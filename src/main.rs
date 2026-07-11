@@ -1,6 +1,7 @@
 mod app;
 mod chats;
 mod diff;
+mod projects;
 mod filetree;
 mod git;
 mod input;
@@ -18,10 +19,12 @@ use std::time::Duration;
 
 use app::App;
 
-fn parse_args() -> (PathBuf, Vec<String>) {
+fn parse_args() -> (Option<PathBuf>, Vec<String>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // usage: vibin [dir] [-- command args...]
-    let mut workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // With a dir the workspace opens directly; without one, the welcome
+    // screen offers the current directory and recent projects.
+    let mut workdir: Option<PathBuf> = None;
     let mut command: Vec<String> = std::env::var("VIBIN_CMD")
         .ok()
         .map(|v| v.split_whitespace().map(String::from).collect())
@@ -32,7 +35,7 @@ fn parse_args() -> (PathBuf, Vec<String>) {
         && first != "--" {
             let dir = PathBuf::from(first);
             if dir.is_dir() {
-                workdir = dir.canonicalize().unwrap_or(dir);
+                workdir = Some(dir.canonicalize().unwrap_or(dir));
                 iter.next();
             } else {
                 eprintln!("error: {first:?} is not a directory");
@@ -50,15 +53,23 @@ fn parse_args() -> (PathBuf, Vec<String>) {
 }
 
 fn main() -> Result<()> {
-    let (workdir, command) = parse_args();
-    let mut app = App::new(workdir, command);
+    let (workdir_arg, command) = parse_args();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let explicit = workdir_arg.is_some();
+    let mut app = App::new(workdir_arg.unwrap_or(cwd), command);
+    if !explicit {
+        app.enter_welcome();
+    }
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
 
-    // First draw so the pane size is known, then start the initial session.
+    // First draw so the pane size is known, then start the initial session
+    // (the welcome screen spawns its session when a project is opened).
     terminal.draw(|f| ui::draw(f, &mut app))?;
-    app.spawn_session();
+    if explicit {
+        app.spawn_session();
+    }
 
     let result = run(&mut terminal, &mut app);
 

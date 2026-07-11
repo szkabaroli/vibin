@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::chats::ChatStore;
 use crate::diff::DiffView;
 use crate::filetree::FileTree;
+use crate::projects::{self, RecentProject};
 use crate::git::GitState;
 use crate::input::key_to_bytes;
 use crate::session::{SessionManager, SessionStatus};
@@ -20,6 +21,28 @@ const TREE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub enum Focus {
     Sidebar,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Launcher: logo + recent projects. Shown when no dir arg was given.
+    Welcome,
+    Workspace,
+}
+
+/// State of the welcome screen: index 0 is always "open current directory",
+/// followed by recent projects discovered from Claude's transcripts.
+pub struct Welcome {
+    pub projects: Vec<RecentProject>,
+    pub selected: usize,
+    pub list: ListState,
+}
+
+impl Welcome {
+    /// Total selectable rows (current dir + recent projects).
+    pub fn len(&self) -> usize {
+        self.projects.len() + 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +89,8 @@ pub struct LayoutMap {
     pub session_tabs: Rect,
     /// The terminal pane (including borders).
     pub terminal_pane: Rect,
+    /// The project list on the welcome screen.
+    pub welcome_list: Rect,
 }
 
 /// Modal overlay currently displayed, if any.
@@ -81,6 +106,8 @@ pub enum Overlay {
 pub struct App {
     pub workdir: PathBuf,
     pub claude_cmd: Vec<String>,
+    pub screen: Screen,
+    pub welcome: Welcome,
     pub sessions: SessionManager,
     pub tree: FileTree,
     pub git: GitState,
@@ -120,6 +147,12 @@ impl App {
         Self {
             workdir,
             claude_cmd,
+            screen: Screen::Workspace,
+            welcome: Welcome {
+                projects: Vec::new(),
+                selected: 0,
+                list: ListState::default(),
+            },
             sessions: SessionManager::new(),
             tree,
             git,
@@ -142,6 +175,41 @@ impl App {
             last_git_refresh: Instant::now(),
             last_tree_refresh: Instant::now(),
         }
+    }
+
+    /// Switch to the welcome/launcher screen and discover recent projects.
+    pub fn enter_welcome(&mut self) {
+        self.screen = Screen::Welcome;
+        let cwd = self.workdir.clone();
+        self.welcome.projects = projects::discover(crate::chats::default_projects_dir())
+            .into_iter()
+            .filter(|p| p.path != cwd)
+            .collect();
+        self.welcome.selected = 0;
+    }
+
+    /// Open a workspace from the welcome screen and start the first session.
+    pub fn open_project(&mut self, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.workdir = path;
+        self.tree = FileTree::new(&self.workdir);
+        self.git = GitState::open(&self.workdir);
+        self.chats = ChatStore::new(&self.workdir);
+        self.screen = Screen::Workspace;
+        self.focus = Focus::Terminal;
+        self.spawn_session();
+    }
+
+    fn open_selected_project(&mut self) {
+        let path = if self.welcome.selected == 0 {
+            self.workdir.clone()
+        } else {
+            match self.welcome.projects.get(self.welcome.selected - 1) {
+                Some(p) => p.path.clone(),
+                None => return,
+            }
+        };
+        self.open_project(path);
     }
 
     pub fn spawn_session(&mut self) {
@@ -194,6 +262,9 @@ impl App {
 
     /// Handle a mouse event; returns true when the UI changed.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
+        if self.screen == Screen::Welcome {
+            return self.handle_welcome_mouse(ev);
+        }
         // Overlays first: wheel scrolls a diff, any click dismisses
         // diff/help. Prompts stay keyboard-only.
         match &mut self.overlay {
@@ -249,6 +320,33 @@ impl App {
                     return true;
                 }
                 false
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_welcome_mouse(&mut self, ev: MouseEvent) -> bool {
+        let pos = Position::new(ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.layout.welcome_list.contains(pos) => {
+                let idx = self.welcome.list.offset()
+                    + (pos.y - self.layout.welcome_list.y) as usize;
+                if idx < self.welcome.len() {
+                    if self.welcome.selected == idx {
+                        self.open_selected_project();
+                    } else {
+                        self.welcome.selected = idx;
+                    }
+                }
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.welcome.selected = self.welcome.selected.saturating_sub(1);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.welcome.selected = (self.welcome.selected + 1).min(self.welcome.len() - 1);
+                true
             }
             _ => false,
         }
@@ -333,6 +431,11 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.status_msg = None;
 
+        if self.screen == Screen::Welcome {
+            self.handle_welcome_key(key);
+            return;
+        }
+
         if self.leader_pending {
             self.leader_pending = false;
             self.handle_leader_key(key);
@@ -352,6 +455,23 @@ impl App {
         match self.focus {
             Focus::Terminal => self.forward_to_terminal(key),
             Focus::Sidebar => self.handle_sidebar_key(key),
+        }
+    }
+
+    fn handle_welcome_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                self.welcome.selected = (self.welcome.selected + 1).min(self.welcome.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.welcome.selected = self.welcome.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => self.open_selected_project(),
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            _ => {}
         }
     }
 
@@ -1041,6 +1161,7 @@ mod tests {
             sidebar_list: Rect::new(1, 2, 28, 20),
             session_tabs: Rect::new(30, 0, 80, 1),
             terminal_pane: Rect::new(30, 1, 80, 22),
+            welcome_list: Rect::new(10, 10, 60, 10),
         };
     }
 
@@ -1171,6 +1292,73 @@ mod tests {
         } else {
             panic!("expected diff overlay");
         }
+    }
+
+    fn welcome_app() -> (TempDir, TempDir, App) {
+        let (dir, mut app) = test_app();
+        let other = TempDir::new().unwrap();
+        app.screen = Screen::Welcome;
+        app.welcome.projects = vec![crate::projects::RecentProject {
+            path: other.path().to_path_buf(),
+            last_active: std::time::SystemTime::now(),
+            chat_count: 2,
+        }];
+        (dir, other, app)
+    }
+
+    #[test]
+    fn welcome_enter_opens_current_directory() {
+        let (dir, _other, mut app) = welcome_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Workspace);
+        assert_eq!(app.workdir, dir.path().canonicalize().unwrap());
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn welcome_navigates_and_opens_recent_project() {
+        let (_dir, other, mut app) = welcome_app();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.welcome.selected, 1);
+        press(&mut app, KeyCode::Char('j')); // clamps at last row
+        assert_eq!(app.welcome.selected, 1);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Workspace);
+        assert_eq!(app.workdir, other.path().canonicalize().unwrap());
+        // the workspace state was rebuilt for the new directory
+        assert_eq!(app.tree.root, app.workdir);
+    }
+
+    #[test]
+    fn welcome_q_quits_and_leader_keys_are_inert() {
+        let (_dir, _other, mut app) = welcome_app();
+        // Ctrl+A c must not spawn sessions on the welcome screen
+        leader(&mut app, KeyCode::Char('c'));
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.screen, Screen::Welcome);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn welcome_click_selects_then_opens() {
+        let (_dir, other, mut app) = welcome_app();
+        fake_layout(&mut app);
+        app.layout.welcome_list = Rect::new(10, 10, 60, 10);
+        assert!(click(&mut app, 12, 11)); // row 1 = recent project
+        assert_eq!(app.welcome.selected, 1);
+        assert_eq!(app.screen, Screen::Welcome);
+        assert!(click(&mut app, 12, 11));
+        assert_eq!(app.screen, Screen::Workspace);
+        assert_eq!(app.workdir, other.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn enter_welcome_excludes_current_dir_from_recents() {
+        let (_dir, mut app) = test_app();
+        app.enter_welcome();
+        assert_eq!(app.screen, Screen::Welcome);
+        assert!(app.welcome.projects.iter().all(|p| p.path != app.workdir));
     }
 
     #[test]

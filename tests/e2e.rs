@@ -22,6 +22,15 @@ impl Tui {
     }
 
     fn launch_env(workdir: &std::path::Path, envs: &[(&str, &str)]) -> Self {
+        Self::launch_opts(workdir, envs, true)
+    }
+
+    /// Launch without a directory argument → welcome screen (cwd = workdir).
+    fn launch_welcome(workdir: &std::path::Path, envs: &[(&str, &str)]) -> Self {
+        Self::launch_opts(workdir, envs, false)
+    }
+
+    fn launch_opts(workdir: &std::path::Path, envs: &[(&str, &str)], pass_dir: bool) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -32,7 +41,9 @@ impl Tui {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vibin"));
-        cmd.arg(workdir);
+        if pass_dir {
+            cmd.arg(workdir);
+        }
         cmd.cwd(workdir);
         cmd.env("TERM", "xterm-256color");
         // Sessions run a plain shell instead of claude so tests are hermetic.
@@ -305,6 +316,51 @@ fn chats_tab_lists_and_resumes_past_conversations() {
     assert!(tui.wait_for("resuming chat cafe1234"), "screen:\n{}", tui.screen());
     // the stub session received the resume flags
     assert!(tui.wait_for("claude-stub --resume cafe1234"), "screen:\n{}", tui.screen());
+}
+
+#[test]
+fn welcome_screen_lists_projects_and_opens_workspace() {
+    let dir = git_fixture();
+    let workdir = dir.path().canonicalize().unwrap();
+    // fake HOME with one recent project pointing at a real directory
+    let home = TempDir::new().unwrap();
+    let recent = home.path().join("code").join("otherproj");
+    std::fs::create_dir_all(&recent).unwrap();
+    let proj = home.path().join(".claude").join("projects").join("-code-otherproj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("chat.jsonl"),
+        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", recent.display()),
+    )
+    .unwrap();
+
+    // no dir argument → welcome screen
+    let mut tui = Tui::launch_welcome(
+        &workdir,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    // logo, version, current dir entry, and the recent project
+    assert!(tui.wait_for("██"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("v0.1.0"), "screen:\n{}", tui.screen());
+    // current-dir row (suffix may truncate with long temp paths) + recents
+    assert!(tui.wait_for("▸ open "), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("~/code/otherproj"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("1 chat"), "screen:\n{}", tui.screen());
+    // Enter opens the current directory as a workspace
+    tui.send(b"\r");
+    assert!(tui.wait_for("Files"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
+}
+
+#[test]
+fn welcome_screen_q_quits() {
+    let dir = git_fixture();
+    let home = TempDir::new().unwrap();
+    let mut tui = Tui::launch_welcome(dir.path(), &[("HOME", home.path().to_str().unwrap())]);
+    assert!(tui.wait_for("██"), "screen:\n{}", tui.screen());
+    tui.send(b"q");
+    assert!(tui.wait_exit());
 }
 
 #[test]

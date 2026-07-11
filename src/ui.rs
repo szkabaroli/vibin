@@ -7,14 +7,31 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs};
 use ratatui::Frame;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Focus, Overlay, SidebarTab};
+use crate::app::{App, Focus, Overlay, Screen, SidebarTab};
 use crate::diff::{DiffLine, DiffLineKind};
 use crate::git::StatusKind;
+use crate::projects::display_path;
 use crate::session::SessionStatus;
 
 const SIDEBAR_WIDTH: u16 = 34;
 
+/// "VIBIN" in ANSI-shadow block letters, split for two-tone coloring
+/// ("VI" dim, "BIN" bright — like opencode's wordmark).
+const LOGO: [(&str, &str); 6] = [
+    ("██╗   ██╗██╗", "██████╗ ██╗███╗   ██╗"),
+    ("██║   ██║██║", "██╔══██╗██║████╗  ██║"),
+    ("██║   ██║██║", "██████╔╝██║██╔██╗ ██║"),
+    ("╚██╗ ██╔╝██║", "██╔══██╗██║██║╚██╗██║"),
+    (" ╚████╔╝ ██║", "██████╔╝██║██║ ╚████║"),
+    ("  ╚═══╝  ╚═╝", "╚═════╝ ╚═╝╚═╝  ╚═══╝"),
+];
+const LOGO_WIDTH: u16 = 33;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    if app.screen == Screen::Welcome {
+        draw_welcome(frame, app);
+        return;
+    }
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
@@ -39,6 +56,97 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         None => {}
     }
+}
+
+fn draw_welcome(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let logo_height = LOGO.len() as u16 + 2; // art + version line + gap
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(area.height.saturating_sub(logo_height + 16) / 3),
+            Constraint::Length(logo_height),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    // logo, centered, two-tone
+    let logo_x = area.x + area.width.saturating_sub(LOGO_WIDTH) / 2;
+    for (i, (left, right)) in LOGO.iter().enumerate() {
+        let line = Line::from(vec![
+            Span::styled(*left, Style::default().fg(Color::DarkGray)),
+            Span::styled(*right, Style::default().fg(Color::Cyan)),
+        ]);
+        let rect = Rect::new(logo_x, chunks[1].y + i as u16, LOGO_WIDTH.min(area.width), 1);
+        frame.render_widget(Paragraph::new(line), rect);
+    }
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version_rect = Rect::new(
+        logo_x,
+        chunks[1].y + LOGO.len() as u16 + 1,
+        LOGO_WIDTH.min(area.width),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            version,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .right_aligned(),
+        version_rect,
+    );
+
+    // project list, centered column
+    let list_width = 64.min(area.width.saturating_sub(4));
+    let list_area = Rect::new(
+        area.x + area.width.saturating_sub(list_width) / 2,
+        chunks[3].y,
+        list_width,
+        chunks[3].height,
+    );
+    app.layout.welcome_list = list_area;
+
+    let now = std::time::SystemTime::now();
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.welcome.len());
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("open ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            display_path(&app.workdir),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  (current directory)", Style::default().fg(Color::DarkGray)),
+    ])));
+    for project in &app.welcome.projects {
+        let chats = format!(
+            "{} chat{}",
+            project.chat_count,
+            if project.chat_count == 1 { "" } else { "s" }
+        );
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{:>4}  ", project.age(now)), Style::default().fg(Color::DarkGray)),
+            Span::raw(display_path(&project.path)),
+            Span::styled(format!("  · {chats}"), Style::default().fg(Color::DarkGray)),
+        ])));
+    }
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
+    app.welcome.list.select(Some(app.welcome.selected));
+    let mut state = std::mem::take(&mut app.welcome.list);
+    frame.render_stateful_widget(list, list_area, &mut state);
+    app.welcome.list = state;
+
+    // footer hints
+    let hints = Line::from(Span::styled(
+        "enter open · j/k move · click select · q quit",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(
+        Paragraph::new(hints).centered(),
+        Rect::new(area.x, chunks[4].y, area.width, 1),
+    );
 }
 
 /// Dashboard glyph and color for a session status.
