@@ -527,6 +527,37 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Grayish base for dialog surfaces — distinct from the terminal background
+/// so popups read as a layer above the workspace.
+const DIALOG_BG: Color = Color::Rgb(32, 34, 40);
+/// Shadow: cells below-right of a dialog keep their glyphs but get crushed
+/// to near-black, which reads as a translucent drop shadow.
+const SHADOW_BG: Color = Color::Rgb(8, 8, 10);
+const SHADOW_FG: Color = Color::Rgb(52, 54, 58);
+
+/// Paint the drop shadow and the dialog's base surface. Call before
+/// rendering the dialog's content into `rect`.
+fn draw_dialog_base(frame: &mut Frame, rect: Rect) {
+    let screen = frame.area();
+    // offset +2/+1 because terminal cells are ~half as wide as tall
+    let shadow = Rect {
+        x: rect.x.saturating_add(2),
+        y: rect.y.saturating_add(1),
+        width: rect.width,
+        height: rect.height,
+    }
+    .intersection(screen);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(SHADOW_BG).fg(SHADOW_FG)),
+        shadow,
+    );
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(DIALOG_BG)),
+        rect,
+    );
+}
+
 fn overlay_area(frame: &Frame, pct_x: u16, pct_y: u16) -> Rect {
     let area = frame.area();
     let width = area.width * pct_x / 100;
@@ -612,7 +643,7 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
 
 fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
     let area = overlay_area(frame, 92, 90);
-    frame.render_widget(Clear, area);
+    draw_dialog_base(frame, area);
     let Some(Overlay::Diff(view)) = &app.overlay else {
         return;
     };
@@ -634,12 +665,14 @@ fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
         (view.scroll + 1).min(view.lines.len()),
         view.lines.len()
     );
-    let paragraph = Paragraph::new(visible).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title),
-    );
+    let paragraph = Paragraph::new(visible)
+        .style(Style::default().bg(DIALOG_BG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        );
     frame.render_widget(paragraph, area);
 }
 
@@ -688,9 +721,9 @@ fn draw_help_overlay(frame: &mut Frame) {
         width,
         height: height.min(area.height),
     };
-    frame.render_widget(Clear, rect);
+    draw_dialog_base(frame, rect);
     frame.render_widget(
-        Paragraph::new(text).block(
+        Paragraph::new(text).style(Style::default().bg(DIALOG_BG)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
@@ -709,16 +742,73 @@ fn draw_prompt(frame: &mut Frame, title: &str, buf: &str) {
         width,
         height: 3,
     };
-    frame.render_widget(Clear, rect);
+    draw_dialog_base(frame, rect);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::raw(buf.to_string()))).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green))
-                .title(title.to_string()),
-        ),
+        Paragraph::new(Line::from(Span::raw(buf.to_string())))
+            .style(Style::default().bg(DIALOG_BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green))
+                    .title(title.to_string()),
+            ),
         rect,
     );
     let cursor_x = rect.x + 1 + (buf.chars().count() as u16).min(rect.width.saturating_sub(3));
     frame.set_cursor_position((cursor_x, rect.y + 1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(app: &mut App) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn bg_count(buf: &ratatui::buffer::Buffer, color: Color) -> usize {
+        buf.content()
+            .iter()
+            .filter(|cell| cell.style().bg == Some(color))
+            .count()
+    }
+
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "hi\n").unwrap();
+        let app = App::new(
+            dir.path().to_path_buf(),
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        (dir, app)
+    }
+
+    #[test]
+    fn dialogs_have_gray_base_and_drop_shadow() {
+        let (_dir, mut app) = test_app();
+        // no overlay → neither dialog base nor shadow anywhere
+        let buf = render(&mut app);
+        assert_eq!(bg_count(&buf, DIALOG_BG), 0);
+        assert_eq!(bg_count(&buf, SHADOW_BG), 0);
+
+        app.overlay = Some(Overlay::Help);
+        let buf = render(&mut app);
+        assert!(bg_count(&buf, DIALOG_BG) > 100, "dialog surface painted");
+        // visible shadow = right column + bottom row of the offset rect
+        assert!(bg_count(&buf, SHADOW_BG) > 10, "drop shadow painted");
+    }
+
+    #[test]
+    fn prompt_dialog_uses_gray_base() {
+        let (_dir, mut app) = test_app();
+        app.overlay = Some(Overlay::CommitPrompt("msg".into()));
+        let buf = render(&mut app);
+        assert!(bg_count(&buf, DIALOG_BG) > 50);
+        assert!(bg_count(&buf, SHADOW_BG) > 5);
+    }
 }
