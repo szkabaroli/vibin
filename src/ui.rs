@@ -27,6 +27,42 @@ const LOGO: [(&str, &str); 6] = [
 ];
 const LOGO_WIDTH: u16 = 33;
 
+/// Block-art sunglasses rendered in rainbow next to the wordmark.
+const GLASSES: [&str; 3] = [
+    "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+    "▐█████▌ ▐█████▌ ",
+    " ▀▀▀▀▀   ▀▀▀▀▀  ",
+];
+const GLASSES_WIDTH: u16 = 16;
+const GLASSES_GAP: u16 = 3;
+
+const RAINBOW: [Color; 6] = [
+    Color::Rgb(255, 95, 95),
+    Color::Rgb(255, 175, 70),
+    Color::Rgb(245, 220, 80),
+    Color::Rgb(110, 215, 120),
+    Color::Rgb(95, 170, 255),
+    Color::Rgb(200, 120, 255),
+];
+
+/// Color a string with a left-to-right rainbow gradient.
+fn rainbow_line(text: &str) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1);
+    Line::from(
+        chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                Span::styled(
+                    c.to_string(),
+                    Style::default().fg(RAINBOW[i * RAINBOW.len() / n]),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.screen == Screen::Welcome {
         draw_welcome(frame, app);
@@ -72,8 +108,15 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // logo, centered, two-tone
-    let logo_x = area.x + area.width.saturating_sub(LOGO_WIDTH) / 2;
+    // logo (two-tone) + rainbow sunglasses, centered as one ensemble;
+    // the glasses are dropped on narrow terminals
+    let with_glasses = area.width >= LOGO_WIDTH + GLASSES_GAP + GLASSES_WIDTH;
+    let total = if with_glasses {
+        LOGO_WIDTH + GLASSES_GAP + GLASSES_WIDTH
+    } else {
+        LOGO_WIDTH
+    };
+    let logo_x = area.x + area.width.saturating_sub(total) / 2;
     for (i, (left, right)) in LOGO.iter().enumerate() {
         let line = Line::from(vec![
             Span::styled(*left, Style::default().fg(Color::DarkGray)),
@@ -81,6 +124,14 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
         ]);
         let rect = Rect::new(logo_x, chunks[1].y + i as u16, LOGO_WIDTH.min(area.width), 1);
         frame.render_widget(Paragraph::new(line), rect);
+    }
+    if with_glasses {
+        let glasses_x = logo_x + LOGO_WIDTH + GLASSES_GAP;
+        for (i, row) in GLASSES.iter().enumerate() {
+            let rect = Rect::new(glasses_x, chunks[1].y + 1 + i as u16, GLASSES_WIDTH, 1)
+                .intersection(area);
+            frame.render_widget(Paragraph::new(rainbow_line(row)), rect);
+        }
     }
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let version_rect = Rect::new(
@@ -831,6 +882,19 @@ mod tests {
         assert!(bg_count(&buf, DIALOG_BG) > 100, "dialog surface painted");
         // visible shadow = right column strip + bottom half-row of ▀ glyphs
         assert!(shadow_count(&buf) > 10, "drop shadow painted");
+    }
+
+    #[test]
+    fn welcome_screen_wears_rainbow_glasses() {
+        let (_dir, mut app) = test_app();
+        app.screen = Screen::Welcome;
+        let buf = render(&mut app);
+        let rainbow_cells = buf
+            .content()
+            .iter()
+            .filter(|cell| matches!(cell.style().fg, Some(fg) if RAINBOW.contains(&fg)))
+            .count();
+        assert!(rainbow_cells > 20, "glasses painted in rainbow: {rainbow_cells}");
     }
 
     #[test]
