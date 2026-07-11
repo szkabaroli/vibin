@@ -529,11 +529,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Grayish base for dialog surfaces — distinct from the terminal background
 /// so popups read as a layer above the workspace.
-const DIALOG_BG: Color = Color::Rgb(32, 34, 40);
-/// Shadow: cells below-right of a dialog keep their glyphs but get crushed
-/// to near-black, which reads as a translucent drop shadow.
-const SHADOW_BG: Color = Color::Rgb(8, 8, 10);
-const SHADOW_FG: Color = Color::Rgb(52, 54, 58);
+const DIALOG_BG: Color = Color::Rgb(40, 42, 48);
+/// Shadow band below-right of a dialog. Sits between the dialog base and
+/// pure black so the elevation stays visible on black terminals (where
+/// nothing can be darkened further, lighter = closer); on gray themes it
+/// still reads as a darkened strip. Underlying glyphs are kept, dimmed.
+const SHADOW_BG: Color = Color::Rgb(22, 24, 28);
+const SHADOW_FG: Color = Color::Rgb(58, 60, 66);
 
 /// Paint the drop shadow and the dialog's base surface. Call before
 /// rendering the dialog's content into `rect`.
