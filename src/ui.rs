@@ -539,19 +539,40 @@ const SHADOW_FG: Color = Color::Rgb(58, 60, 66);
 
 /// Paint the drop shadow and the dialog's base surface. Call before
 /// rendering the dialog's content into `rect`.
+///
+/// Terminal cells are ~twice as tall as wide, so a visually even shadow is
+/// one column on the right and HALF a row on the bottom — the bottom strip
+/// is drawn with upper-half blocks (▀) to get the half-row.
 fn draw_dialog_base(frame: &mut Frame, rect: Rect) {
     let screen = frame.area();
-    let shadow = Rect {
-        x: rect.x.saturating_add(1),
+    // right strip: 1 column, starting one row below the dialog top
+    let right = Rect {
+        x: rect.right().min(screen.right()),
         y: rect.y.saturating_add(1),
-        width: rect.width,
-        height: rect.height,
+        width: 1,
+        height: rect.height.saturating_sub(1),
     }
     .intersection(screen);
     frame.render_widget(
         Block::default().style(Style::default().bg(SHADOW_BG).fg(SHADOW_FG)),
-        shadow,
+        right,
     );
+    // bottom strip: half-row of shadow via ▀ glyphs (top half shadow-colored,
+    // bottom half stays the terminal background)
+    let bottom = Rect {
+        x: rect.x.saturating_add(1),
+        y: rect.bottom().min(screen.bottom()),
+        width: rect.width,
+        height: 1,
+    }
+    .intersection(screen);
+    if !bottom.is_empty() {
+        frame.render_widget(
+            Paragraph::new("▀".repeat(bottom.width as usize))
+                .style(Style::default().fg(SHADOW_BG)),
+            bottom,
+        );
+    }
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default().style(Style::default().bg(DIALOG_BG)),
@@ -776,6 +797,17 @@ mod tests {
             .count()
     }
 
+    /// Shadow cells: right strip (bg) + bottom half-row (▀ glyphs).
+    fn shadow_count(buf: &ratatui::buffer::Buffer) -> usize {
+        buf.content()
+            .iter()
+            .filter(|cell| {
+                cell.style().bg == Some(SHADOW_BG)
+                    || (cell.symbol() == "▀" && cell.style().fg == Some(SHADOW_BG))
+            })
+            .count()
+    }
+
     fn test_app() -> (tempfile::TempDir, App) {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "hi\n").unwrap();
@@ -792,13 +824,13 @@ mod tests {
         // no overlay → neither dialog base nor shadow anywhere
         let buf = render(&mut app);
         assert_eq!(bg_count(&buf, DIALOG_BG), 0);
-        assert_eq!(bg_count(&buf, SHADOW_BG), 0);
+        assert_eq!(shadow_count(&buf), 0);
 
         app.overlay = Some(Overlay::Help);
         let buf = render(&mut app);
         assert!(bg_count(&buf, DIALOG_BG) > 100, "dialog surface painted");
-        // visible shadow = right column + bottom row of the offset rect
-        assert!(bg_count(&buf, SHADOW_BG) > 10, "drop shadow painted");
+        // visible shadow = right column strip + bottom half-row of ▀ glyphs
+        assert!(shadow_count(&buf) > 10, "drop shadow painted");
     }
 
     #[test]
@@ -807,6 +839,6 @@ mod tests {
         app.overlay = Some(Overlay::CommitPrompt("msg".into()));
         let buf = render(&mut app);
         assert!(bg_count(&buf, DIALOG_BG) > 50);
-        assert!(bg_count(&buf, SHADOW_BG) > 5);
+        assert!(shadow_count(&buf) > 5);
     }
 }
