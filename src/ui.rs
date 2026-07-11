@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Tabs};
 use ratatui::Frame;
 use tui_term::widget::PseudoTerminal;
 
@@ -541,9 +541,8 @@ const SHADOW_FG: Color = Color::Rgb(58, 60, 66);
 /// rendering the dialog's content into `rect`.
 fn draw_dialog_base(frame: &mut Frame, rect: Rect) {
     let screen = frame.area();
-    // offset +2/+1 because terminal cells are ~half as wide as tall
     let shadow = Rect {
-        x: rect.x.saturating_add(2),
+        x: rect.x.saturating_add(1),
         y: rect.y.saturating_add(1),
         width: rect.width,
         height: rect.height,
@@ -649,7 +648,8 @@ fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
     let Some(Overlay::Diff(view)) = &app.overlay else {
         return;
     };
-    let inner_height = area.height.saturating_sub(2) as usize;
+    // borderless: one title row on top, one column of padding each side
+    let inner_height = area.height.saturating_sub(1) as usize;
     let inner_width = area.width.saturating_sub(2) as usize;
     app.diff_viewport = inner_height.max(1);
 
@@ -669,12 +669,10 @@ fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
     );
     let paragraph = Paragraph::new(visible)
         .style(Style::default().bg(DIALOG_BG))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(title),
-        );
+        .block(Block::default().padding(Padding::horizontal(1)).title(Line::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
     frame.render_widget(paragraph, area);
 }
 
@@ -714,7 +712,7 @@ fn draw_help_overlay(frame: &mut Frame) {
             }
         })
         .collect();
-    let height = (text.len() + 2) as u16;
+    let height = (text.len() + 1) as u16;
     let area = frame.area();
     let width = 74.min(area.width.saturating_sub(4));
     let rect = Rect {
@@ -726,10 +724,10 @@ fn draw_help_overlay(frame: &mut Frame) {
     draw_dialog_base(frame, rect);
     frame.render_widget(
         Paragraph::new(text).style(Style::default().bg(DIALOG_BG)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" keys (any key to close) "),
+            Block::default().padding(Padding::horizontal(1)).title(Line::styled(
+                " keys (any key to close) ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
         ),
         rect,
     );
@@ -742,18 +740,16 @@ fn draw_prompt(frame: &mut Frame, title: &str, buf: &str) {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + area.height / 2 - 1,
         width,
-        height: 3,
+        height: 2, // title row + input row
     };
     draw_dialog_base(frame, rect);
     frame.render_widget(
         Paragraph::new(Line::from(Span::raw(buf.to_string())))
             .style(Style::default().bg(DIALOG_BG))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green))
-                    .title(title.to_string()),
-            ),
+            .block(Block::default().padding(Padding::horizontal(1)).title(Line::styled(
+                title.to_string(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ))),
         rect,
     );
     let cursor_x = rect.x + 1 + (buf.chars().count() as u16).min(rect.width.saturating_sub(3));
