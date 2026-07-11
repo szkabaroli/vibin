@@ -20,9 +20,9 @@ use app::App;
 
 fn parse_args() -> (PathBuf, Vec<String>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // usage: agentic-tui [dir] [-- command args...]
+    // usage: vibin [dir] [-- command args...]
     let mut workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut command: Vec<String> = std::env::var("AGENTIC_TUI_CMD")
+    let mut command: Vec<String> = std::env::var("VIBIN_CMD")
         .ok()
         .map(|v| v.split_whitespace().map(String::from).collect())
         .unwrap_or_else(|| vec!["claude".to_string()]);

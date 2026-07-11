@@ -174,7 +174,7 @@ pub fn commit(repo: &Repository, message: &str) -> Result<git2::Oid> {
     let tree = repo.find_tree(tree_id)?;
     let sig = repo
         .signature()
-        .or_else(|_| Signature::now("agentic-tui", "agentic-tui@localhost"))?;
+        .or_else(|_| Signature::now("vibin", "vibin@localhost"))?;
     let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let parents: Vec<&Commit> = parent.as_ref().into_iter().collect();
     let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;

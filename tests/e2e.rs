@@ -31,12 +31,12 @@ impl Tui {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_agentic-tui"));
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vibin"));
         cmd.arg(workdir);
         cmd.cwd(workdir);
         cmd.env("TERM", "xterm-256color");
         // Sessions run a plain shell instead of claude so tests are hermetic.
-        cmd.env("AGENTIC_TUI_CMD", "/bin/sh");
+        cmd.env("VIBIN_CMD", "/bin/sh");
         for (key, value) in envs {
             cmd.env(key, value);
         }
@@ -293,7 +293,7 @@ fn chats_tab_lists_and_resumes_past_conversations() {
         &[
             ("HOME", home.path().to_str().unwrap()),
             // sessions echo their args so we can observe the resume flags
-            ("AGENTIC_TUI_CMD", "/bin/echo claude-stub"),
+            ("VIBIN_CMD", "/bin/echo claude-stub"),
         ],
     );
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());

@@ -351,7 +351,7 @@ fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(block.title(" agentic-tui "));
+            .block(block.title(" vibin "));
             frame.render_widget(msg, pane);
         }
     }

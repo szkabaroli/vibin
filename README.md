@@ -1,4 +1,4 @@
-# agentic-tui
+# vibin
 
 A terminal-based agentic workspace, in the spirit of Conductor / Codex but fully
 TUI: run multiple Claude Code instances side by side, browse the file tree,
@@ -39,9 +39,9 @@ one after its task with `Ctrl+A ,` so the tab bar reads like a task list.
 
 ```sh
 cargo build --release
-./target/release/agentic-tui [dir]              # sessions run `claude` in dir
-./target/release/agentic-tui [dir] -- claude --model opus   # custom command
-AGENTIC_TUI_CMD="claude --continue" agentic-tui             # via env var
+./target/release/vibin [dir]              # sessions run `claude` in dir
+./target/release/vibin [dir] -- claude --model opus   # custom command
+VIBIN_CMD="claude --continue" vibin             # via env var
 ```
 
 ## Keys
