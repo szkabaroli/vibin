@@ -4,9 +4,9 @@
 # app itself follows each theme.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-scripts/demo-workspace.sh   # (re)create /tmp/vibin-demo
 render() { # theme suffix
-  sed -e "s/%THEME%/$1/" -e "s/%SUFFIX%/$2/" scripts/demo.tape.tmpl > /tmp/vibin-demo-$2.tape
+  demo/workspace.sh         # fresh /tmp/vibin-demo — the tape fixes its typo
+  sed -e "s/%THEME%/$1/" -e "s/%SUFFIX%/$2/" demo/demo.tape.tmpl > /tmp/vibin-demo-$2.tape
   vhs /tmp/vibin-demo-$2.tape
 }
 render "Belafonte Night" dark

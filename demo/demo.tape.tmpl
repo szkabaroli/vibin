@@ -1,0 +1,107 @@
+# Template — render via demo/record.sh (fills %THEME% / %SUFFIX% for the
+# light and dark variants).
+# Rendered at 2x (2400x1440 @ FontSize 26) for crispness; embed scaled down.
+# The demo workspace (demo/workspace.sh) ships a deliberate E0599 typo —
+# `batcher.puush(readme)` — that gets hovered, fixed, and saved on camera.
+
+Output assets/demo-%SUFFIX%.gif
+
+Set Theme "%THEME%"
+Set FontSize 26
+Set Width 2400
+Set Height 1440
+Set Padding 24
+Set TypingSpeed 110ms
+
+# launch off-camera in the demo workspace, go straight to the code shell,
+# and let rust-analyzer finish indexing so diagnostics are live on camera
+Hide
+Type `cd /tmp/vibin-demo && vibin . -- sleep 600`
+Enter
+Sleep 4s
+Ctrl+A
+Sleep 300ms
+Type "f"
+Sleep 25s
+Show
+
+# open the file through the palette, typed at human speed
+Sleep 1200ms
+Ctrl+K
+Sleep 900ms
+Type "main"
+Sleep 1400ms
+Enter
+Sleep 2s
+
+# jump to the error line; the E0599 message shows in the status bar
+Type ":51"
+Sleep 400ms
+Enter
+Sleep 1200ms
+
+# word-jump onto the misspelled method: w w w hops to `puush`, e selects it
+Type "w"
+Sleep 320ms
+Type "w"
+Sleep 240ms
+Type "w"
+Sleep 300ms
+Type "e"
+Sleep 900ms
+
+# hover it: space k pops the diagnostic with rust-analyzer's suggestion
+Space
+Sleep 250ms
+Type "k"
+Sleep 2200ms
+
+Screenshot assets/hero-%SUFFIX%.png
+Sleep 1300ms
+
+# close the popup; `puush` is still selected — change it to `push`, save
+Escape
+Sleep 800ms
+Type "c"
+Sleep 500ms
+Type "push"
+Sleep 400ms
+Escape
+Sleep 600ms
+Type ":w"
+Sleep 300ms
+Enter
+
+# let cargo check re-run off-camera, then admire the clean status bar
+Hide
+Sleep 10s
+Show
+Sleep 2s
+
+# hover docs preview on a std method (get_or_insert_with, line 33)
+Type ":33"
+Sleep 400ms
+Enter
+Sleep 700ms
+Type "w"
+Sleep 260ms
+Type "w"
+Sleep 200ms
+Type "w"
+Sleep 260ms
+Type "w"
+Sleep 200ms
+Type "w"
+Sleep 300ms
+Type "e"
+Sleep 800ms
+Space
+Sleep 250ms
+Type "k"
+Sleep 2500ms
+Type "j"
+Sleep 400ms
+Type "j"
+Sleep 1400ms
+Escape
+Sleep 1500ms

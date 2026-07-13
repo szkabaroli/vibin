@@ -66,7 +66,8 @@ impl Batcher {
 fn main() {
     let root = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     let mut batcher = Batcher::new();
-    batcher.push(Change::Created(PathBuf::from("README.md")));
+    let readme = Change::Created(PathBuf::from("README.md"));
+    batcher.puush(readme);
     loop {
         if let Some(batch) = batcher.drain() {
             for change in &batch {
