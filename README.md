@@ -10,16 +10,10 @@
   a fun project, built for vibing — i don't recommend using it.
 </p>
 
-```
-┌ Files ──────────┐ ✎ main.rs [+] │ ● 1:api-refactor │ ○ 2:wombat
-│ ▸ src         2 │┌───────────────────────────────────────────────┐
-│   main.rs     1 ││  12  fn main() {                              │
-│   lib.rs        ││  13      let app = App::new();                │
-│ ▸ docs          ││  14      app.run()                            │
-│   Cargo.toml    ││          ~~~~~~~ method not found     E 1     │
-└─────────────────┘└───────────────────────────────────────────────┘
- NOR  main.rs [+]  ■ method not found   ⟳ cargo check   14:8  rust
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.png">
+  <img src="assets/hero-light.png" alt="the editor: file tree, tree-sitter highlighting, LSP diagnostics in the gutter and status bar">
+</picture>
 
 one TUI, three shells: **F3** code (file tree + modal editor), **F2** git
 (stage, diff, commit), **F1** agents (Claude terminals + resumable chats,

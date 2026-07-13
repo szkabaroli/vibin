@@ -92,6 +92,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_main_area(frame, app, main[1]);
     draw_status_bar(frame, app, outer[1]);
 
+    // modal dimming: with a dialog or the leader menu up, everything
+    // behind it steps back (hover popups are tooltips, not modals)
+    let modal_open = app.leader_pending
+        || matches!(
+            &app.overlay,
+            Some(
+                Overlay::Diff(_)
+                    | Overlay::Help
+                    | Overlay::CommitPrompt(_)
+                    | Overlay::RenamePrompt(_)
+                    | Overlay::Palette(_)
+            )
+        );
+    if modal_open {
+        dim_background(frame.buffer_mut());
+        // squiggles are re-printed post-draw at full color — skip them
+        // while dimmed or they'd glow through the veil
+        app.squiggle_overlays.clear();
+    }
+
     match &app.overlay {
         Some(Overlay::Diff(_)) => draw_diff_overlay(frame, app),
         Some(Overlay::Help) => draw_help_overlay(frame, app.welcome.phase),
@@ -1100,6 +1120,39 @@ fn adaptive(dark: Color, light: Color) -> Color {
 /// Theme-native grey (see color::wash), as a ratatui Color.
 fn wash(weight: u32) -> Option<Color> {
     crate::color::wash(weight).map(|(r, g, b)| Color::Rgb(r, g, b))
+}
+
+/// Recolor every cell toward the terminal background so an open modal
+/// reads as the only lit layer: RGB colors blend ~55% toward the
+/// background, default-colored text gets an explicit dim wash (there is
+/// no RGB to blend), and indexed colors lean on the DIM attribute.
+fn dim_background(buf: &mut ratatui::buffer::Buffer) {
+    let (br, bgc, bb) = crate::color::terminal_bg()
+        .unwrap_or(if crate::color::is_light() { (255, 255, 255) } else { (0, 0, 0) });
+    let default_fg =
+        wash(110).unwrap_or_else(|| adaptive(Color::Rgb(90, 94, 104), Color::Rgb(172, 176, 184)));
+    let blend = |c: u8, base: u8| ((c as u32 * 115 + base as u32 * 141) / 256) as u8;
+    let dim_color = |c: Color| match c {
+        Color::Rgb(r, g, b) => Color::Rgb(blend(r, br), blend(g, bgc), blend(b, bb)),
+        other => other,
+    };
+    let area = buf.area;
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let style = cell.style();
+            let fg = match style.fg {
+                Some(Color::Reset) | None => Some(default_fg),
+                Some(c) => Some(dim_color(c)),
+            };
+            let bg = style.bg.map(dim_color);
+            let underline = style.underline_color.map(dim_color);
+            cell.set_style(
+                Style { fg, bg, underline_color: underline, ..style }
+                    .add_modifier(Modifier::DIM),
+            );
+        }
+    }
 }
 
 
@@ -2714,6 +2767,27 @@ mod tests {
         // fancy mode: no straight underline in the buffer for that span
         let cell = &buf[(s.x, s.y)];
         assert!(!cell.style().add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn modals_dim_the_background() {
+        let (_dir, mut app) = test_app();
+        let buf = render(&mut app);
+        let normal = bg_count(&buf, STATUSBAR_BG());
+        assert!(normal > 0, "status bar visible when no modal is open");
+        // help dialog up: the status bar's cells are dimmed (or covered) —
+        // none keep the undimmed background
+        app.overlay = Some(Overlay::Help);
+        let buf = render(&mut app);
+        assert_eq!(bg_count(&buf, STATUSBAR_BG()), 0, "backdrop dimmed behind the modal");
+        // hover popups are tooltips, not modals: no dimming
+        app.overlay = Some(Overlay::Hover(crate::app::HoverDoc {
+            text: "docs".into(),
+            scroll: 0,
+            diagnostics: vec![],
+        }));
+        let buf = render(&mut app);
+        assert!(bg_count(&buf, STATUSBAR_BG()) > 0, "hover leaves the backdrop lit");
     }
 
     #[test]
