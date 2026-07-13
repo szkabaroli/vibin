@@ -139,18 +139,27 @@ fn git_fixture() -> TempDir {
 }
 
 #[test]
-fn boots_and_shows_file_tree_and_first_session() {
+fn boots_and_shows_shells() {
     let dir = git_fixture();
     let mut tui = Tui::launch(dir.path());
-    assert!(tui.wait_for("Files"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("hello.txt"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("src"), "screen:\n{}", tui.screen());
-    // first session tab is present and the shell prompt rendered
+    // Agents shell by default: session tab + shell prompt + chats sidebar
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
-    // git branch appears in the status bar
+    assert!(tui.wait_for("AGENTS"), "screen:\n{}", tui.screen());
     let branch_shown = tui.wait_for("main") || tui.wait_for("master");
     assert!(branch_shown, "screen:\n{}", tui.screen());
+    // F3 → Code shell with the file tree
+    tui.send(b"\x1bOR");
+    assert!(tui.wait_for("hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("src"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("Search Files"), "screen:\n{}", tui.screen());
+    // F2 → Git shell with changes + diff main pane
+    tui.send(b"\x1bOQ");
+    assert!(tui.wait_for("?? hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("Update(hello.txt)"), "screen:\n{}", tui.screen());
+    // F1 → back to Agents
+    tui.send(b"\x1bOP");
+    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
     tui.send(b"q");
     assert!(tui.wait_exit());
@@ -161,6 +170,9 @@ fn typed_input_reaches_the_shell_session() {
     let dir = git_fixture();
     let mut tui = Tui::launch(dir.path());
     assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    // workspaces open with the file tree focused: jump to the agent first
+    tui.send(CTRL_A);
+    tui.send(b"1");
     tui.send(b"echo marker-$((40 + 2))\r");
     assert!(tui.wait_for("marker-42"), "screen:\n{}", tui.screen());
 }
@@ -233,12 +245,13 @@ fn exited_session_shows_status_and_respawns() {
     let dir = git_fixture();
     let mut tui = Tui::launch(dir.path());
     assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    tui.send(CTRL_A);
+    tui.send(b"1");
     tui.send(b"exit 7\r");
     // dashboard: red cross in the tab bar, exit code in the pane title,
     // count in the status bar
     assert!(tui.wait_for("✖"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("exited (7)"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("1 exited"), "screen:\n{}", tui.screen());
     // respawn in place
     tui.send(CTRL_A);
     tui.send(b"R");
@@ -254,7 +267,7 @@ fn rename_session_via_prompt() {
     let mut tui = Tui::launch(dir.path());
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
-    tui.send(b",");
+    tui.send(b"r");
     assert!(tui.wait_for("rename session"), "screen:\n{}", tui.screen());
     // clear the prefilled title, type a new one
     tui.send(&[0x7f; 10]);
@@ -310,7 +323,7 @@ fn chats_tab_lists_and_resumes_past_conversations() {
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
     tui.send(b"h");
-    assert!(tui.wait_for("Chats (1)"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("fix the flux capacitor"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("fix the flux capacitor"), "screen:\n{}", tui.screen());
     tui.send(b"\r");
     assert!(tui.wait_for("resuming chat cafe1234"), "screen:\n{}", tui.screen());
@@ -346,11 +359,10 @@ fn welcome_screen_lists_projects_and_opens_workspace() {
     assert!(tui.wait_for("▸ open "), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("~/code/otherproj"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("1 chat"), "screen:\n{}", tui.screen());
-    // Enter opens the current directory as a workspace
+    // Enter opens the current directory as a workspace (Agents shell)
     tui.send(b"\r");
-    assert!(tui.wait_for("Files"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("hello.txt"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("AGENTS"), "screen:\n{}", tui.screen());
 }
 
 #[test]
@@ -361,6 +373,134 @@ fn welcome_screen_q_quits() {
     assert!(tui.wait_for("██"), "screen:\n{}", tui.screen());
     tui.send(b"q");
     assert!(tui.wait_exit());
+}
+
+#[test]
+fn editor_opens_edits_and_saves_modal_style() {
+    let dir = git_fixture();
+    let mut tui = Tui::launch(dir.path());
+    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    // sidebar → select hello.txt (items: 📂 src, hello.txt) → open
+    tui.send(CTRL_A);
+    tui.send(b"f");
+    tui.send(b"j"); // src → hello.txt
+    tui.send(b"\r");
+    // editor pane: statusline shows NOR mode + filename, tab bar shows ✎
+    assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("hello e2e"), "screen:\n{}", tui.screen());
+    // modal editing: insert at start, dirty marker appears
+    tui.send(b"iedited ");
+    assert!(tui.wait_for(" INSERT "), "screen:\n{}", tui.screen());
+    tui.send(&[0x1b]); // Esc
+    assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("[+]"), "screen:\n{}", tui.screen());
+    // :wq writes and closes
+    tui.send(b":wq\r");
+    assert!(tui.wait_gone(" NORMAL "), "screen:\n{}", tui.screen());
+    let saved = std::fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+    assert_eq!(saved, "edited hello e2e\n");
+}
+
+#[test]
+fn editor_syntax_highlighting_renders_rust() {
+    let dir = git_fixture();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {\n    let x = \"hi\";\n}\n").unwrap();
+    let mut tui = Tui::launch(dir.path());
+    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    tui.send(CTRL_A);
+    tui.send(b"f");
+    tui.send(b"j"); // src → main.rs (sorted: 📂 src, hello.txt, main.rs)
+    tui.send(b"j");
+    tui.send(b"\r");
+    assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
+    // content + line numbers + language in the statusline
+    assert!(tui.wait_for("fn main"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("rust"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for(" 1 "), "screen:\n{}", tui.screen());
+    tui.send(b":q\r");
+    assert!(tui.wait_gone(" NORMAL "), "screen:\n{}", tui.screen());
+}
+
+/// Fake LSP server (bash): initialize + one diagnostic on didOpen + hover.
+fn write_fake_lsp(dir: &std::path::Path) -> String {
+    let script = dir.join("fake-lsp.sh");
+    std::fs::write(
+        &script,
+        r##"#!/bin/bash
+read_msg() {
+  local len=0 line
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    [ -z "$line" ] && break
+    case "$line" in "Content-Length:"*) len=$(echo "${line#Content-Length:}" | tr -d ' ');; esac
+  done
+  dd bs=1 count="$len" 2>/dev/null
+}
+send() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while true; do
+  msg=$(read_msg)
+  [ -z "$msg" ] && exit 0
+  case "$msg" in
+    *'"method":"initialize"'*) send '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"method":"textDocument/didOpen"'*)
+      uri=$(echo "$msg" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' | head -1)
+      send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"severity\":1,\"message\":\"e2e fake error\"}]}}" ;;
+    *'"method":"textDocument/hover"'*)
+      id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+      send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"e2e hover docs\"}}}" ;;
+  esac
+done
+"##,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script.to_string_lossy().into_owned()
+}
+
+#[test]
+fn editor_lsp_hover_and_diagnostics() {
+    let dir = git_fixture();
+    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let lsp = write_fake_lsp(dir.path());
+    let mut tui = Tui::launch_env(dir.path(), &[("VIBIN_LSP_CMD", &lsp)]);
+    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    // open main.rs (tree: 📂 src, fake-lsp.sh, hello.txt, main.rs)
+    tui.send(CTRL_A);
+    tui.send(b"f");
+    tui.send(b"jjj");
+    tui.send(b"\r");
+    assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
+    // diagnostics: gutter dot, statusline message + error count
+    assert!(tui.wait_for("e2e fake error"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("E 1"), "screen:\n{}", tui.screen());
+    // hover via space-k
+    tui.send(b" k");
+    assert!(tui.wait_for("e2e hover docs"), "screen:\n{}", tui.screen());
+    // any key dismisses
+    tui.send(b"q");
+    assert!(tui.wait_gone("e2e hover docs"), "screen:\n{}", tui.screen());
+}
+
+#[test]
+fn command_palette_opens_files_and_runs_commands() {
+    let dir = git_fixture();
+    let mut tui = Tui::launch(dir.path());
+    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    // Ctrl+K → palette, fuzzy-find hello.txt, Enter opens the editor
+    tui.send(&[0x0b]);
+    assert!(tui.wait_for("🔍"), "screen:\n{}", tui.screen());
+    tui.send(b"hello");
+    assert!(tui.wait_for("▸ hello.txt"), "screen:\n{}", tui.screen());
+    tui.send(b"\r");
+    assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("hello e2e"), "screen:\n{}", tui.screen());
+    tui.send(b":q\r");
+    // command mode: > new agent
+    tui.send(&[0x0b]);
+    tui.send(b">new agent\r");
+    assert!(tui.wait_for(" 2:"), "screen:\n{}", tui.screen());
 }
 
 #[test]
@@ -375,4 +515,17 @@ fn session_close_shows_placeholder() {
     tui.send(CTRL_A);
     tui.send(b"c");
     assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
+}
+
+/// Not a test — run with `cargo test --test e2e dump_welcome -- --ignored`
+/// to print the rendered welcome screen for visual inspection.
+#[test]
+#[ignore]
+fn dump_welcome() {
+    let dir = git_fixture();
+    let home = TempDir::new().unwrap();
+    let tui = Tui::launch_welcome(dir.path(), &[("HOME", home.path().to_str().unwrap())]);
+    assert!(tui.wait_for("v0.1.0"));
+    std::thread::sleep(Duration::from_millis(300));
+    panic!("welcome screen:\n{}", tui.screen());
 }

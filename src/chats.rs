@@ -196,9 +196,10 @@ mod tests {
 
     #[test]
     fn munges_like_claude_code() {
+        // the '.' in the user segment must munge to '-' like the rest
         assert_eq!(
-            munge_workdir(Path::new("/Users/rolandsz.kovacs/Documents/Code/agentic-tui")),
-            "-Users-rolandsz-kovacs-Documents-Code-agentic-tui"
+            munge_workdir(Path::new("/Users/user.name/Documents/Code/agentic-tui")),
+            "-Users-user-name-Documents-Code-agentic-tui"
         );
         assert_eq!(munge_workdir(Path::new("/a_b/c d")), "-a-b-c-d");
     }

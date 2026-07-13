@@ -23,6 +23,8 @@ pub struct DiffLine {
     /// Line number in the new file (adds and context).
     pub new_no: Option<u32>,
     pub text: String,
+    /// Language of the file this line belongs to (for syntax highlighting).
+    pub lang: Option<&'static str>,
 }
 
 impl DiffLine {
@@ -32,6 +34,7 @@ impl DiffLine {
             old_no: None,
             new_no: None,
             text: text.into(),
+            lang: None,
         }
     }
 }
@@ -74,6 +77,7 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
     let mut dels: u32 = 0;
     let mut stat_idx: Option<usize> = None;
     let mut in_hunk = false;
+    let mut lang: Option<&'static str> = None;
 
     let close_file = |out: &mut Vec<DiffLine>, stat_idx: &mut Option<usize>, adds: &mut u32, dels: &mut u32| {
         if let Some(idx) = stat_idx.take() {
@@ -86,7 +90,11 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             close_file(&mut out, &mut stat_idx, &mut adds, &mut dels);
-            out.push(DiffLine::plain(DiffLineKind::FileHeader, parse_file_path(rest)));
+            let path = parse_file_path(rest);
+            let name =
+                crate::editor::highlight::language_name(std::path::Path::new(&path));
+            lang = (name != "text").then_some(name);
+            out.push(DiffLine::plain(DiffLineKind::FileHeader, path));
             out.push(DiffLine::plain(DiffLineKind::FileStat, String::new()));
             stat_idx = Some(out.len() - 1);
             in_hunk = false;
@@ -117,6 +125,7 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
                 old_no: None,
                 new_no: Some(new_no),
                 text: rest.to_string(),
+                lang,
             });
             new_no += 1;
             adds += 1;
@@ -126,6 +135,7 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
                 old_no: Some(old_no),
                 new_no: None,
                 text: rest.to_string(),
+                lang,
             });
             old_no += 1;
             dels += 1;
@@ -136,6 +146,7 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
                 old_no: Some(old_no),
                 new_no: Some(new_no),
                 text: rest.to_string(),
+                lang,
             });
             old_no += 1;
             new_no += 1;
@@ -252,6 +263,16 @@ mod tests {
         assert_eq!(adds, vec![(Some(1), "first"), (Some(2), "second")]);
         // the "\ No newline" marker is hidden
         assert!(!lines.iter().any(|l| l.text.contains("No newline")));
+    }
+
+    #[test]
+    fn content_lines_carry_the_file_language() {
+        let text = "diff --git a/src/x.rs b/src/x.rs\n@@ -1,1 +1,1 @@\n-old\n+let x = 1;\ndiff --git a/notes.xyz b/notes.xyz\n@@ -1,1 +1,1 @@\n+plain\n";
+        let lines = parse(text);
+        let add_rs = lines.iter().find(|l| l.text == "let x = 1;").unwrap();
+        assert_eq!(add_rs.lang, Some("rust"));
+        let add_plain = lines.iter().find(|l| l.text == "plain").unwrap();
+        assert_eq!(add_plain.lang, None);
     }
 
     #[test]

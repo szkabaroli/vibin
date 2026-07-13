@@ -1,0 +1,355 @@
+# Regenerate the per-language spell-check dictionaries (assets/dict/*.dic)
+# from real toolchain sources. Each job installs a language toolchain,
+# tokenizes its standard-library sources with scripts/extract-dict.py
+# (identifiers split camelCase/snake_case, words <= 2 chars or made of a
+# single repeated character dropped), and uploads a Hunspell .dic file.
+# The final job collects them and opens a PR.
+
+name: dictionaries
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 1 * *" # monthly, 1st at 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stdlib sources
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rust-src --toolchain stable
+      - name: Extract
+        run: |
+          src="$(rustc +stable --print sysroot)/lib/rustlib/src/rust/library"
+          python3 scripts/extract-dict.py "$src" --ext .rs > rust.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-rust, path: rust.dic }
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - name: Extract
+        run: |
+          python3 scripts/extract-dict.py "$(go env GOROOT)/src" --ext .go > go.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-go, path: go.dic }
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Extract
+        run: |
+          src="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')"
+          python3 scripts/extract-dict.py "$src" --ext .py --ext .pyi > python.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-python, path: python.dic }
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: lts/* }
+      - name: Install TypeScript + Node type declarations
+        run: |
+          mkdir -p /tmp/tsdict && cd /tmp/tsdict
+          npm install --no-save typescript @types/node
+      - name: Extract
+        run: |
+          python3 scripts/extract-dict.py \
+            /tmp/tsdict/node_modules/typescript/lib \
+            /tmp/tsdict/node_modules/@types/node \
+            --ext .d.ts > ts.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-ts, path: ts.dic }
+
+  ruby:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: "3.3" }
+      - name: Extract
+        run: |
+          src="$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]')"
+          python3 scripts/extract-dict.py "$src" --ext .rb > ruby.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-ruby, path: ruby.dic }
+
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, intl, gd, curl, zip
+      - name: Extract via runtime reflection
+        run: |
+          php -r '
+            foreach (get_defined_functions()["internal"] as $f) echo $f, "\n";
+            foreach (get_declared_classes() as $c) {
+              echo $c, "\n";
+              foreach (get_class_methods($c) as $m) echo $m, "\n";
+            }
+            foreach (array_keys(get_defined_constants()) as $k) echo $k, "\n";
+          ' | python3 scripts/extract-dict.py - > php.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-php, path: php.dic }
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract from system + libstdc++ headers
+        run: |
+          gxx_inc="$(echo | g++ -E -x c++ - -v 2>&1 | sed -n 's/^ //p' | grep '/c++' | head -n1)"
+          python3 scripts/extract-dict.py "$gxx_inc" /usr/include --ext .h --ext .hpp --ext "" > cpp.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-cpp, path: cpp.dic }
+
+  csharp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0.x" }
+      - name: Extract via runtime reflection
+        run: |
+          mkdir -p /tmp/csdict && cd /tmp/csdict
+          dotnet new console --no-restore -o dump
+          cat > dump/Program.cs <<'EOF'
+          using System.Reflection;
+          var tpa = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+              .Split(Path.PathSeparator);
+          foreach (var path in tpa)
+          {
+              Assembly asm;
+              try { asm = Assembly.LoadFrom(path); } catch { continue; }
+              Type[] types;
+              try { types = asm.GetExportedTypes(); } catch { continue; }
+              foreach (var t in types)
+              {
+                  Console.WriteLine(t.Name);
+                  MemberInfo[] members;
+                  try { members = t.GetMembers(); } catch { continue; }
+                  foreach (var m in members) Console.WriteLine(m.Name);
+              }
+          }
+          EOF
+          dotnet run --project dump | python3 "$GITHUB_WORKSPACE/scripts/extract-dict.py" - > "$GITHUB_WORKSPACE/csharp.dic"
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-csharp, path: csharp.dic }
+
+  sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the runner's preinstalled PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -Atc "SELECT version();"
+      - name: Extract from system catalogs
+        run: |
+          sudo -u postgres psql -At <<'SQL' | python3 scripts/extract-dict.py - > sql.dic
+          SELECT word FROM pg_get_keywords()
+          UNION SELECT proname FROM pg_proc
+          UNION SELECT typname FROM pg_type
+          UNION SELECT name FROM pg_settings
+          UNION SELECT relname FROM pg_class
+          UNION SELECT attname FROM pg_attribute
+          UNION SELECT column_name FROM information_schema.columns;
+          SQL
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-sql, path: sql.dic }
+
+  shell:
+    runs-on: ubuntu-latest
+    # A pinned container instead of the runner's own environment: the
+    # ubuntu-latest image gains/loses preinstalled tools with every rollout,
+    # which would churn the dictionary. The stock ubuntu image ships without
+    # man pages (a dpkg excludes file strips /usr/share/man), so drop the
+    # exclude and reinstall the core packages to restore their docs.
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install a stable, documented command set
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get update
+          apt-get install -y python3 git man-db manpages bash-completion
+          apt-get install -y --reinstall \
+            coreutils findutils grep sed gawk tar gzip bash util-linux \
+            procps hostname curl wget openssh-client rsync less diffutils
+      - uses: actions/checkout@v4
+      - name: Extract from commands, builtins, and man pages
+        shell: bash
+        run: |
+          { compgen -c; compgen -b; compgen -k; } > words.txt
+          find /usr/share/man/man1 /usr/share/man/man8 -name '*.gz' -print0 \
+            | xargs -0 zcat 2>/dev/null >> words.txt || true
+          python3 scripts/extract-dict.py - < words.txt > shell.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-shell, path: shell.dic }
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: lts/* }
+      - name: Install browser-spec data packages
+        run: |
+          mkdir -p /tmp/webdict && cd /tmp/webdict
+          npm install --no-save @webref/css @webref/elements mdn-data typescript
+      - name: Extract
+        run: |
+          python3 scripts/extract-dict.py \
+            /tmp/webdict/node_modules/@webref/css \
+            /tmp/webdict/node_modules/mdn-data/css \
+            --ext .json > css.dic
+          python3 scripts/extract-dict.py \
+            /tmp/webdict/node_modules/@webref/elements \
+            /tmp/webdict/node_modules/mdn-data/html \
+            /tmp/webdict/node_modules/typescript/lib \
+            --ext .json --ext lib.dom.d.ts > html.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-web, path: "*.dic" }
+
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download kotlin-stdlib sources from Maven Central
+        run: |
+          base=https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib
+          ver="$(curl -fsSL "$base/maven-metadata.xml" | sed -n 's:.*<release>\(.*\)</release>.*:\1:p')"
+          echo "kotlin-stdlib $ver"
+          curl -fsSL -o stdlib-sources.jar "$base/$ver/kotlin-stdlib-$ver-sources.jar"
+          unzip -q stdlib-sources.jar -d stdlib-src
+      - name: Extract
+        run: python3 scripts/extract-dict.py stdlib-src --ext .kt > kotlin.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-kotlin, path: kotlin.dic }
+
+  kubernetes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the Kubernetes OpenAPI spec
+        run: |
+          ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          echo "kubernetes $ver"
+          curl -fsSL -o swagger.json \
+            "https://raw.githubusercontent.com/kubernetes/kubernetes/$ver/api/openapi-spec/swagger.json"
+      - name: Extract API resources, fields, and kubectl vocabulary
+        run: |
+          kubectl completion bash > kubectl-completion.txt || true
+          cat swagger.json kubectl-completion.txt | python3 scripts/extract-dict.py - > k8s.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-k8s, path: k8s.dic }
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gather Docker CLI, compose-spec, and Dockerfile sources
+        run: |
+          docker completion bash > words.txt
+          curl -fsSL https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json >> words.txt
+          # BuildKit's Dockerfile frontend: instruction set, flags
+          # (--mount=type=cache etc.), and reference docs.
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/moby/buildkit /tmp/buildkit
+          git -C /tmp/buildkit sparse-checkout set frontend/dockerfile
+      - name: Extract
+        run: |
+          python3 scripts/extract-dict.py - /tmp/buildkit/frontend/dockerfile < words.txt > docker.dic
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-docker, path: docker.dic }
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Init a workspace with popular providers
+        run: |
+          mkdir -p /tmp/tf && cd /tmp/tf
+          cat > main.tf <<'EOF'
+          terraform {
+            required_providers {
+              aws        = { source = "hashicorp/aws" }
+              kubernetes = { source = "hashicorp/kubernetes" }
+              random     = { source = "hashicorp/random" }
+              tls        = { source = "hashicorp/tls" }
+              local      = { source = "hashicorp/local" }
+              null       = { source = "hashicorp/null" }
+            }
+          }
+          EOF
+          terraform init -input=false
+      - name: Extract provider schemas and CLI vocabulary
+        run: |
+          cd /tmp/tf
+          terraform providers schema -json > schemas.json
+          terraform -help > help.txt 2>&1 || true
+          cat schemas.json help.txt | python3 "$GITHUB_WORKSPACE/scripts/extract-dict.py" - > "$GITHUB_WORKSPACE/terraform.dic"
+      - uses: actions/upload-artifact@v4
+        with: { name: dict-terraform, path: terraform.dic }
+
+  publish:
+    needs:
+      [
+        rust,
+        go,
+        python,
+        typescript,
+        ruby,
+        php,
+        cpp,
+        csharp,
+        sql,
+        shell,
+        web,
+        kotlin,
+        kubernetes,
+        docker,
+        terraform,
+      ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dict-*
+          merge-multiple: true
+          path: assets/dict
+      - name: Summarize
+        run: wc -l assets/dict/*.dic
+      - name: Open PR with regenerated dictionaries
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/regenerate-dictionaries
+          title: "Regenerate spell-check dictionaries from toolchain sources"
+          commit-message: "Regenerate assets/dict/*.dic from toolchain stdlib sources"
+          body: >
+            Automated dictionary refresh: each language toolchain was
+            installed, its standard-library sources tokenized, identifiers
+            split into component words, and words of 2 characters or fewer
+            (or made of a single repeated character) removed.
+          add-paths: assets/dict/*.dic

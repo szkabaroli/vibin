@@ -1,0 +1,858 @@
+diff --git a/src/colors.rs b/src/colors.rs
+new file mode 100644
+index 000000000..fca86c277
+--- /dev/null
++++ b/src/colors.rs
+@@ -0,0 +1,195 @@
++//! # Colors
++//!
++//! Terminal capability queries for color values and the color scheme
++//! (light vs. dark mode).
++
++/// Terminal color type, used in queries and responses.
++///
++/// `Palette(n)` uses OSC 4. The remaining variants use OSC 10..=19.
++#[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Copy, Eq)]
++pub enum ColorType {
++    Palette(u8),
++    Foreground,
++    Background,
++    Cursor,
++    PointerForeground,
++    PointerBackground,
++    TektronixForeground,
++    TektronixBackground,
++    HighlightBackground,
++    TektronixCursor,
++    HighlightForeground,
++}
++
++impl ColorType {
++    /// Maps an OSC number (10..=19) to the corresponding `ColorType` variant.
++    pub(crate) fn from_osc_number(n: u8) -> Option<Self> {
++        match n {
++            10 => Some(Self::Foreground),
++            11 => Some(Self::Background),
++            12 => Some(Self::Cursor),
++            13 => Some(Self::PointerForeground),
++            14 => Some(Self::PointerBackground),
++            15 => Some(Self::TektronixForeground),
++            16 => Some(Self::TektronixBackground),
++            17 => Some(Self::HighlightBackground),
++            18 => Some(Self::TektronixCursor),
++            19 => Some(Self::HighlightForeground),
++            _ => None,
++        }
++    }
++
++    /// Returns the OSC number for this color type.
++    pub(crate) fn osc_number(&self) -> u8 {
++        match self {
++            Self::Palette(_) => 4,
++            Self::Foreground => 10,
++            Self::Background => 11,
++            Self::Cursor => 12,
++            Self::PointerForeground => 13,
++            Self::PointerBackground => 14,
++            Self::TektronixForeground => 15,
++            Self::TektronixBackground => 16,
++            Self::HighlightBackground => 17,
++            Self::TektronixCursor => 18,
++            Self::HighlightForeground => 19,
++        }
++    }
++}
++
++/// The terminal's color scheme preference (dark or light).
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++#[derive(Debug, PartialOrd, Ord, PartialEq, Hash, Clone, Copy, Eq)]
++pub enum ColorScheme {
++    Dark,
++    Light,
++}
++
++/// A parsed color response from the terminal.
++#[derive(Debug, PartialOrd, PartialEq, Hash, Clone, Eq)]
++pub(crate) struct ColorEntry {
++    pub color_type: ColorType,
++    pub r: u8,
++    pub g: u8,
++    pub b: u8,
++}
++
++/// Query for the RGB value of a single terminal color.
++///
++/// Use OSC 4 for palette entries and OSC 10..=19 for dynamic colors such as
++/// foreground, background, and cursor. Returns `None` if the terminal does not
++/// reply.
++///
++/// Use with [`QueryBatch`](crate::query::QueryBatch):
++///
++/// ```no_run
++/// # #[cfg(unix)] {
++/// use crossterm::colors::{ColorType, QueryColor};
++/// use crossterm::query::QueryBatch;
++///
++/// let mut batch = QueryBatch::new();
++/// let fg = batch.add(QueryColor(ColorType::Foreground));
++/// let bg = batch.add(QueryColor(ColorType::Background));
++/// let results = batch.execute()?;
++/// println!("fg: {:?}, bg: {:?}", results.get(&fg)?, results.get(&bg)?);
++/// # }
++/// # Ok::<(), std::io::Error>(())
++/// ```
++#[cfg(all(unix, feature = "events"))]
++#[derive(Clone)]
++pub struct QueryColor(pub ColorType);
++
++#[cfg(all(unix, feature = "events"))]
++#[allow(private_interfaces)]
++impl crate::query::TerminalQuery for QueryColor {
++    type Response = Option<(u8, u8, u8)>;
++
++    fn query_bytes(&self) -> Vec<u8> {
++        let mut buf = Vec::new();
++        let n = self.0.osc_number();
++        match self.0 {
++            ColorType::Palette(index) => {
++                use std::io::Write;
++                let _ = write!(buf, "\x1B]{n};{index};?\x1B\\");
++            }
++            _ => {
++                use std::io::Write;
++                let _ = write!(buf, "\x1B]{n};?\x1B\\");
++            }
++        }
++        buf
++    }
++
++    fn matches(&self, event: &crate::event::internal::InternalEvent) -> bool {
++        matches!(
++            event,
++            crate::event::internal::InternalEvent::ColorResponse(entry)
++                if entry.color_type == self.0
++        )
++    }
++
++    fn extract(
++        &self,
++        event: Option<crate::event::internal::InternalEvent>,
++    ) -> std::io::Result<Option<(u8, u8, u8)>> {
++        match event {
++            Some(crate::event::internal::InternalEvent::ColorResponse(entry)) => {
++                Ok(Some((entry.r, entry.g, entry.b)))
++            }
++            None => Ok(None),
++            _ => unreachable!(),
++        }
++    }
++}
++
++/// Query the terminal's current color scheme (dark or light mode).
++///
++/// Sends DEC private mode report `CSI ? 996 n`; the terminal replies with
++/// `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light). Returns `None` if
++/// the terminal does not reply.
++///
++/// Use with [`QueryBatch`](crate::query::QueryBatch):
++///
++/// ```no_run
++/// # #[cfg(unix)] {
++/// use crossterm::colors::QueryColorScheme;
++/// use crossterm::query::QueryBatch;
++///
++/// let mut batch = QueryBatch::new();
++/// let scheme = batch.add(QueryColorScheme);
++/// let results = batch.execute()?;
++/// println!("scheme: {:?}", results.get(&scheme)?);
++/// # }
++/// # Ok::<(), std::io::Error>(())
++/// ```
++#[cfg(all(unix, feature = "events"))]
++#[derive(Clone)]
++pub struct QueryColorScheme;
++
++#[cfg(all(unix, feature = "events"))]
++#[allow(private_interfaces)]
++impl crate::query::TerminalQuery for QueryColorScheme {
++    type Response = Option<ColorScheme>;
++
++    fn query_bytes(&self) -> Vec<u8> {
++        b"\x1B[?996n".to_vec()
++    }
++
++    fn matches(&self, event: &crate::event::internal::InternalEvent) -> bool {
++        matches!(
++            event,
++            crate::event::internal::InternalEvent::ColorSchemeResponse(_)
++        )
++    }
++
++    fn extract(
++        &self,
++        event: Option<crate::event::internal::InternalEvent>,
++    ) -> std::io::Result<Option<ColorScheme>> {
++        match event {
++            Some(crate::event::internal::InternalEvent::ColorSchemeResponse(s)) => Ok(Some(s)),
++            None => Ok(None),
++            _ => unreachable!(),
++        }
++    }
++}
+diff --git a/src/cursor/sys/unix.rs b/src/cursor/sys/unix.rs
+index ed9919541..ce54de079 100644
+--- a/src/cursor/sys/unix.rs
++++ b/src/cursor/sys/unix.rs
+@@ -1,5 +1,5 @@
+ use std::{
+-    io::{self, Error, ErrorKind, Write},
++    io::{self, Error, ErrorKind},
+     time::Duration,
+ };
+ 
+@@ -40,10 +40,8 @@ fn read_position_raw() -> io::Result<(u16, u16)> {
+         let _ = internal::read(&CursorPositionFilter);
+     }
+ 
+-    // Use `ESC [ 6 n` to and retrieve the cursor position.
+-    let mut stdout = io::stdout();
+-    stdout.write_all(b"\x1B[6n")?;
+-    stdout.flush()?;
++    // Use `ESC [ 6 n` to retrieve the cursor position.
++    crate::event::write_query(b"\x1B[6n")?;
+ 
+     loop {
+         match internal::poll(Some(Duration::from_millis(2000)), &CursorPositionFilter) {
+diff --git a/src/event.rs b/src/event.rs
+index 7d5e9ebe3..d3f82d575 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -54,6 +54,8 @@
+ //!             #[cfg(feature = "bracketed-paste")]
+ //!             Event::Paste(data) => println!("{:?}", data),
+ //!             Event::Resize(width, height) => println!("New size {}x{}", width, height),
++//!             #[cfg(all(unix, feature = "events"))]
++//!             Event::ColorSchemeChanged(scheme) => println!("{:?}", scheme),
+ //!         }
+ //!     }
+ //!     execute!(
+@@ -100,6 +102,8 @@
+ //!                 #[cfg(feature = "bracketed-paste")]
+ //!                 Event::Paste(data) => println!("Pasted {:?}", data),
+ //!                 Event::Resize(width, height) => println!("New size {}x{}", width, height),
++//!                 #[cfg(all(unix, feature = "events"))]
++//!                 Event::ColorSchemeChanged(scheme) => println!("{:?}", scheme),
+ //!             }
+ //!         } else {
+ //!             // Timeout expired and no `Event` is available
+@@ -132,6 +136,8 @@ use derive_more::derive::IsVariant;
+ #[cfg(feature = "event-stream")]
+ pub use stream::EventStream;
+ 
++#[cfg(all(unix, feature = "events"))]
++use crate::colors::ColorScheme;
+ use crate::{
+     csi,
+     event::{filter::EventFilter, internal::InternalEvent},
+@@ -230,6 +236,8 @@ pub fn poll(timeout: Duration) -> std::io::Result<bool> {
+ pub fn read() -> std::io::Result<Event> {
+     match internal::read(&EventFilter)? {
+         InternalEvent::Event(event) => Ok(event),
++        #[cfg(all(unix, feature = "events"))]
++        InternalEvent::ColorSchemeResponse(scheme) => Ok(Event::ColorSchemeChanged(scheme)),
+         #[cfg(unix)]
+         _ => unreachable!(),
+     }
+@@ -259,12 +267,29 @@ pub fn read() -> std::io::Result<Event> {
+ pub fn try_read() -> Option<Event> {
+     match internal::try_read(&EventFilter) {
+         Some(InternalEvent::Event(event)) => Some(event),
++        #[cfg(all(unix, feature = "events"))]
++        Some(InternalEvent::ColorSchemeResponse(scheme)) => {
++            Some(Event::ColorSchemeChanged(scheme))
++        }
+         None => None,
+         #[cfg(unix)]
+         _ => unreachable!(),
+     }
+ }
+ 
++/// Writes a terminal query. Avoids writing to stdout when `use-dev-tty` is enabled since it may be piped.
++#[cfg(unix)]
++pub(crate) fn write_query(bytes: &[u8]) -> std::io::Result<()> {
++    use std::io::Write;
++    #[cfg(feature = "use-dev-tty")]
++    let mut out = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
++    #[cfg(not(feature = "use-dev-tty"))]
++    let mut out = std::io::stdout();
++    out.write_all(bytes)?;
++    out.flush()?;
++    Ok(())
++}
++
+ bitflags! {
+     /// Represents special flags that tell compatible terminals to add extra information to keyboard events.
+     ///
+@@ -394,6 +419,45 @@ impl Command for DisableFocusChange {
+     }
+ }
+ 
++/// A command that enables color scheme change notifications via DEC mode `?2031`.
++///
++/// While enabled, the terminal sends a `CSI ? 997 ; {1,2} n` report whenever the
++/// color scheme changes. Crossterm surfaces these as
++/// [`Event::ColorSchemeChanged`].
++///
++/// It should be paired with [`DisableColorSchemeDetection`] at the end of execution.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct EnableColorSchemeDetection;
++
++impl Command for EnableColorSchemeDetection {
++    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
++        f.write_str(csi!("?2031h"))
++    }
++
++    #[cfg(windows)]
++    fn execute_winapi(&self) -> std::io::Result<()> {
++        Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "Color scheme detection not implemented in the legacy Windows API.",
++        ))
++    }
++}
++
++/// A command that disables color scheme change notifications.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct DisableColorSchemeDetection;
++
++impl Command for DisableColorSchemeDetection {
++    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
++        f.write_str(csi!("?2031l"))
++    }
++
++    #[cfg(windows)]
++    fn execute_winapi(&self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
+ /// A command that enables [bracketed paste mode](https://en.wikipedia.org/wiki/Bracketed-paste).
+ ///
+ /// It should be paired with [`DisableBracketedPaste`] at the end of execution.
+@@ -547,6 +611,10 @@ pub enum Event {
+     /// A resize event with new dimensions after resize (columns, rows).
+     /// **Note** that resize events can occur in batches.
+     Resize(u16, u16),
++    /// The terminal's color scheme changed. Only emitted while
++    /// [`EnableColorSchemeDetection`] is active.
++    #[cfg(all(unix, feature = "events"))]
++    ColorSchemeChanged(ColorScheme),
+ }
+ 
+ impl Event {
+diff --git a/src/event/filter.rs b/src/event/filter.rs
+index b939a297d..04a901a3a 100644
+--- a/src/event/filter.rs
++++ b/src/event/filter.rs
+@@ -30,7 +30,7 @@ impl Filter for KeyboardEnhancementFlagsFilter {
+         // progressive keyboard enhancement.
+         matches!(
+             *event,
+-            InternalEvent::KeyboardEnhancementFlags(_) | InternalEvent::PrimaryDeviceAttributes
++            InternalEvent::KeyboardEnhancementFlags(_) | InternalEvent::PrimaryDeviceAttributes(_)
+         )
+     }
+ }
+@@ -42,7 +42,7 @@ pub(crate) struct PrimaryDeviceAttributesFilter;
+ #[cfg(unix)]
+ impl Filter for PrimaryDeviceAttributesFilter {
+     fn eval(&self, event: &InternalEvent) -> bool {
+-        matches!(*event, InternalEvent::PrimaryDeviceAttributes)
++        matches!(*event, InternalEvent::PrimaryDeviceAttributes(_))
+     }
+ }
+ 
+@@ -52,7 +52,10 @@ pub(crate) struct EventFilter;
+ impl Filter for EventFilter {
+     #[cfg(unix)]
+     fn eval(&self, event: &InternalEvent) -> bool {
+-        matches!(*event, InternalEvent::Event(_))
++        matches!(
++            *event,
++            InternalEvent::Event(_) | InternalEvent::ColorSchemeResponse(_)
++        )
+     }
+ 
+     #[cfg(windows)]
+@@ -92,18 +95,21 @@ mod tests {
+                 crate::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+             ))
+         );
+-        assert!(KeyboardEnhancementFlagsFilter.eval(&InternalEvent::PrimaryDeviceAttributes));
++        assert!(KeyboardEnhancementFlagsFilter.eval(&InternalEvent::PrimaryDeviceAttributes(vec![])));
+     }
+ 
+     #[test]
+     fn test_primary_device_attributes_filter_filters_primary_device_attributes() {
+         assert!(!PrimaryDeviceAttributesFilter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
+-        assert!(PrimaryDeviceAttributesFilter.eval(&InternalEvent::PrimaryDeviceAttributes));
++        assert!(PrimaryDeviceAttributesFilter.eval(&InternalEvent::PrimaryDeviceAttributes(vec![])));
+     }
+ 
+     #[test]
+     fn test_event_filter_filters_events() {
+         assert!(EventFilter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
++        assert!(EventFilter.eval(&InternalEvent::ColorSchemeResponse(
++            crate::colors::ColorScheme::Dark
++        )));
+         assert!(!EventFilter.eval(&InternalEvent::CursorPosition(0, 0)));
+     }
+ 
+diff --git a/src/event/internal.rs b/src/event/internal.rs
+index 1d6f95048..467f1a248 100644
+--- a/src/event/internal.rs
++++ b/src/event/internal.rs
+@@ -2,6 +2,8 @@ use std::time::Duration;
+ 
+ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+ 
++#[cfg(all(unix, feature = "events"))]
++use crate::colors::{ColorEntry, ColorScheme};
+ #[cfg(unix)]
+ use crate::event::KeyboardEnhancementFlags;
+ use crate::event::{filter::Filter, read::InternalEventReader, timeout::PollTimeout, Event};
+@@ -76,6 +78,14 @@ pub(crate) enum InternalEvent {
+     #[cfg(unix)]
+     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
+     /// Attributes and architectural class of the terminal.
++    ///
++    /// The vec contains the `;`-separated parameters from `ESC [ ? … c`.
+     #[cfg(unix)]
+-    PrimaryDeviceAttributes,
++    PrimaryDeviceAttributes(Vec<u16>),
++    /// A color (`OSC 4` palette or `OSC 10..=19` dynamic) reported by the terminal.
++    #[cfg(all(unix, feature = "events"))]
++    ColorResponse(ColorEntry),
++    /// The terminal's color scheme (`CSI ? 997 ; {1,2} n`).
++    #[cfg(all(unix, feature = "events"))]
++    ColorSchemeResponse(ColorScheme),
+ }
+diff --git a/src/event/sys/unix/parse.rs b/src/event/sys/unix/parse.rs
+index 8897096c0..99e134ba1 100644
+--- a/src/event/sys/unix/parse.rs
++++ b/src/event/sys/unix/parse.rs
+@@ -74,6 +74,7 @@ pub(crate) fn parse_event(
+                         }
+                     }
+                     b'[' => parse_csi(buffer),
++                    b']' => parse_osc(buffer),
+                     b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
+                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
+                         event_option.map(|event| {
+@@ -180,6 +181,7 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+         b'?' => match buffer[buffer.len() - 1] {
+             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
+             b'c' => return parse_csi_primary_device_attributes(buffer),
++            b'n' => return parse_csi_color_scheme_response(buffer),
+             _ => None,
+         },
+         b'0'..=b'9' => {
+@@ -289,15 +291,126 @@ fn parse_csi_keyboard_enhancement_flags(buffer: &[u8]) -> io::Result<Option<Inte
+ }
+ 
+ fn parse_csi_primary_device_attributes(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+-    // ESC [ 64 ; attr1 ; attr2 ; ... ; attrn ; c
++    // ESC [ ? attr1 ; attr2 ; ... ; attrn c
+     assert!(buffer.starts_with(b"\x1B[?"));
+     assert!(buffer.ends_with(b"c"));
+ 
+-    // This is a stub for parsing the primary device attributes. This response is not
+-    // exposed in the crossterm API so we don't need to parse the individual attributes yet.
+-    // See <https://vt100.net/docs/vt510-rm/DA1.html>
++    let s = std::str::from_utf8(&buffer[3..buffer.len() - 1])
++        .map_err(|_| could_not_parse_event_error())?;
++
++    let params: Vec<u16> = s
++        .split(';')
++        .filter(|p| !p.is_empty())
++        .map(|p| p.parse::<u16>().map_err(|_| could_not_parse_event_error()))
++        .collect::<io::Result<Vec<u16>>>()?;
++
++    Ok(Some(InternalEvent::PrimaryDeviceAttributes(params)))
++}
++
++fn parse_csi_color_scheme_response(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
++    // CSI ? 997 ; 1 n  (dark)
++    // CSI ? 997 ; 2 n  (light)
++    assert!(buffer.starts_with(b"\x1B[?"));
++    assert!(buffer.ends_with(b"n"));
++
++    let s = std::str::from_utf8(&buffer[3..buffer.len() - 1])
++        .map_err(|_| could_not_parse_event_error())?;
+ 
+-    Ok(Some(InternalEvent::PrimaryDeviceAttributes))
++    let mut split = s.split(';');
++
++    let code = next_parsed::<u16>(&mut split)?;
++    if code != 997 {
++        return Err(could_not_parse_event_error());
++    }
++
++    let mode = next_parsed::<u8>(&mut split)?;
++    let scheme = match mode {
++        1 => crate::colors::ColorScheme::Dark,
++        2 => crate::colors::ColorScheme::Light,
++        _ => return Err(could_not_parse_event_error()),
++    };
++
++    Ok(Some(InternalEvent::ColorSchemeResponse(scheme)))
++}
++
++fn find_osc_terminator(buffer: &[u8]) -> Option<usize> {
++    let mut i = 2; // skip ESC ]
++    while i < buffer.len() {
++        if buffer[i] == b'\x07' {
++            return Some(i + 1);
++        }
++        if buffer[i] == b'\x1B' && i + 1 < buffer.len() && buffer[i + 1] == b'\\' {
++            return Some(i + 2);
++        }
++        i += 1;
++    }
++    None
++}
++
++fn parse_color_channel(s: &str) -> Option<u8> {
++    // Terminals respond with 2-digit ("ff") or 4-digit ("ffff") hex.
++    let val = u16::from_str_radix(s, 16).ok()?;
++    Some(if s.len() <= 2 { val as u8 } else { (val >> 8) as u8 })
++}
++
++fn parse_rgb_spec(s: &str) -> Option<(u8, u8, u8)> {
++    let s = s.strip_prefix("rgb:")?;
++    let mut parts = s.split('/');
++    let r = parse_color_channel(parts.next()?)?;
++    let g = parse_color_channel(parts.next()?)?;
++    let b = parse_color_channel(parts.next()?)?;
++    if parts.next().is_some() {
++        return None;
++    }
++    Some((r, g, b))
++}
++
++fn parse_osc(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
++    use crate::colors::{ColorEntry, ColorType};
++
++    let end = match find_osc_terminator(buffer) {
++        Some(end) => end,
++        None => return Ok(None),
++    };
++
++    let terminator_len = if buffer[end - 1] == b'\\' { 2 } else { 1 };
++    let payload = std::str::from_utf8(&buffer[2..end - terminator_len])
++        .map_err(|_| could_not_parse_event_error())?;
++
++    let (osc_num_str, rest) = payload
++        .split_once(';')
++        .ok_or_else(could_not_parse_event_error)?;
++    let osc_num: u8 = osc_num_str
++        .parse()
++        .map_err(|_| could_not_parse_event_error())?;
++
++    if osc_num == 4 {
++        // OSC 4;{index};rgb:...
++        let (index_str, rgb_str) = rest
++            .split_once(';')
++            .ok_or_else(could_not_parse_event_error)?;
++        let index: u8 = index_str
++            .parse()
++            .map_err(|_| could_not_parse_event_error())?;
++        let (r, g, b) = parse_rgb_spec(rgb_str).ok_or_else(could_not_parse_event_error)?;
++        Ok(Some(InternalEvent::ColorResponse(ColorEntry {
++            color_type: ColorType::Palette(index),
++            r,
++            g,
++            b,
++        })))
++    } else if let Some(color_type) = ColorType::from_osc_number(osc_num) {
++        // OSC 10..=19;rgb:...
++        let (r, g, b) = parse_rgb_spec(rest).ok_or_else(could_not_parse_event_error)?;
++        Ok(Some(InternalEvent::ColorResponse(ColorEntry {
++            color_type,
++            r,
++            g,
++            b,
++        })))
++    } else {
++        Err(could_not_parse_event_error())
++    }
+ }
+ 
+ fn parse_modifiers(mask: u8) -> KeyModifiers {
+@@ -1503,4 +1616,87 @@ mod tests {
+             )))),
+         );
+     }
++
++    #[test]
++    fn test_parse_csi_primary_device_attributes_empty() {
++        assert_eq!(
++            parse_csi_primary_device_attributes(b"\x1B[?c").unwrap(),
++            Some(InternalEvent::PrimaryDeviceAttributes(vec![])),
++        );
++    }
++
++    #[test]
++    fn test_parse_csi_primary_device_attributes_multi() {
++        assert_eq!(
++            parse_csi_primary_device_attributes(b"\x1B[?64;1;2;6;9;15;22c").unwrap(),
++            Some(InternalEvent::PrimaryDeviceAttributes(vec![64, 1, 2, 6, 9, 15, 22])),
++        );
++    }
++
++    #[test]
++    fn test_parse_csi_primary_device_attributes_trailing_semicolon() {
++        assert_eq!(
++            parse_csi_primary_device_attributes(b"\x1B[?1;2;c").unwrap(),
++            Some(InternalEvent::PrimaryDeviceAttributes(vec![1, 2])),
++        );
++    }
++
++    #[test]
++    fn test_parse_csi_primary_device_attributes_malformed() {
++        assert!(parse_csi_primary_device_attributes(b"\x1B[?abc").is_err());
++        assert!(parse_csi_primary_device_attributes(b"\x1B[?99999999c").is_err());
++    }
++
++    #[test]
++    fn test_parse_osc_color_response() {
++        use crate::colors::{ColorEntry, ColorType};
++
++        // OSC 4 palette, BEL terminator, 4-digit hex.
++        assert_eq!(
++            parse_event(b"\x1B]4;1;rgb:ffff/0000/0000\x07", false).unwrap(),
++            Some(InternalEvent::ColorResponse(ColorEntry {
++                color_type: ColorType::Palette(1),
++                r: 0xff,
++                g: 0x00,
++                b: 0x00,
++            })),
++        );
++        // OSC 11 dynamic, ST terminator, 2-digit hex.
++        assert_eq!(
++            parse_event(b"\x1B]11;rgb:ab/cd/ef\x1B\\", false).unwrap(),
++            Some(InternalEvent::ColorResponse(ColorEntry {
++                color_type: ColorType::Background,
++                r: 0xab,
++                g: 0xcd,
++                b: 0xef,
++            })),
++        );
++    }
++
++    #[test]
++    fn test_parse_osc_color_errors() {
++        // No terminator yet, caller should keep buffering.
++        assert_eq!(parse_event(b"\x1B]10;rgb:ffff/ffff", false).unwrap(), None);
++        // Malformed rgb spec.
++        assert!(parse_event(b"\x1B]10;notacolor\x07", false).is_err());
++        // OSC 52 (clipboard) is not a color response we handle.
++        assert!(parse_event(b"\x1B]52;c;foo\x07", false).is_err());
++    }
++
++    #[test]
++    fn test_parse_csi_color_scheme_response() {
++        use crate::colors::ColorScheme;
++
++        assert_eq!(
++            parse_event(b"\x1B[?997;1n", false).unwrap(),
++            Some(InternalEvent::ColorSchemeResponse(ColorScheme::Dark)),
++        );
++        assert_eq!(
++            parse_event(b"\x1B[?997;2n", false).unwrap(),
++            Some(InternalEvent::ColorSchemeResponse(ColorScheme::Light)),
++        );
++        // Invalid mode and wrong code.
++        assert!(parse_event(b"\x1B[?997;3n", false).is_err());
++        assert!(parse_event(b"\x1B[?998;1n", false).is_err());
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 0f572aa47..bffcfe4ad 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -244,6 +244,12 @@ pub mod cursor;
+ /// A module to read events.
+ #[cfg(feature = "events")]
+ pub mod event;
++/// A module to send batched terminal capability queries.
++#[cfg(all(unix, feature = "events"))]
++pub mod query;
++/// A module to query terminal colors and color scheme.
++#[cfg(all(unix, feature = "events"))]
++pub mod colors;
+ /// A module to apply attributes and colors on your text.
+ pub mod style;
+ /// A module to work with the terminal.
+diff --git a/src/query.rs b/src/query.rs
+new file mode 100644
+index 000000000..6be748477
+--- /dev/null
++++ b/src/query.rs
+@@ -0,0 +1,156 @@
++//! Batched terminal capability querying.
++//!
++//! Sends multiple terminal queries in a single write and collects all responses
++//! in one read pass, using DA1 (`ESC [ c`) as a sentinel that follows the
++//! batched queries.
++//!
++//! Concrete query types live in their respective capability modules.
++
++use std::{io, time::Duration};
++
++use crate::event::{
++    filter::Filter,
++    internal::{self, InternalEvent},
++};
++
++/// A terminal capability query that can be issued via [`QueryBatch`].
++#[allow(private_interfaces)]
++pub trait TerminalQuery: Clone + Send + Sync + 'static {
++    type Response;
++    fn query_bytes(&self) -> Vec<u8>;
++    fn matches(&self, event: &InternalEvent) -> bool;
++    fn extract(&self, event: Option<InternalEvent>) -> io::Result<Self::Response>;
++}
++
++/// A typed handle to retrieve one query's result from a [`QueryResults`].
++///
++/// Obtained by calling [`QueryBatch::add`].
++pub struct QueryHandle<T> {
++    idx: usize,
++    extract: Box<dyn Fn(Option<InternalEvent>) -> io::Result<T>>,
++}
++
++/// Results returned by [`QueryBatch::execute`].
++pub struct QueryResults {
++    results: Vec<Option<InternalEvent>>,
++}
++
++impl QueryResults {
++    /// Extracts the response for the given handle.
++    pub fn get<T>(&self, handle: &QueryHandle<T>) -> io::Result<T> {
++        (handle.extract)(self.results[handle.idx].clone())
++    }
++}
++
++struct BatchFilter {
++    matchers: Vec<Box<dyn Fn(&InternalEvent) -> bool + Send + Sync>>,
++}
++
++impl Filter for BatchFilter {
++    fn eval(&self, event: &InternalEvent) -> bool {
++        // Always pass DA1; it ends the batch read loop.
++        matches!(event, InternalEvent::PrimaryDeviceAttributes(_))
++            || self.matchers.iter().any(|m| m(event))
++    }
++}
++
++/// Sends multiple terminal queries in one write and collects all responses.
++///
++/// All queries are written together followed by a DA1 sentinel (`ESC [ c`).
++/// Reads until the DA1 reply arrives or the timeout expires; any queries that
++/// haven't responded by then are returned as `None`.
++///
++/// Concrete query types are defined in capability modules (e.g. `colors`,
++/// `graphics`).
++///
++/// # Example
++///
++/// ```no_run
++/// # #[cfg(unix)] {
++/// use crossterm::query::QueryBatch;
++///
++/// let mut batch = QueryBatch::new();
++/// // batch.add(SomeQuery) for each capability query you want to issue
++/// let _results = batch.execute()?;
++/// # }
++/// # Ok::<(), std::io::Error>(())
++/// ```
++pub struct QueryBatch {
++    /// How long [`execute`](Self::execute) waits for the DA1 reply before giving up.
++    pub timeout: Duration,
++    bytes: Vec<Vec<u8>>,
++    matchers: Vec<Box<dyn Fn(&InternalEvent) -> bool + Send + Sync>>,
++    results: Vec<Option<InternalEvent>>,
++}
++
++impl Default for QueryBatch {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl QueryBatch {
++    pub fn new() -> Self {
++        Self {
++            timeout: Duration::from_secs(2),
++            bytes: Vec::new(),
++            matchers: Vec::new(),
++            results: Vec::new(),
++        }
++    }
++
++    /// Builder-style setter for the [`timeout`](field@Self::timeout) field.
++    pub fn timeout(mut self, timeout: Duration) -> Self {
++        self.timeout = timeout;
++        self
++    }
++
++    /// Registers a query and returns a handle for retrieving its result.
++    pub fn add<Q: TerminalQuery>(&mut self, query: Q) -> QueryHandle<Q::Response> {
++        let idx = self.bytes.len();
++        let q = query.clone();
++        self.bytes.push(query.query_bytes());
++        self.matchers.push(Box::new(move |e| q.matches(e)));
++        self.results.push(None);
++        QueryHandle {
++            idx,
++            extract: Box::new(move |e| query.extract(e)),
++        }
++    }
++
++    /// Sends all queries plus a DA1 sentinel and reads until the DA1 reply arrives.
++    pub fn execute(mut self) -> io::Result<QueryResults> {
++        let filter = BatchFilter {
++            matchers: self.matchers,
++        };
++
++        // Drain any stale responses from prior queries.
++        while internal::poll(Some(Duration::ZERO), &filter)? {
++            internal::read(&filter)?;
++        }
++
++        let mut bytes: Vec<u8> = self.bytes.into_iter().flatten().collect();
++        bytes.extend_from_slice(b"\x1B[c"); // DA1 sentinel
++        crate::event::write_query(&bytes)?;
++
++        loop {
++            if !internal::poll(Some(self.timeout), &filter)? {
++                break;
++            }
++            let event = internal::read(&filter)?;
++            let is_da1 = matches!(event, InternalEvent::PrimaryDeviceAttributes(_));
++            for (matcher, result) in filter.matchers.iter().zip(self.results.iter_mut()) {
++                if matcher(&event) && result.is_none() {
++                    *result = Some(event.clone());
++                }
++            }
++            if is_da1 {
++                break;
++            }
++        }
++
++        Ok(QueryResults {
++            results: self.results,
++        })
++    }
++}

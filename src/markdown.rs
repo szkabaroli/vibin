@@ -1,0 +1,696 @@
+//! A small reusable markdown → styled-Lines renderer. Used by the LSP
+//! hover popup; intended to also render .md files later.
+//!
+//! Supported: headings, fenced code blocks, inline code, **bold**,
+//! *italic*, [links](url), bullet lists, blockquotes, and horizontal
+//! rules (---, ***, ___).
+
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+/// Hover/preview markdown colors, derived from the terminal theme with
+/// the same machinery as the editor: palette slots for accents, fg/bg
+/// washes for surfaces. Fallbacks match the old dark constants, plus
+/// light variants.
+fn wash(weight: u32) -> Option<Color> {
+    crate::color::wash(weight).map(|(r, g, b)| Color::Rgb(r, g, b))
+}
+fn slot(i: usize, dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
+    let (r, g, b) = crate::color::ansi16(i).unwrap_or(if crate::color::is_light() {
+        light
+    } else {
+        dark
+    });
+    Color::Rgb(r, g, b)
+}
+fn adaptive(dark: Color, light: Color) -> Color {
+    if crate::color::is_light() { light } else { dark }
+}
+#[allow(non_snake_case)]
+fn CODE_BG() -> Color {
+    wash(16).unwrap_or_else(|| adaptive(Color::Rgb(26, 28, 34), Color::Rgb(232, 234, 238)))
+}
+#[allow(non_snake_case)]
+fn HEADING_FG() -> Color {
+    wash(252).unwrap_or_else(|| adaptive(Color::Rgb(240, 244, 250), Color::Rgb(24, 26, 32)))
+}
+#[allow(non_snake_case)]
+fn LINK_FG() -> Color {
+    slot(12, (110, 175, 255), (9, 105, 218))
+}
+/// Same color as the hover popup's header/footer rules (ui::DIALOG_BORDER),
+/// so every horizontal line inside a popover reads as one family.
+#[allow(non_snake_case)]
+fn RULE_FG() -> Color {
+    wash(110).unwrap_or_else(|| adaptive(Color::Rgb(96, 100, 112), Color::Rgb(152, 156, 166)))
+}
+#[allow(non_snake_case)]
+fn QUOTE_FG() -> Color {
+    wash(140).unwrap_or_else(|| adaptive(Color::Rgb(150, 156, 168), Color::Rgb(104, 108, 118)))
+}
+#[allow(non_snake_case)]
+fn BULLET_FG() -> Color {
+    slot(12, (110, 175, 255), (9, 105, 218))
+}
+
+thread_local! {
+    /// Render width, used to pad code blocks into solid panels.
+    static WIDTH_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(60) };
+    /// Default language for inline `code` and unlabeled fences — the
+    /// language of the source file the docs belong to (hover popups).
+    static LANG_HINT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// A hyperlink found during rendering: rendered line index, char column
+/// within that line, label text, and target url.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdLink {
+    pub line: usize,
+    pub col: usize,
+    pub text: String,
+    pub url: String,
+}
+
+/// Render markdown into styled lines. `width` is used for horizontal rules
+/// and code-block panels. (The hover popup uses render_with_links; this
+/// simpler entry point is for future .md file rendering.)
+#[allow(dead_code)]
+pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_with_links(text, width).0
+}
+
+/// Like render(), also reporting where hyperlinks ended up so callers can
+/// emit OSC 8 overlays for terminals that support clickable links.
+/// render_with_links with a default language: inline `code` spans and
+/// fences without a language tag highlight as `lang` — hover docs read
+/// like the source file they describe.
+pub fn render_with_links_lang(
+    text: &str,
+    width: usize,
+    lang: &'static str,
+) -> (Vec<Line<'static>>, Vec<MdLink>) {
+    LANG_HINT.with(|l| l.set(lang));
+    let out = render_with_links(text, width);
+    LANG_HINT.with(|l| l.set(""));
+    out
+}
+
+pub fn render_with_links(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<MdLink>) {
+    WIDTH_HINT.with(|w| w.set(width));
+    let mut links: Vec<MdLink> = Vec::new();
+    let mut out = Vec::new();
+    let mut code_block: Option<(String, Vec<String>)> = None;
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            match code_block.take() {
+                Some((lang, block)) => out.extend(code_lines(&lang, &block)),
+                None => {
+                    let mut lang = trimmed.trim_start_matches('`').trim().to_lowercase();
+                    if lang.is_empty() {
+                        lang = LANG_HINT.with(|l| l.get()).to_string();
+                    }
+                    code_block = Some((lang, Vec::new()));
+                }
+            }
+            continue;
+        }
+        if let Some((_, block)) = &mut code_block {
+            block.push(raw.to_string());
+            continue;
+        }
+        if is_rule(trimmed) {
+            out.push(Line::from(Span::styled(
+                "─".repeat(width.max(1)),
+                Style::default().fg(RULE_FG()),
+            )));
+            continue;
+        }
+        if let Some(rest) = heading_text(trimmed) {
+            out.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default().fg(HEADING_FG()).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("> ") {
+            let mut spans = vec![Span::styled("▎ ", Style::default().fg(RULE_FG()))];
+            spans.extend(restyle(
+                inline_links(rest, 2, out.len(), &mut links),
+                Style::default().fg(QUOTE_FG()),
+            ));
+            out.push(Line::from(spans));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            let indent = raw.len() - trimmed.len();
+            let mut spans = vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled("• ", Style::default().fg(BULLET_FG())),
+            ];
+            spans.extend(inline_links(rest, indent + 2, out.len(), &mut links));
+            out.push(Line::from(spans));
+            continue;
+        }
+        let line_idx = out.len();
+        out.push(Line::from(inline_links(raw, 0, line_idx, &mut links)));
+    }
+    // unterminated fence: render what we have
+    if let Some((lang, block)) = code_block {
+        out.extend(code_lines(&lang, &block));
+    }
+    let out = collapse_rule_gaps(out, &mut links);
+    let out = wrap_lines(out, &mut links, width);
+    (out, links)
+}
+
+/// Drop blank rows adjacent to horizontal rules: the rule IS the
+/// separator, so `text\n\n---\n\nmore` renders as three rows, not five.
+fn collapse_rule_gaps(lines: Vec<Line<'static>>, links: &mut Vec<MdLink>) -> Vec<Line<'static>> {
+    let is_rule = |l: &Line| {
+        l.width() > 0 && l.spans.iter().all(|sp| sp.content.chars().all(|c| c == '─'))
+    };
+    let is_blank = |l: &Line| l.width() == 0;
+    let mut keep = vec![true; lines.len()];
+    for i in 0..lines.len() {
+        if !is_blank(&lines[i]) {
+            continue;
+        }
+        let prev = lines[..i].iter().rev().find(|l| !is_blank(l));
+        let next = lines[i + 1..].iter().find(|l| !is_blank(l));
+        if prev.is_some_and(is_rule) || next.is_some_and(is_rule) {
+            keep[i] = false;
+        }
+    }
+    // remap link line indices past the removed rows
+    let mut new_index = vec![0usize; lines.len()];
+    let mut n = 0;
+    for (i, &k) in keep.iter().enumerate() {
+        new_index[i] = n;
+        if k {
+            n += 1;
+        }
+    }
+    for link in links.iter_mut() {
+        link.line = new_index[link.line];
+    }
+    lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(l, k)| k.then_some(l))
+        .collect()
+}
+
+/// Word-wrap rendered lines to `width`, splitting styled spans at word
+/// boundaries and remapping link coordinates onto the wrapped rows. Done
+/// here (not via ratatui's Paragraph::wrap) so scroll math and link
+/// overlays keep counting real rows. Code-panel rows (fully backgrounded)
+/// are exempt — code clips rather than reflows.
+fn wrap_lines(
+    lines: Vec<Line<'static>>,
+    links: &mut Vec<MdLink>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut remapped: Vec<MdLink> = Vec::new();
+    for (idx, line) in lines.into_iter().enumerate() {
+        let line_links: Vec<MdLink> = links.iter().filter(|l| l.line == idx).cloned().collect();
+        let is_code_panel =
+            !line.spans.is_empty() && line.spans.iter().all(|sp| sp.style.bg.is_some());
+        if line.width() <= width || is_code_panel {
+            for mut l in line_links {
+                l.line = out.len();
+                remapped.push(l);
+            }
+            out.push(line);
+            continue;
+        }
+        let cells: Vec<(char, Style)> = line
+            .spans
+            .iter()
+            .flat_map(|sp| {
+                let st = sp.style;
+                sp.content.chars().map(move |c| (c, st)).collect::<Vec<_>>()
+            })
+            .collect();
+        // greedy word wrap over the styled cells
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0;
+        while start < cells.len() {
+            if !rows.is_empty() {
+                while start < cells.len() && cells[start].0 == ' ' {
+                    start += 1;
+                }
+            }
+            if start >= cells.len() {
+                break;
+            }
+            let mut end = (start + width).min(cells.len());
+            if end < cells.len()
+                && let Some(space) = (start..end).rev().find(|&i| cells[i].0 == ' ')
+                && space > start
+            {
+                end = space;
+            }
+            rows.push((start, end));
+            start = end;
+        }
+        for &(s0, e0) in &rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for &(c, st) in &cells[s0..e0] {
+                match spans.last_mut() {
+                    Some(last) if last.style == st => last.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), st)),
+                }
+            }
+            for l in &line_links {
+                let len = l.text.chars().count();
+                // links split by the wrap are dropped (same policy the
+                // hover overlay already applies to clipped links)
+                if l.col >= s0 && l.col + len <= e0 {
+                    let mut nl = l.clone();
+                    nl.line = out.len();
+                    nl.col = l.col - s0;
+                    remapped.push(nl);
+                }
+            }
+            out.push(Line::from(spans));
+        }
+    }
+    *links = remapped;
+    out
+}
+
+/// Inline `code` → spans on the panel background, syntax-highlighted with
+/// the hinted language (the hovered file's) when one is set.
+fn inline_code_spans(code: &str) -> Vec<Span<'static>> {
+    use crate::editor::highlight::{line_spans, style_for};
+    let lang = LANG_HINT.with(|l| l.get());
+    let plain = || vec![Span::styled(code.to_string(), Style::default().bg(CODE_BG()))];
+    if lang.is_empty() {
+        return plain();
+    }
+    let hl = line_spans(lang, code);
+    if hl.is_empty() {
+        return plain();
+    }
+    let mut styles = vec![Style::default().bg(CODE_BG()); code.chars().count()];
+    for span in &hl {
+        let s_chars = code.get(..span.start).map(|t| t.chars().count()).unwrap_or(0);
+        let e_chars = code.get(..span.end).map(|t| t.chars().count()).unwrap_or(s_chars);
+        let style = style_for(span.highlight).bg(CODE_BG());
+        if style.fg.is_some() {
+            for slot in styles.iter_mut().take(e_chars.min(code.chars().count())).skip(s_chars) {
+                *slot = style;
+            }
+        }
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (c, st) in code.chars().zip(styles) {
+        match spans.last_mut() {
+            Some(last) if last.style == st => last.content.to_mut().push(c),
+            _ => spans.push(Span::styled(c.to_string(), st)),
+        }
+    }
+    spans
+}
+
+/// Fenced code block → syntax-highlighted lines via tree-sitter when the
+/// fence names a language we know; plain code tint otherwise.
+fn code_lines(lang: &str, block: &[String]) -> Vec<Line<'static>> {
+    use crate::editor::highlight::{config_for_lang, highlight_source, style_for};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use tree_sitter_highlight::HighlightConfiguration;
+    thread_local! {
+        static CONFIGS: RefCell<HashMap<String, Option<HighlightConfiguration>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    let pad_to = |_text: &str, spans: &mut Vec<Span<'static>>| {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        spans.push(Span::styled(
+            " ".repeat(WIDTH_HINT.with(|w| w.get()).saturating_sub(used)),
+            Style::default().bg(CODE_BG()),
+        ));
+    };
+    let plain = || -> Vec<Line<'static>> {
+        block
+            .iter()
+            .map(|l| {
+                let mut spans =
+                    vec![Span::styled(l.clone(), Style::default().bg(CODE_BG()))];
+                pad_to(l, &mut spans);
+                Line::from(spans)
+            })
+            .collect()
+    };
+    if lang.is_empty() {
+        return plain();
+    }
+    CONFIGS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let config = cache
+            .entry(lang.to_string())
+            .or_insert_with(|| config_for_lang(lang));
+        let Some(config) = config else {
+            return plain();
+        };
+        let source = block.join("
+");
+        let spans = highlight_source(config, &source);
+        let mut lines = Vec::with_capacity(block.len());
+        let mut line_start = 0usize; // byte offset of the current line
+        for text in block {
+            let line_end = line_start + text.len();
+            // background-only base: plain tokens keep the terminal's
+            // default foreground, exactly as the editor renders them
+            let mut styles = vec![Style::default().bg(CODE_BG()); text.chars().count()];
+            for span in spans.iter().filter(|s| s.start < line_end && s.end > line_start) {
+                let s = span.start.saturating_sub(line_start);
+                let e = (span.end - line_start).min(text.len());
+                let s_chars = text.get(..s).map(|t| t.chars().count()).unwrap_or(0);
+                let e_chars = text.get(..e).map(|t| t.chars().count()).unwrap_or(s_chars);
+                let style = style_for(span.highlight).bg(CODE_BG());
+                let upto = e_chars.min(styles.len());
+                for slot in styles.iter_mut().take(upto).skip(s_chars) {
+                    if style.fg.is_some() {
+                        *slot = style;
+                    }
+                }
+            }
+            let mut segments: Vec<Span> = Vec::new();
+            for (c, style) in text.chars().zip(styles.iter()) {
+                match segments.last_mut() {
+                    Some(last) if last.style == *style => last.content.to_mut().push(c),
+                    _ => segments.push(Span::styled(c.to_string(), *style)),
+                }
+            }
+            if segments.is_empty() {
+                segments.push(Span::raw(""));
+            }
+            pad_to(text, &mut segments);
+            lines.push(Line::from(segments));
+            line_start = line_end + 1; // + newline
+        }
+        lines
+    })
+}
+
+/// A thematic break: 3+ of the same char among -, *, _ (spaces allowed).
+fn is_rule(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+    chars.len() >= 3 && matches!(chars[0], '-' | '*' | '_') && chars.iter().all(|c| *c == chars[0])
+}
+
+fn heading_text(line: &str) -> Option<&str> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) {
+        line.strip_prefix(&"#".repeat(hashes))
+            .map(|r| r.trim_start())
+            .filter(|r| !r.is_empty())
+    } else {
+        None
+    }
+}
+
+fn restyle(spans: Vec<Span<'static>>, base: Style) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|s| {
+            let style = base.patch(s.style);
+            Span::styled(s.content, style)
+        })
+        .collect()
+}
+
+/// Inline markdown: `code`, **bold**, *italic*, [text](url).
+#[allow(dead_code)]
+fn inline(text: &str) -> Vec<Span<'static>> {
+    inline_links(text, 0, 0, &mut Vec::new())
+}
+
+/// Inline renderer that also records hyperlink positions. `offset` is the
+/// char column where this text starts on its rendered line.
+fn inline_links(
+    text: &str,
+    offset: usize,
+    line_idx: usize,
+    links: &mut Vec<MdLink>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut buf = String::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut i = 0;
+
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>, bold: bool, italic: bool| {
+        if buf.is_empty() {
+            return;
+        }
+        let mut style = Style::default();
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        spans.push(Span::styled(std::mem::take(buf), style));
+    };
+
+    while i < chars.len() {
+        // `code`
+        if chars[i] == '`'
+            && let Some(end) = chars[i + 1..].iter().position(|c| *c == '`') {
+                flush(&mut buf, &mut spans, bold, italic);
+                let code: String = chars[i + 1..i + 1 + end].iter().collect();
+                spans.extend(inline_code_spans(&code));
+                i += end + 2;
+                continue;
+            }
+        // [text](url) — show the text, drop the url
+        if chars[i] == '['
+            && let Some(close) = chars[i + 1..].iter().position(|c| *c == ']') {
+                let after = i + 1 + close + 1;
+                if chars.get(after) == Some(&'(')
+                    && let Some(paren) = chars[after + 1..].iter().position(|c| *c == ')') {
+                        flush(&mut buf, &mut spans, bold, italic);
+                        let label: String = chars[i + 1..i + 1 + close].iter().collect();
+                        let url: String = chars[after + 1..after + 1 + paren].iter().collect();
+                        let col: usize =
+                            offset + spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+                        links.push(MdLink {
+                            line: line_idx,
+                            col,
+                            text: label.clone(),
+                            url,
+                        });
+                        spans.push(Span::styled(
+                            label,
+                            Style::default().fg(LINK_FG()).add_modifier(Modifier::UNDERLINED),
+                        ));
+                        i = after + 1 + paren + 1;
+                        continue;
+                    }
+            }
+        // ** bold toggle
+        if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            flush(&mut buf, &mut spans, bold, italic);
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        // * italic toggle
+        if chars[i] == '*' {
+            flush(&mut buf, &mut spans, bold, italic);
+            italic = !italic;
+            i += 1;
+            continue;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush(&mut buf, &mut spans, bold, italic);
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn blank_rows_around_rules_collapse() {
+        let lines = super::render("above\n\n---\n\nbelow", 20);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts.len(), 3, "text, rule, text — no blank rows: {texts:?}");
+        assert!(texts[0].contains("above"));
+        assert!(texts[1].chars().all(|c| c == '─'));
+        assert!(texts[2].contains("below"));
+        // blank rows between paragraphs (no rule involved) survive
+        let lines = super::render("one\n\ntwo", 20);
+        assert_eq!(lines.len(), 3, "paragraph gap kept");
+    }
+
+    #[test]
+    fn inline_code_highlights_with_hinted_language() {
+        // with a rust hint, `let` inside inline code gets the keyword color
+        let (lines, _) = super::render_with_links_lang("see `let x = 1;` here", 60, "rust");
+        let spans = &lines[0].spans;
+        let let_span = spans
+            .iter()
+            .find(|sp| sp.content.as_ref() == "let")
+            .expect("`let` split into its own span");
+        assert!(let_span.style.fg.is_some(), "keyword colored: {:?}", let_span.style);
+        assert_eq!(let_span.style.bg, Some(CODE_BG()), "still on the code panel");
+        // without a hint, inline code stays a single plain span
+        let (lines, _) = super::render_with_links("see `let x = 1;` here", 60);
+        let spans = &lines[0].spans;
+        assert!(
+            spans.iter().any(|sp| sp.content.as_ref() == "let x = 1;"),
+            "unhinted inline code is one plain span"
+        );
+    }
+
+    #[test]
+    fn long_paragraphs_word_wrap_and_links_survive() {
+        let text = format!(
+            "{} [docs](https://example.com) {}",
+            "word ".repeat(20),
+            "tail ".repeat(20)
+        );
+        let (lines, links) = super::render_with_links(&text, 40);
+        assert!(lines.len() > 1, "paragraph wrapped into multiple rows");
+        for line in &lines {
+            assert!(line.width() <= 40, "row within width: {}", line.width());
+        }
+        // no mid-word breaks: full rows end exactly at a word boundary
+        for line in &lines[..lines.len() - 1] {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if text.chars().count() == 40 {
+                assert!(
+                    text.ends_with(' ') || text.ends_with(char::is_alphanumeric),
+                    "row is a clean cut: {text:?}"
+                );
+            }
+        }
+        // the link survived wrapping and points at its label on the row
+        let link = links.iter().find(|l| l.url == "https://example.com").expect("link kept");
+        let row: String = lines[link.line].spans.iter().map(|s| s.content.as_ref()).collect();
+        let at: String = row.chars().skip(link.col).take(4).collect();
+        assert_eq!(at, "docs", "link col points at its label");
+    }
+
+    use super::*;
+
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn horizontal_rules_become_lines() {
+        for rule in ["---", "___", "***", "- - -", "_____"] {
+            let lines = render(rule, 10);
+            assert_eq!(text_of(&lines[0]), "─".repeat(10), "rule {rule:?}");
+        }
+        // not rules: rendered as text (word-wrapped at width 10)
+        let lines = render("-- too short", 10);
+        let joined: String =
+            lines.iter().map(text_of).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("too short"), "{joined:?}");
+    }
+
+    #[test]
+    fn headings_are_bold_without_hashes() {
+        let lines = render("## Section title", 40);
+        assert_eq!(text_of(&lines[0]), "Section title");
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn code_fences_hide_markers_and_syntax_highlight() {
+        let lines = render("```rust\nfn main() {}\n```\nafter", 40);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(text_of(&lines[0]).trim_end(), "fn main() {}");
+        // "fn" is a rust keyword → keyword purple, not the plain code tint
+        let kw = lines[0].spans.iter().find(|s| s.content.contains("fn")).unwrap();
+        assert_eq!(kw.style.fg, Some(Color::Rgb(183, 148, 244)));
+        assert_eq!(kw.style.bg, Some(CODE_BG()), "code block sits on its own panel");
+        assert_eq!(text_of(&lines[1]), "after");
+    }
+
+    #[test]
+    fn unknown_fence_language_stays_plain() {
+        let lines = render("```klingon\nqapla' code\n```", 40);
+        assert_eq!(lines[0].spans[0].style.fg, None, "code keeps the default fg");
+        assert_eq!(lines[0].spans[0].style.bg, Some(CODE_BG()), "panel background set");
+    }
+
+    #[test]
+    fn unterminated_fence_still_renders() {
+        let lines = render("```rust\nlet x = 1;", 40);
+        assert_eq!(text_of(&lines[0]).trim_end(), "let x = 1;");
+    }
+
+    #[test]
+    fn inline_styles() {
+        let lines = render("a **bold** and `code` and *it* end", 60);
+        let line = &lines[0];
+        let bold = line.spans.iter().find(|s| s.content == "bold").unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let code = line.spans.iter().find(|s| s.content == "code").unwrap();
+        assert_eq!(code.style.fg, None, "inline code keeps the default fg");
+        assert_eq!(code.style.bg, Some(CODE_BG()), "inline code gets the panel bg");
+        assert_eq!(code.style.bg, Some(CODE_BG()), "inline code is a chip");
+        let italic = line.spans.iter().find(|s| s.content == "it").unwrap();
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn links_show_label_only() {
+        let lines = render("see [the docs](https://example.com) here", 60);
+        let text = text_of(&lines[0]);
+        assert!(text.contains("the docs"));
+        assert!(!text.contains("example.com"));
+        let link = lines[0].spans.iter().find(|s| s.content == "the docs").unwrap();
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn links_report_positions_and_urls() {
+        let (lines, links) = render_with_links(
+            "intro\nsee [docs](https://example.com) now\n- has [b](https://b.io)",
+            60,
+        );
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].line, 1);
+        assert_eq!(links[0].col, 4); // after "see "
+        assert_eq!(links[0].text, "docs");
+        assert_eq!(links[0].url, "https://example.com");
+        assert_eq!(links[1].line, 2);
+        assert_eq!(links[1].col, 6); // after "• has "
+        // the rendered text at that position is the label
+        let text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert_eq!(&text[4..8], "docs");
+    }
+
+    #[test]
+    fn bullets_and_quotes() {
+        let lines = render("- item one\n> quoted words", 40);
+        assert!(text_of(&lines[0]).starts_with("• "));
+        assert!(text_of(&lines[1]).contains("quoted words"));
+    }
+
+    #[test]
+    fn unclosed_backtick_is_literal() {
+        let lines = render("has ` one tick", 40);
+        assert!(text_of(&lines[0]).contains("` one tick"));
+    }
+}

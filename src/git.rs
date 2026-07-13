@@ -181,6 +181,25 @@ pub fn commit(repo: &Repository, message: &str) -> Result<git2::Oid> {
     Ok(oid)
 }
 
+/// How the changes panel arranges entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitView {
+    /// Flat list of full paths.
+    List,
+    /// Files grouped under their directories.
+    Tree,
+}
+
+/// One visual row of the tree view: either a directory label or a file
+/// pointing back at its status entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRow {
+    pub depth: usize,
+    pub name: String,
+    /// Index into `entries` for files; None for directory rows.
+    pub entry: Option<usize>,
+}
+
 /// Application-facing wrapper holding the repository handle plus the last
 /// refreshed status snapshot.
 pub struct GitState {
@@ -188,6 +207,7 @@ pub struct GitState {
     pub entries: Vec<StatusEntry>,
     pub branch: Option<String>,
     pub selected: usize,
+    pub view: GitView,
 }
 
 impl GitState {
@@ -198,6 +218,7 @@ impl GitState {
             entries: Vec::new(),
             branch: None,
             selected: 0,
+            view: GitView::List,
         };
         state.refresh();
         state
@@ -223,6 +244,47 @@ impl GitState {
 
     pub fn selected_entry(&self) -> Option<&StatusEntry> {
         self.entries.get(self.selected)
+    }
+
+    pub fn toggle_view(&mut self) {
+        self.view = match self.view {
+            GitView::List => GitView::Tree,
+            GitView::Tree => GitView::List,
+        };
+    }
+
+    /// Rows of the tree view: directory labels interleaved with their files,
+    /// sorted by path so shared directory prefixes are emitted once.
+    pub fn tree_rows(&self) -> Vec<GitRow> {
+        let mut order: Vec<usize> = (0..self.entries.len()).collect();
+        order.sort_by(|&a, &b| self.entries[a].path.cmp(&self.entries[b].path));
+
+        let mut rows = Vec::new();
+        let mut stack: Vec<String> = Vec::new();
+        for idx in order {
+            let path = &self.entries[idx].path;
+            let comps: Vec<&str> = path.split('/').collect();
+            let (dirs, file) = comps.split_at(comps.len() - 1);
+            let mut common = 0;
+            while common < stack.len() && common < dirs.len() && stack[common] == dirs[common] {
+                common += 1;
+            }
+            stack.truncate(common);
+            for dir in &dirs[common..] {
+                rows.push(GitRow {
+                    depth: stack.len(),
+                    name: dir.to_string(),
+                    entry: None,
+                });
+                stack.push(dir.to_string());
+            }
+            rows.push(GitRow {
+                depth: dirs.len(),
+                name: file[0].to_string(),
+                entry: Some(idx),
+            });
+        }
+        rows
     }
 
     pub fn select_next(&mut self) {
@@ -421,6 +483,66 @@ mod tests {
         state.commit("initial").unwrap();
         assert!(state.entries.is_empty());
         assert!(state.branch.is_some());
+    }
+
+    #[test]
+    fn tree_rows_group_files_under_directories() {
+        let (dir, repo) = init_repo();
+        drop(repo);
+        let mut state = GitState::open(dir.path());
+        std::fs::create_dir_all(dir.path().join("src/ui")).unwrap();
+        write(dir.path().join("a.txt"), "x").unwrap();
+        write(dir.path().join("src/app.rs"), "x").unwrap();
+        write(dir.path().join("src/ui/mod.rs"), "x").unwrap();
+        state.refresh();
+        let rows = state.tree_rows();
+        let shape: Vec<(usize, &str, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.name.as_str(), r.entry.is_some()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "a.txt", true),
+                (0, "src", false),
+                (1, "app.rs", true),
+                (1, "ui", false),
+                (2, "mod.rs", true),
+            ]
+        );
+        // file rows point back at the right entries
+        let file_paths: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.entry.map(|i| state.entries[i].path.as_str()))
+            .collect();
+        assert_eq!(file_paths, vec!["a.txt", "src/app.rs", "src/ui/mod.rs"]);
+    }
+
+    #[test]
+    fn tree_rows_share_common_directory_prefix() {
+        let (dir, repo) = init_repo();
+        drop(repo);
+        let mut state = GitState::open(dir.path());
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        write(dir.path().join("src/a.rs"), "x").unwrap();
+        write(dir.path().join("src/b.rs"), "x").unwrap();
+        state.refresh();
+        let rows = state.tree_rows();
+        // "src" appears once, both files nested under it
+        assert_eq!(rows.iter().filter(|r| r.name == "src").count(), 1);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn toggle_view_flips_between_list_and_tree() {
+        let (dir, repo) = init_repo();
+        drop(repo);
+        let mut state = GitState::open(dir.path());
+        assert_eq!(state.view, GitView::List);
+        state.toggle_view();
+        assert_eq!(state.view, GitView::Tree);
+        state.toggle_view();
+        assert_eq!(state.view, GitView::List);
     }
 
     #[test]
