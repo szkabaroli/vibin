@@ -14,7 +14,7 @@ THEMES=(
   "mocha|Catppuccin Mocha|Catppuccin Mocha"
   "tokyonight|TokyoNight|TokyoNight"
   "gruvbox|GruvboxDark|Gruvbox Dark"
-  "rosepine|rose-pine|Rosé Pine"
+  "django|DjangoRebornAgain|Django Reborn Again"
   "nord|nord|Nord"
   "latte|Catppuccin Latte|Catppuccin Latte"
 )
