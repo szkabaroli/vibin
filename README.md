@@ -24,6 +24,14 @@ spell check that understands `snake_case`, and a hex viewer that decodes
 terminal's own theme (queried over OSC), and follow it when it flips
 between light and dark.
 
+## themes
+
+vibin has no themes of its own — it asks the terminal for its palette
+(over OSC) and colors itself from the answer. the same build, six
+terminal themes:
+
+![the same scene under six terminal themes](assets/themes.png)
+
 ## install
 
 ```sh
