@@ -26,11 +26,23 @@ jobs:
       - name: Install vibin
         run: cargo install --path . --locked
 
-      # ttyd + ffmpeg + a headless chrome come with vhs-action's setup
+      # installed directly instead of via vhs-action: the action pulls
+      # ffmpeg from BtbN's GitHub releases (fails intermittently) and
+      # ignores a system ffmpeg entirely. apt is boring and works.
+      # fonts-jetbrains-mono = vhs's default font.
       - name: Install vhs
-        uses: charmbracelet/vhs-action@v2
-        with:
-          install-only: true
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.charm.sh/apt/gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
+            | sudo tee /etc/apt/sources.list.d/charm.list
+          sudo apt-get update
+          sudo apt-get install -y vhs ffmpeg fonts-jetbrains-mono
+          sudo curl -fsSL -o /usr/local/bin/ttyd \
+            https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
+          sudo chmod +x /usr/local/bin/ttyd
+          vhs --version && ttyd --version && ffmpeg -version | head -1
 
       - name: Record
         run: demo/record.sh
