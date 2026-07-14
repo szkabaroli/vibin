@@ -6,10 +6,6 @@
 
 Output assets/demo-%SUFFIX%.gif
 
-# ttyd doesn't export COLORTERM, so vibin would assume a plain terminal:
-# 256-color quantization and no slant glyphs. vhs renders truecolor fine.
-Env VIBIN_TRUECOLOR "1"
-
 Set Theme "%THEME%"
 Set FontFamily "Fira Code"
 Set FontSize 26
@@ -21,7 +17,10 @@ Set TypingSpeed 110ms
 # launch off-camera in the demo workspace, go straight to the code shell,
 # and let rust-analyzer finish indexing so diagnostics are live on camera
 Hide
-Type `cd /tmp/vibin-demo && vibin . -- sleep 600`
+# VIBIN_TRUECOLOR: ttyd doesn't export COLORTERM, so vibin would assume a
+# plain terminal — 256-color quantization and no slant glyphs. (vhs 0.10
+# has no Env command, and one in the tape silently breaks the Set lines.)
+Type `cd /tmp/vibin-demo && VIBIN_TRUECOLOR=1 vibin . -- sleep 600`
 Enter
 Sleep 4s
 Ctrl+A

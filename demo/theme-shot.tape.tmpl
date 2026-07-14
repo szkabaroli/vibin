@@ -1,9 +1,6 @@
 # One still per theme for the README theme grid — same scene as the hero.
 Output demo/.themes/%SUFFIX%.gif
 
-# see demo.tape.tmpl: ttyd doesn't export COLORTERM
-Env VIBIN_TRUECOLOR "1"
-
 Set Theme "%THEME%"
 Set FontFamily "Fira Code"
 Set FontSize 26
@@ -12,7 +9,8 @@ Set Height 1440
 Set Padding 24
 
 Hide
-Type `cd /tmp/vibin-demo && vibin . -- sleep 600`
+# VIBIN_TRUECOLOR: see demo.tape.tmpl
+Type `cd /tmp/vibin-demo && VIBIN_TRUECOLOR=1 vibin . -- sleep 600`
 Enter
 Sleep 4s
 Ctrl+A
