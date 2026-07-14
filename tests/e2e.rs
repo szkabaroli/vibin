@@ -457,7 +457,7 @@ while true; do
   msg=$(read_msg)
   [ -z "$msg" ] && exit 0
   case "$msg" in
-    *'"method":"initialize"'*) send '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"method":"initialize"'*) send '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"textDocumentSync":1}}}' ;;
     *'"method":"textDocument/didOpen"'*)
       uri=$(echo "$msg" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' | head -1)
       send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"severity\":1,\"message\":\"e2e fake error\"}]}}"

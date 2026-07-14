@@ -85,6 +85,10 @@ struct Shared {
     /// Active work-done progress streams, in the order they began. The most
     /// recent (last) is what the status bar shows.
     progress: Vec<Progress>,
+    /// The server's TextDocumentSyncKind (0 none, 1 full, 2 incremental),
+    /// from the initialize result. Starts as full so edits made before the
+    /// handshake finishes aren't dropped (they queue anyway).
+    sync_kind: u8,
     /// The server's stdout reached EOF — it exited or crashed.
     dead: bool,
     generation: u64,
@@ -224,7 +228,7 @@ impl LspClient {
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let writer = Arc::new(Mutex::new(stdin));
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared { sync_kind: 1, ..Shared::default() }));
         let next_id = Arc::new(AtomicU64::new(2)); // id 1 = initialize
 
         let client = Self {
@@ -329,16 +333,46 @@ impl LspClient {
         }
     }
 
+    /// Sync an edited document, respecting the server's declared sync
+    /// kind: incremental servers get one range covering the changed span
+    /// (prefix/suffix-trimmed against the last synced text), full-sync
+    /// servers get the whole buffer, sync-kind-none servers get nothing.
     pub fn did_change(&self, path: &Path, text: &str, version: i64) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.open_docs.insert(path.to_path_buf(), text.to_string());
-        }
+        let (old, kind) = match self.shared.lock() {
+            Ok(mut shared) => {
+                let old = shared.open_docs.insert(path.to_path_buf(), text.to_string());
+                (old, shared.sync_kind)
+            }
+            Err(_) => (None, 1),
+        };
+        let content_changes = match (kind, old) {
+            (0, _) => return, // server doesn't want document sync
+            (2, Some(old)) => match diff_change(&old, text) {
+                Some(((sl, sc), (el, ec), replaced)) => json!([{
+                    "range": { "start": { "line": sl, "character": sc },
+                                "end": { "line": el, "character": ec } },
+                    "text": replaced,
+                }]),
+                None => return, // texts identical — nothing to sync
+            },
+            _ => json!([{ "text": text }]),
+        };
         self.notify(json!({
             "jsonrpc": "2.0", "method": "textDocument/didChange",
             "params": {
                 "textDocument": { "uri": path_to_uri(path), "version": version },
-                "contentChanges": [{ "text": text }],
+                "contentChanges": content_changes,
             }
+        }));
+    }
+
+    /// The document left the editor. Its text stays in the client's cache:
+    /// diagnostics for closed files keep arriving (cargo check, workspace
+    /// pulls) and still need it for column conversion.
+    pub fn did_close(&self, path: &Path) {
+        self.notify(json!({
+            "jsonrpc": "2.0", "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": path_to_uri(path) } }
         }));
     }
 
@@ -644,6 +678,7 @@ fn reader_loop(
                         let Ok(mut shared) = shared.lock() else { break };
                         shared.initialized = true;
                         shared.supports_workspace_diag = supports_ws;
+                        shared.sync_kind = parse_sync_kind(message.get("result"));
                         shared.generation += 1;
                         std::mem::take(&mut shared.queued)
                     };
@@ -889,6 +924,58 @@ pub fn char_to_utf16_col(line: &str, char_col: usize) -> usize {
     line.chars().take(char_col).map(|c| c.len_utf16()).sum()
 }
 
+/// TextDocumentSyncKind from an initialize result: a bare number or an
+/// options object with `change`. Absent means the server doesn't sync.
+fn parse_sync_kind(result: Option<&Value>) -> u8 {
+    match result.and_then(|r| r.pointer("/capabilities/textDocumentSync")) {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(1) as u8,
+        Some(Value::Object(o)) => o.get("change").and_then(Value::as_u64).unwrap_or(0) as u8,
+        _ => 0,
+    }
+}
+
+/// The single contiguous change turning `old` into `new`: LSP range over
+/// `old` (line, UTF-16 col) plus the replacement text — the classic
+/// common-prefix/suffix trim, clamped to char boundaries. None when the
+/// texts are identical.
+#[allow(clippy::type_complexity)]
+fn diff_change(old: &str, new: &str) -> Option<((usize, usize), (usize, usize), String)> {
+    if old == new {
+        return None;
+    }
+    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = 0;
+    let max_prefix = ob.len().min(nb.len());
+    while prefix < max_prefix && ob[prefix] == nb[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    let mut suffix = 0;
+    let max_suffix = max_prefix - prefix; // never overlap the prefix
+    while suffix < max_suffix && ob[ob.len() - 1 - suffix] == nb[nb.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!old.is_char_boundary(ob.len() - suffix) || !new.is_char_boundary(nb.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    // byte offset in `text` → (line, UTF-16 col)
+    let pos = |text: &str, byte: usize| -> (usize, usize) {
+        let before = &text[..byte];
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col16 = before[line_start..].chars().map(|c| c.len_utf16()).sum();
+        (before.matches('\n').count(), col16)
+    };
+    Some((
+        pos(old, prefix),
+        pos(old, ob.len() - suffix),
+        new[prefix..nb.len() - suffix].to_string(),
+    ))
+}
+
 fn parse_diagnostic(value: &Value, doc: &str) -> Option<Diagnostic> {
     let range = value.get("range")?;
     let mut diagnostic = Diagnostic {
@@ -1033,7 +1120,7 @@ while true; do
   [ -z "$msg" ] && exit 0
   case "$msg" in
     *'"method":"initialize"'*)
-      send '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"hoverProvider":true,"diagnosticProvider":{"workspaceDiagnostics":true}}}}' ;;
+      send '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"textDocumentSync":1,"hoverProvider":true,"diagnosticProvider":{"workspaceDiagnostics":true}}}}' ;;
     *'"method":"workspace/diagnostic"'*)
       id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
       send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"items\":[{\"kind\":\"full\",\"uri\":\"file://$PWD/lib.rs\",\"resultId\":\"r1\",\"items\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"severity\":1,\"message\":\"workspace error\"}]}]}}" ;;
@@ -1069,6 +1156,41 @@ done
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn diff_change_computes_minimal_utf16_ranges() {
+        // middle-of-line edit: puush → push on line 2
+        let old = "fn main() {\n    batcher.puush(x);\n}\n";
+        let new = "fn main() {\n    batcher.push(x);\n}\n";
+        let (start, end, text) = diff_change(old, new).unwrap();
+        assert_eq!(start, (1, 14));
+        assert_eq!(end, (1, 15));
+        assert_eq!(text, ""); // puush → push: delete one u
+        // pure insertion at end of file
+        let (start, end, text) = diff_change("a\n", "a\nb\n").unwrap();
+        assert_eq!((start, end), ((1, 0), (1, 0)));
+        assert_eq!(text, "b\n");
+        // deletion spanning lines
+        let (start, end, text) = diff_change("a\nbb\ncc\n", "a\ncc\n").unwrap();
+        assert_eq!((start, end), ((1, 0), (2, 0)));
+        assert_eq!(text, "");
+        // UTF-16 columns: the emoji is 2 units wide
+        let (start, ..) = diff_change("😀ab\n", "😀aXb\n").unwrap();
+        assert_eq!(start, (0, 3), "col counts 😀 as two utf16 units");
+        // identical → no change to send
+        assert!(diff_change("same\n", "same\n").is_none());
+    }
+
+    #[test]
+    fn parses_text_document_sync_kind() {
+        let num = json!({ "capabilities": { "textDocumentSync": 2 } });
+        assert_eq!(parse_sync_kind(Some(&num)), 2);
+        let obj = json!({ "capabilities": { "textDocumentSync": { "openClose": true, "change": 1 } } });
+        assert_eq!(parse_sync_kind(Some(&obj)), 1);
+        let absent = json!({ "capabilities": {} });
+        assert_eq!(parse_sync_kind(Some(&absent)), 0, "no sync declared = none");
+        assert_eq!(parse_sync_kind(None), 0);
+    }
 
     #[test]
     fn late_document_text_restores_diagnostic_columns() {

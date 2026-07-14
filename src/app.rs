@@ -550,6 +550,10 @@ impl App {
         }
         match Editor::open(path) {
             Ok(mut editor) => {
+                // the previous document leaves the editor for good here
+                if let (Some(client), Some(old)) = (&self.lsp, &self.editor) {
+                    client.did_close(&old.path);
+                }
                 // apply the merged config's editor defaults
                 editor.spell_check = self.config.spell_check && crate::spell::available();
                 editor.mark_unicode = self.config.mark_unicode;
@@ -777,6 +781,9 @@ impl App {
     fn handle_editor_event(&mut self, event: EditorEvent) {
         match event {
             EditorEvent::Close => {
+                if let (Some(client), Some(editor)) = (&self.lsp, &self.editor) {
+                    client.did_close(&editor.path);
+                }
                 self.editor = None;
                 self.focus = Focus::Sidebar;
             }
