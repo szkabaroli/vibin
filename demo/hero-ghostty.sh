@@ -33,7 +33,7 @@ window-padding-y = 8
 macos-titlebar-style = hidden
 confirm-close-surface = false
 working-directory = /tmp/vibin-demo
-command = $VIBIN . -- sleep 600
+command = $VIBIN /tmp/vibin-demo -- sleep 600
 EOF
 
 "$GHOSTTY" --config-file="$CFG" >/dev/null 2>&1 &
