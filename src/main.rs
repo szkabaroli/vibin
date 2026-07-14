@@ -60,8 +60,22 @@ fn main() -> Result<()> {
                 vibin::keybind::print_keybinds(&kb);
             }
             "+list-actions" => vibin::keybind::print_actions(),
+            // the fully resolved config for this directory (defaults ←
+            // global ← nearest .vibin), as TOML that can be pasted back
+            "+show-config" => {
+                let config = vibin::config::Config::load(&cwd);
+                match toml::to_string_pretty(&config) {
+                    Ok(body) => print!("{body}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             other => {
-                eprintln!("unknown command {other} (try +list-keybinds, +list-actions)");
+                eprintln!(
+                    "unknown command {other} (try +list-keybinds, +list-actions, +show-config)"
+                );
                 std::process::exit(1);
             }
         }

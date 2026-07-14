@@ -136,6 +136,27 @@ fn git_fixture() -> TempDir {
 }
 
 #[test]
+fn show_config_dumps_resolved_toml() {
+    // no PTY needed: +commands print and exit
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".vibin")).unwrap();
+    std::fs::write(dir.path().join(".vibin/config.toml"), "show_hidden = true\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_vibin"))
+        .arg("+show-config")
+        .current_dir(dir.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", dir.path()) // isolate from the user's global config
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("show_hidden = true"), "local .vibin override resolved:\n{text}");
+    assert!(text.contains("[lsp.rust_analyzer]"), "built-in defaults included:\n{text}");
+    // and it round-trips: the dump is valid config TOML
+    assert!(text.parse::<toml::Table>().is_ok());
+}
+
+#[test]
 fn boots_and_shows_shells() {
     let dir = git_fixture();
     let mut tui = Tui::launch(dir.path());
