@@ -70,6 +70,7 @@ jobs:
           git add assets/hero-light.png assets/hero-dark.png
           git diff --cached --quiet && echo "no changes" && exit 0
           git commit -m "chore: regenerate demo shots [skip ci]"
-          # main may have moved while we recorded
-          git pull --rebase origin main
+          # main may have moved while we recorded; on conflicting binaries
+          # the fresh recording wins (-X theirs = the replayed commit)
+          git pull --rebase -X theirs origin main
           git push
