@@ -36,6 +36,24 @@ cargo install --path .      # install as `vibin` — do this after each work cyc
 - `grammars/` vendored C grammars, `vendor/crossterm` patched crate,
   `patches/` records the delta
 
+## commits
+
+conventional commits: `type(scope): summary` — lowercase, imperative,
+no trailing period. body explains the why when it isn't obvious.
+
+- types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `chore`, `ci`
+- scopes are the module names: `ui`, `editor`, `lsp`, `app`, `config`,
+  `git`, `session`, `filetree`, `palette` … omit when the change is
+  repo-wide.
+- one logical change per commit; formatting-only churn goes in its own
+  `chore: cargo fmt` commit, never mixed into a feature.
+
+```
+feat(lsp): apply textDocument/formatting via :fmt
+fix(filetree): classify symlinked directories by their target
+chore: cargo fmt
+```
+
 ## conventions
 
 - describe vibin's behavior directly — never as "X-style" comparisons to
