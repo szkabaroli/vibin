@@ -17,10 +17,12 @@ Set TypingSpeed 110ms
 # launch off-camera in the demo workspace, go straight to the code shell,
 # and let rust-analyzer finish indexing so diagnostics are live on camera
 Hide
-# VIBIN_TRUECOLOR: ttyd doesn't export COLORTERM, so vibin would assume a
-# plain terminal — 256-color quantization and no slant glyphs. (vhs 0.10
-# has no Env command, and one in the tape silently breaks the Set lines.)
-Type `cd /tmp/vibin-demo && VIBIN_TRUECOLOR=1 vibin . -- sleep 600`
+# VIBIN_TRUECOLOR: ttyd doesn't export COLORTERM, so vibin would quantize
+# to 256 colors. VIBIN_FANCY=0: xterm.js doesn't synthesize the ◢◤ slant
+# glyphs (it draws the font's small triangles, gappy on camera) — record
+# with the clean straight-edge fallback instead. (Inline env, not vhs's
+# Env command: vhs 0.10 lacks it and it silently breaks the Set lines.)
+Type `cd /tmp/vibin-demo && VIBIN_TRUECOLOR=1 VIBIN_FANCY=0 vibin . -- sleep 600`
 Enter
 Sleep 4s
 Ctrl+A
