@@ -11,8 +11,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use divan::Bencher;
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 /// A large real-world source file (this repo's biggest module).
 const RUST_SRC: &str = include_str!("../src/ui.rs");

@@ -49,6 +49,13 @@ show_hidden = false
 spell_check = true
 mark_unicode = true
 # mouse_scroll_multiplier = 3   # unset = auto per terminal
+
+# language servers, vim.lsp.config-shaped — override a field of a built-in
+# or add your own; root_markers start the server at workspace open
+# [lsp.clangd]
+# cmd = ["clangd"]
+# filetypes = ["c", "cpp"]
+# root_markers = ["compile_commands.json"]
 ```
 
 ## license

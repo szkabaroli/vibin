@@ -2,7 +2,9 @@
 //! staging and committing.
 
 use anyhow::{Context, Result};
-use git2::{Commit, DiffFormat, DiffOptions, IndexAddOption, Repository, Signature, Status, StatusOptions};
+use git2::{
+    Commit, DiffFormat, DiffOptions, IndexAddOption, Repository, Signature, Status, StatusOptions,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,23 +59,18 @@ impl StatusEntry {
 pub fn head_branch(repo: &Repository) -> Option<String> {
     match repo.head() {
         Ok(head) => head.shorthand().ok().map(String::from),
-        Err(_) => repo
-            .find_reference("HEAD")
-            .ok()
-            .and_then(|r| {
-                r.symbolic_target()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.trim_start_matches("refs/heads/").to_string())
-            }),
+        Err(_) => repo.find_reference("HEAD").ok().and_then(|r| {
+            r.symbolic_target()
+                .ok()
+                .flatten()
+                .map(|s| s.trim_start_matches("refs/heads/").to_string())
+        }),
     }
 }
 
 pub fn statuses(repo: &Repository) -> Result<Vec<StatusEntry>> {
     let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .exclude_submodules(true);
+    opts.include_untracked(true).recurse_untracked_dirs(true).exclude_submodules(true);
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut entries = Vec::new();
     for entry in statuses.iter() {
@@ -94,12 +91,7 @@ pub fn statuses(repo: &Repository) -> Result<Vec<StatusEntry>> {
                 | Status::WT_RENAMED
                 | Status::WT_TYPECHANGE,
         ) || s.is_conflicted();
-        entries.push(StatusEntry {
-            path: path.to_string(),
-            kind,
-            staged,
-            unstaged,
-        });
+        entries.push(StatusEntry { path: path.to_string(), kind, staged, unstaged });
     }
     Ok(entries)
 }
@@ -172,9 +164,7 @@ pub fn commit(repo: &Repository, message: &str) -> Result<git2::Oid> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
-    let sig = repo
-        .signature()
-        .or_else(|_| Signature::now("vibin", "vibin@localhost"))?;
+    let sig = repo.signature().or_else(|_| Signature::now("vibin", "vibin@localhost"))?;
     let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let parents: Vec<&Commit> = parent.as_ref().into_iter().collect();
     let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
@@ -213,15 +203,24 @@ pub struct GitState {
 impl GitState {
     pub fn open(path: &Path) -> Self {
         let repo = Repository::discover(path).ok();
-        let mut state = Self {
-            repo,
-            entries: Vec::new(),
-            branch: None,
-            selected: 0,
-            view: GitView::List,
-        };
+        let mut state =
+            Self { repo, entries: Vec::new(), branch: None, selected: 0, view: GitView::List };
         state.refresh();
         state
+    }
+
+    /// The file's content at HEAD, for gutter change markers. None when
+    /// untracked, binary, or not in a repo (every line reads as added).
+    pub fn head_text(&self, path: &Path) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        // canonicalize both sides: /tmp and /var are symlinks on macOS
+        let path = path.canonicalize().ok()?;
+        let workdir = repo.workdir()?.canonicalize().ok()?;
+        let rel = path.strip_prefix(&workdir).ok()?.to_path_buf();
+        let head = repo.head().ok()?.peel_to_tree().ok()?;
+        let entry = head.get_path(&rel).ok()?;
+        let blob = repo.find_blob(entry.id()).ok()?;
+        std::str::from_utf8(blob.content()).ok().map(str::to_string)
     }
 
     pub fn is_repo(&self) -> bool {
@@ -271,18 +270,10 @@ impl GitState {
             }
             stack.truncate(common);
             for dir in &dirs[common..] {
-                rows.push(GitRow {
-                    depth: stack.len(),
-                    name: dir.to_string(),
-                    entry: None,
-                });
+                rows.push(GitRow { depth: stack.len(), name: dir.to_string(), entry: None });
                 stack.push(dir.to_string());
             }
-            rows.push(GitRow {
-                depth: dirs.len(),
-                name: file[0].to_string(),
-                entry: Some(idx),
-            });
+            rows.push(GitRow { depth: dirs.len(), name: file[0].to_string(), entry: Some(idx) });
         }
         rows
     }
@@ -496,10 +487,8 @@ mod tests {
         write(dir.path().join("src/ui/mod.rs"), "x").unwrap();
         state.refresh();
         let rows = state.tree_rows();
-        let shape: Vec<(usize, &str, bool)> = rows
-            .iter()
-            .map(|r| (r.depth, r.name.as_str(), r.entry.is_some()))
-            .collect();
+        let shape: Vec<(usize, &str, bool)> =
+            rows.iter().map(|r| (r.depth, r.name.as_str(), r.entry.is_some())).collect();
         assert_eq!(
             shape,
             vec![
@@ -511,10 +500,8 @@ mod tests {
             ]
         );
         // file rows point back at the right entries
-        let file_paths: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| r.entry.map(|i| state.entries[i].path.as_str()))
-            .collect();
+        let file_paths: Vec<&str> =
+            rows.iter().filter_map(|r| r.entry.map(|i| state.entries[i].path.as_str())).collect();
         assert_eq!(file_paths, vec!["a.txt", "src/app.rs", "src/ui/mod.rs"]);
     }
 

@@ -16,11 +16,8 @@ fn wash(weight: u32) -> Option<Color> {
     crate::color::wash(weight).map(|(r, g, b)| Color::Rgb(r, g, b))
 }
 fn slot(i: usize, dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
-    let (r, g, b) = crate::color::ansi16(i).unwrap_or(if crate::color::is_light() {
-        light
-    } else {
-        dark
-    });
+    let (r, g, b) =
+        crate::color::ansi16(i).unwrap_or(if crate::color::is_light() { light } else { dark });
     Color::Rgb(r, g, b)
 }
 fn adaptive(dark: Color, light: Color) -> Color {
@@ -35,7 +32,7 @@ fn HEADING_FG() -> Color {
     wash(252).unwrap_or_else(|| adaptive(Color::Rgb(240, 244, 250), Color::Rgb(24, 26, 32)))
 }
 #[allow(non_snake_case)]
-fn LINK_FG() -> Color {
+pub fn LINK_FG() -> Color {
     slot(12, (110, 175, 255), (9, 105, 218))
 }
 /// Same color as the hover popup's header/footer rules (ui::DIALOG_BORDER),
@@ -167,9 +164,8 @@ pub fn render_with_links(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<M
 /// Drop blank rows adjacent to horizontal rules: the rule IS the
 /// separator, so `text\n\n---\n\nmore` renders as three rows, not five.
 fn collapse_rule_gaps(lines: Vec<Line<'static>>, links: &mut Vec<MdLink>) -> Vec<Line<'static>> {
-    let is_rule = |l: &Line| {
-        l.width() > 0 && l.spans.iter().all(|sp| sp.content.chars().all(|c| c == '─'))
-    };
+    let is_rule =
+        |l: &Line| l.width() > 0 && l.spans.iter().all(|sp| sp.content.chars().all(|c| c == '─'));
     let is_blank = |l: &Line| l.width() == 0;
     let mut keep = vec![true; lines.len()];
     for i in 0..lines.len() {
@@ -194,11 +190,7 @@ fn collapse_rule_gaps(lines: Vec<Line<'static>>, links: &mut Vec<MdLink>) -> Vec
     for link in links.iter_mut() {
         link.line = new_index[link.line];
     }
-    lines
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(l, k)| k.then_some(l))
-        .collect()
+    lines.into_iter().zip(keep).filter_map(|(l, k)| k.then_some(l)).collect()
 }
 
 /// Word-wrap rendered lines to `width`, splitting styled spans at word
@@ -341,8 +333,7 @@ fn code_lines(lang: &str, block: &[String]) -> Vec<Line<'static>> {
         block
             .iter()
             .map(|l| {
-                let mut spans =
-                    vec![Span::styled(l.clone(), Style::default().bg(CODE_BG()))];
+                let mut spans = vec![Span::styled(l.clone(), Style::default().bg(CODE_BG()))];
                 pad_to(l, &mut spans);
                 Line::from(spans)
             })
@@ -351,16 +342,36 @@ fn code_lines(lang: &str, block: &[String]) -> Vec<Line<'static>> {
     if lang.is_empty() {
         return plain();
     }
+    // diff blocks: +/- lines in the theme's green/red, no grammar needed
+    if lang == "diff" {
+        return block
+            .iter()
+            .map(|l| {
+                let fg = match l.chars().next() {
+                    Some('+') => Some(slot(2, (110, 190, 110), (40, 130, 60))),
+                    Some('-') => Some(slot(1, (210, 120, 120), (180, 60, 60))),
+                    _ => None,
+                };
+                let mut style = Style::default().bg(CODE_BG());
+                if let Some(fg) = fg {
+                    style = style.fg(fg);
+                }
+                let mut spans = vec![Span::styled(l.clone(), style)];
+                pad_to(l, &mut spans);
+                Line::from(spans)
+            })
+            .collect();
+    }
     CONFIGS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let config = cache
-            .entry(lang.to_string())
-            .or_insert_with(|| config_for_lang(lang));
+        let config = cache.entry(lang.to_string()).or_insert_with(|| config_for_lang(lang));
         let Some(config) = config else {
             return plain();
         };
-        let source = block.join("
-");
+        let source = block.join(
+            "
+",
+        );
         let spans = highlight_source(config, &source);
         let mut lines = Vec::with_capacity(block.len());
         let mut line_start = 0usize; // byte offset of the current line
@@ -409,9 +420,7 @@ fn is_rule(line: &str) -> bool {
 fn heading_text(line: &str) -> Option<&str> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) {
-        line.strip_prefix(&"#".repeat(hashes))
-            .map(|r| r.trim_start())
-            .filter(|r| !r.is_empty())
+        line.strip_prefix(&"#".repeat(hashes)).map(|r| r.trim_start()).filter(|r| !r.is_empty())
     } else {
         None
     }
@@ -465,38 +474,36 @@ fn inline_links(
     while i < chars.len() {
         // `code`
         if chars[i] == '`'
-            && let Some(end) = chars[i + 1..].iter().position(|c| *c == '`') {
-                flush(&mut buf, &mut spans, bold, italic);
-                let code: String = chars[i + 1..i + 1 + end].iter().collect();
-                spans.extend(inline_code_spans(&code));
-                i += end + 2;
-                continue;
-            }
+            && let Some(end) = chars[i + 1..].iter().position(|c| *c == '`')
+        {
+            flush(&mut buf, &mut spans, bold, italic);
+            let code: String = chars[i + 1..i + 1 + end].iter().collect();
+            spans.extend(inline_code_spans(&code));
+            i += end + 2;
+            continue;
+        }
         // [text](url) — show the text, drop the url
         if chars[i] == '['
-            && let Some(close) = chars[i + 1..].iter().position(|c| *c == ']') {
-                let after = i + 1 + close + 1;
-                if chars.get(after) == Some(&'(')
-                    && let Some(paren) = chars[after + 1..].iter().position(|c| *c == ')') {
-                        flush(&mut buf, &mut spans, bold, italic);
-                        let label: String = chars[i + 1..i + 1 + close].iter().collect();
-                        let url: String = chars[after + 1..after + 1 + paren].iter().collect();
-                        let col: usize =
-                            offset + spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-                        links.push(MdLink {
-                            line: line_idx,
-                            col,
-                            text: label.clone(),
-                            url,
-                        });
-                        spans.push(Span::styled(
-                            label,
-                            Style::default().fg(LINK_FG()).add_modifier(Modifier::UNDERLINED),
-                        ));
-                        i = after + 1 + paren + 1;
-                        continue;
-                    }
+            && let Some(close) = chars[i + 1..].iter().position(|c| *c == ']')
+        {
+            let after = i + 1 + close + 1;
+            if chars.get(after) == Some(&'(')
+                && let Some(paren) = chars[after + 1..].iter().position(|c| *c == ')')
+            {
+                flush(&mut buf, &mut spans, bold, italic);
+                let label: String = chars[i + 1..i + 1 + close].iter().collect();
+                let url: String = chars[after + 1..after + 1 + paren].iter().collect();
+                let col: usize =
+                    offset + spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+                links.push(MdLink { line: line_idx, col, text: label.clone(), url });
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(LINK_FG()).add_modifier(Modifier::UNDERLINED),
+                ));
+                i = after + 1 + paren + 1;
+                continue;
             }
+        }
         // ** bold toggle
         if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
             flush(&mut buf, &mut spans, bold, italic);
@@ -526,10 +533,8 @@ mod tests {
     #[test]
     fn blank_rows_around_rules_collapse() {
         let lines = super::render("above\n\n---\n\nbelow", 20);
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let texts: Vec<String> =
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert_eq!(texts.len(), 3, "text, rule, text — no blank rows: {texts:?}");
         assert!(texts[0].contains("above"));
         assert!(texts[1].chars().all(|c| c == '─'));
@@ -561,11 +566,8 @@ mod tests {
 
     #[test]
     fn long_paragraphs_word_wrap_and_links_survive() {
-        let text = format!(
-            "{} [docs](https://example.com) {}",
-            "word ".repeat(20),
-            "tail ".repeat(20)
-        );
+        let text =
+            format!("{} [docs](https://example.com) {}", "word ".repeat(20), "tail ".repeat(20));
         let (lines, links) = super::render_with_links(&text, 40);
         assert!(lines.len() > 1, "paragraph wrapped into multiple rows");
         for line in &lines {
@@ -602,8 +604,7 @@ mod tests {
         }
         // not rules: rendered as text (word-wrapped at width 10)
         let lines = render("-- too short", 10);
-        let joined: String =
-            lines.iter().map(text_of).collect::<Vec<_>>().join(" ");
+        let joined: String = lines.iter().map(text_of).collect::<Vec<_>>().join(" ");
         assert!(joined.contains("too short"), "{joined:?}");
     }
 

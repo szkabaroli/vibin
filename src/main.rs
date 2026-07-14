@@ -12,43 +12,6 @@ use std::time::Duration;
 
 use app::App;
 
-/// Re-print link labels wrapped in OSC 8 so terminals that support
-/// hyperlinks (Ghostty, iTerm2, WezTerm, Kitty) make them clickable.
-/// ratatui's buffer can't carry hyperlinks, so this runs after each draw.
-/// Re-print diagnostic spans with a curly underline (SGR 4:3) in the
-/// severity color — the wavy squiggles ratatui itself cannot draw.
-fn emit_squiggles(squiggles: &[app::Squiggle]) {
-    use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
-    use crossterm::style::Print;
-    use std::io::Write;
-    if squiggles.is_empty() {
-        return;
-    }
-    let mut out = std::io::stdout();
-    let _ = crossterm::queue!(out, SavePosition);
-    for s in squiggles {
-        let fg = match s.fg {
-            Some((r, g, b)) => format!("\x1b[38;2;{r};{g};{b}m"),
-            None => "\x1b[39m".to_string(),
-        };
-        let bg = match s.bg {
-            Some((r, g, b)) => format!("\x1b[48;2;{r};{g};{b}m"),
-            None => "\x1b[49m".to_string(),
-        };
-        let (cr, cg, cb) = s.curl;
-        let _ = crossterm::queue!(
-            out,
-            MoveTo(s.x, s.y),
-            Print(format!(
-                "{fg}{bg}\x1b[4:3m\x1b[58;2;{cr};{cg};{cb}m{}\x1b[4:0m\x1b[59m",
-                s.text
-            )),
-        );
-    }
-    let _ = crossterm::queue!(out, Print("\x1b[0m"), RestorePosition);
-    let _ = out.flush();
-}
-
 fn parse_args() -> (Option<PathBuf>, Vec<String>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // usage: vibin [dir] [-- command args...]
@@ -62,16 +25,17 @@ fn parse_args() -> (Option<PathBuf>, Vec<String>) {
 
     let mut iter = args.into_iter().peekable();
     if let Some(first) = iter.peek()
-        && first != "--" {
-            let dir = PathBuf::from(first);
-            if dir.is_dir() {
-                workdir = Some(dir.canonicalize().unwrap_or(dir));
-                iter.next();
-            } else {
-                eprintln!("error: {first:?} is not a directory");
-                std::process::exit(1);
-            }
+        && first != "--"
+    {
+        let dir = PathBuf::from(first);
+        if dir.is_dir() {
+            workdir = Some(dir.canonicalize().unwrap_or(dir));
+            iter.next();
+        } else {
+            eprintln!("error: {first:?} is not a directory");
+            std::process::exit(1);
         }
+    }
     if iter.peek().map(String::as_str) == Some("--") {
         iter.next();
         let cmd: Vec<String> = iter.collect();
@@ -83,18 +47,60 @@ fn parse_args() -> (Option<PathBuf>, Vec<String>) {
 }
 
 fn main() -> Result<()> {
+    // ghostty-style +commands: run and exit, no TUI
+    if let Some(plus) = std::env::args().nth(1).filter(|a| a.starts_with('+')) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match plus.as_str() {
+            "+list-keybinds" => {
+                let config = vibin::config::Config::load(&cwd);
+                let (kb, errors) = vibin::keybind::Keybinds::from_config(&config.keybinds);
+                for e in &errors {
+                    eprintln!("warning: {e}");
+                }
+                vibin::keybind::print_keybinds(&kb);
+            }
+            "+list-actions" => vibin::keybind::print_actions(),
+            other => {
+                eprintln!("unknown command {other} (try +list-keybinds, +list-actions)");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let (workdir_arg, command) = parse_args();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let explicit = workdir_arg.is_some();
     let mut app = App::new(workdir_arg.unwrap_or(cwd), command);
     if !explicit {
         app.enter_welcome();
+    } else {
+        // straight into a workspace: eager LSP start from config markers
+        app.activate_workspace_lsp();
     }
 
-    let mut terminal = ratatui::init();
+    // manual init on our undercurl-aware backend (ratatui::init would
+    // hand back a plain CrosstermBackend)
+    crossterm::terminal::enable_raw_mode()?;
+    let _ = execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            ratatui::restore();
+            hook(info);
+        }));
+    }
+    let mut terminal = ratatui::Terminal::new(vibin::backend::UndercurlBackend::stdout())?;
     // ask the terminal for its colors (OSC 11/17/4) while stdin is still
     // ours: background, selection, and the full ANSI palette drive the UI
     color::detect_terminal_bg();
+    // same window: probe the graphics protocol (kitty/sixel/iTerm2) and
+    // cell pixel size for image previews; a terminal that answers with
+    // nothing usable keeps the half-block fallback
+    if let Some((picker, kitty_anim)) = vibin::imageview::probe_picker() {
+        app.picker = picker;
+        app.kitty_anim = kitty_anim;
+    }
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     // live dark/light switching (mode 2031) where supported (Ghostty, kitty)
     let _ = execute!(std::io::stdout(), event::EnableColorSchemeDetection);
@@ -128,7 +134,7 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(terminal: &mut vibin::backend::VibinTerminal, app: &mut App) -> Result<()> {
     // Terminals without 24-bit color (Apple Terminal.app) garble RGB
     // sequences: quantize the finished frame to xterm-256 there.
     let truecolor = color::supports_truecolor();
@@ -156,9 +162,6 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                     color::quantize_buffer(f.buffer_mut());
                 }
             })?;
-            if truecolor {
-                emit_squiggles(&app.squiggle_overlays);
-            }
             let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
             // bar cursor while inserting, block otherwise
             let wants_bar = app.wants_bar_cursor();
@@ -167,10 +170,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 let _ = if wants_bar {
                     execute!(std::io::stdout(), crossterm::cursor::SetCursorStyle::BlinkingBar)
                 } else {
-                    execute!(
-                        std::io::stdout(),
-                        crossterm::cursor::SetCursorStyle::DefaultUserShape
-                    )
+                    execute!(std::io::stdout(), crossterm::cursor::SetCursorStyle::DefaultUserShape)
                 };
             }
             dirty = false;
@@ -216,7 +216,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         let sel = batch.add(QueryColor(ColorType::HighlightBackground));
                         let fg = batch.add(QueryColor(ColorType::Foreground));
                         // the whole palette drives syntax, diagnostics, diffs
-                        let slots: Vec<_> = (0..16u8).chain([238])
+                        let slots: Vec<_> = (0..16u8)
+                            .chain([238])
                             .map(|i| (i, batch.add(QueryColor(ColorType::Palette(i)))))
                             .collect();
                         if let Ok(results) = batch.execute() {

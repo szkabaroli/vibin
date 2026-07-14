@@ -41,6 +41,18 @@ struct Shared {
     hover_result: Option<String>,
     definition_pending: Option<u64>,
     definition_result: Option<Vec<Location>>,
+    /// In-flight `textDocument/documentLink` request and the file it's for.
+    links_pending: Option<(u64, PathBuf)>,
+    /// Last documentLink reply per file.
+    links: HashMap<PathBuf, Vec<DocumentLink>>,
+    /// In-flight `textDocument/formatting` request and the file it's for.
+    formatting_pending: Option<(u64, PathBuf)>,
+    /// Formatting reply: the file plus its edits in UTF-16 positions.
+    formatting_result: Option<(PathBuf, Vec<FmtEdit>)>,
+    /// In-flight `textDocument/codeLens` request and the file it's for.
+    lens_pending: Option<(u64, PathBuf)>,
+    /// Last codeLens reply per file.
+    lenses: HashMap<PathBuf, Vec<CodeLens>>,
     /// The server advertised `diagnosticProvider.workspaceDiagnostics` — it
     /// can report problems for the whole project via `workspace/diagnostic`.
     supports_workspace_diag: bool,
@@ -55,6 +67,42 @@ struct Shared {
     /// The server's stdout reached EOF — it exited or crashed.
     dead: bool,
     generation: u64,
+    /// `window/showMessage` notifications not yet shown: (type, message).
+    messages: Vec<(u8, String)>,
+    /// `window/showMessageRequest`s awaiting a user decision — each must
+    /// be answered (see [`Client::respond_message_request`]).
+    message_requests: Vec<MessageRequest>,
+}
+
+/// A server-initiated `window/showMessageRequest`: a message plus action
+/// buttons. The server blocks on an answer — the picked action's title,
+/// or null for "dismissed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRequest {
+    /// JSON-RPC id to answer with.
+    pub id: u64,
+    /// 1=error, 2=warning, 3=info, 4=log.
+    pub typ: u8,
+    pub message: String,
+    /// Action button titles, in server order.
+    pub actions: Vec<String>,
+}
+
+/// Parse `window/showMessageRequest` params into a [`MessageRequest`].
+fn parse_message_request(id: u64, params: &Value) -> Option<MessageRequest> {
+    let message = params.get("message")?.as_str()?.to_string();
+    let typ = params.get("type").and_then(Value::as_u64).unwrap_or(3) as u8;
+    let actions = params
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|item| item.get("title").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(MessageRequest { id, typ, message, actions })
 }
 
 /// An in-flight work-done progress stream (an `$/progress` token the server
@@ -77,27 +125,58 @@ pub struct Location {
     pub character: usize,
 }
 
-/// The language server command for a language, if we support one.
-/// `VIBIN_LSP_CMD` overrides the command for every language (used by the
-/// tests; also lets users point at a custom server).
-pub fn server_command(language: &str) -> Option<Vec<String>> {
-    if let Ok(cmd) = std::env::var("VIBIN_LSP_CMD") {
-        let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
-        if !parts.is_empty() {
-            return Some(parts);
-        }
-    }
-    let cmd: &[&str] = match language {
-        "rust" => &["rust-analyzer"],
-        "typescript" | "javascript" => &["typescript-language-server", "--stdio"],
-        "python" => &["pyright-langserver", "--stdio"],
-        "bash" => &["bash-language-server", "start"],
-        "yaml" => &["yaml-language-server", "--stdio"],
-        "dockerfile" => &["docker-langserver", "--stdio"],
-        "protobuf" => &["protols"],
-        _ => return None,
-    };
-    Some(cmd.iter().map(|s| s.to_string()).collect())
+/// One `textDocument/formatting` edit: replace the (line, UTF-16 col)
+/// range with `text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FmtEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+/// Parse a formatting reply: TextEdit[].
+fn parse_fmt_edits(result: Option<&Value>) -> Vec<FmtEdit> {
+    let Some(edits) = result.and_then(Value::as_array) else { return Vec::new() };
+    edits
+        .iter()
+        .filter_map(|e| {
+            let pos = |p: &str| -> Option<(usize, usize)> {
+                Some((
+                    e.pointer(&format!("/range/{p}/line"))?.as_u64()? as usize,
+                    e.pointer(&format!("/range/{p}/character"))?.as_u64()? as usize,
+                ))
+            };
+            Some(FmtEdit {
+                start: pos("start")?,
+                end: pos("end")?,
+                text: e.get("newText")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A `textDocument/codeLens` annotation: a command title the server pins
+/// to a line ("run", "5 references", …). Display-only in vibin — lenses
+/// arriving without a resolved command are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeLens {
+    pub line: usize,
+    pub title: String,
+}
+
+/// A `textDocument/documentLink` range: text the server says is a link
+/// (a URL in a comment, the path in an import/include, …). Columns are
+/// char indices. Links without a resolved `target` are dropped — vibin
+/// doesn't do the `documentLink/resolve` round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentLink {
+    pub line: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    /// URI to open: `https://…`, or `file://…` for import targets.
+    pub target: String,
+    /// Server-provided hover text ("" when absent).
+    pub tooltip: String,
 }
 
 pub struct LspClient {
@@ -135,16 +214,29 @@ impl LspClient {
             next_id: Arc::clone(&next_id),
         };
 
+        // vibin doesn't implement client-side file watching, so servers
+        // that support it must watch the workspace themselves — without
+        // this rust-analyzer never notices Cargo.toml/rust-analyzer.toml
+        // edits (its default watcher is the client)
+        let init_options = match language {
+            "rust" => json!({ "files": { "watcher": "server" } }),
+            _ => Value::Null,
+        };
         let init = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
                 "processId": std::process::id(),
                 "rootUri": path_to_uri(root),
+                "initializationOptions": init_options,
                 "capabilities": {
                     "textDocument": {
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "publishDiagnostics": {},
-                        "diagnostic": { "dynamicRegistration": false }
+                        "diagnostic": { "dynamicRegistration": false },
+                        "documentLink": { "tooltipSupport": true },
+                        // no dynamicRegistration/resolve: servers should
+                        // send lenses with commands filled in
+                        "codeLens": {}
                     },
                     "workspace": {
                         "diagnostics": { "refreshSupport": true }
@@ -152,7 +244,22 @@ impl LspClient {
                     // opt in to server-initiated work-done progress — without
                     // this, servers never send window/workDoneProgress/create
                     // or the $/progress stream that drives the status bar
-                    "window": { "workDoneProgress": true }
+                    "window": { "workDoneProgress": true },
+                    // rust-analyzer gates its run/debug/references code
+                    // lenses on the client claiming these custom commands —
+                    // without this it sends no lenses at all. vibin renders
+                    // lenses as annotations, so claiming them is display-
+                    // truthful; other servers ignore unknown experimentals.
+                    "experimental": {
+                        "commands": {
+                            "commands": [
+                                "rust-analyzer.runSingle",
+                                "rust-analyzer.debugSingle",
+                                "rust-analyzer.showReferences",
+                                "rust-analyzer.gotoLocation"
+                            ]
+                        }
+                    }
                 },
                 "workspaceFolders": [{ "uri": path_to_uri(root), "name": "workspace" }]
             }
@@ -264,6 +371,64 @@ impl LspClient {
         self.shared.lock().ok()?.definition_result.take()
     }
 
+    /// Ask for the clickable ranges of a document. Fire-and-forget like
+    /// hover: the reply lands in shared state, read it with
+    /// [`document_links`](Self::document_links). A newer request for any
+    /// file supersedes an unanswered older one.
+    pub fn request_document_links(&self, path: &Path) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.links_pending = Some((id, path.to_path_buf()));
+        }
+        self.notify(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/documentLink",
+            "params": { "textDocument": { "uri": path_to_uri(path) } }
+        }));
+    }
+
+    /// The last known links of a file (empty until a reply arrived).
+    pub fn document_links(&self, path: &Path) -> Vec<DocumentLink> {
+        self.shared.lock().ok().and_then(|s| s.links.get(path).cloned()).unwrap_or_default()
+    }
+
+    /// Ask for a document's code lenses; fire-and-forget like links.
+    pub fn request_code_lenses(&self, path: &Path) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.lens_pending = Some((id, path.to_path_buf()));
+        }
+        self.notify(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/codeLens",
+            "params": { "textDocument": { "uri": path_to_uri(path) } }
+        }));
+    }
+
+    /// Ask the server to format a document. Fire-and-forget: the reply
+    /// lands in shared state; poll with [`Self::take_formatting`].
+    pub fn request_formatting(&self, path: &Path, tab_size: usize, insert_spaces: bool) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.formatting_pending = Some((id, path.to_path_buf()));
+        }
+        self.notify(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/formatting",
+            "params": {
+                "textDocument": { "uri": path_to_uri(path) },
+                "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+            }
+        }));
+    }
+
+    /// The formatting reply, if one arrived: file + UTF-16 ranged edits.
+    pub fn take_formatting(&self) -> Option<(PathBuf, Vec<FmtEdit>)> {
+        self.shared.lock().ok()?.formatting_result.take()
+    }
+
+    /// The last known code lenses of a file (empty until a reply arrived).
+    pub fn code_lenses(&self, path: &Path) -> Vec<CodeLens> {
+        self.shared.lock().ok().and_then(|s| s.lenses.get(path).cloned()).unwrap_or_default()
+    }
+
     /// True when the server process died (e.g. a rustup shim for an
     /// uninstalled component spawns fine, then exits instantly).
     pub fn failed(&self) -> bool {
@@ -271,11 +436,7 @@ impl LspClient {
     }
 
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
-        self.shared
-            .lock()
-            .ok()
-            .and_then(|s| s.diagnostics.get(path).cloned())
-            .unwrap_or_default()
+        self.shared.lock().ok().and_then(|s| s.diagnostics.get(path).cloned()).unwrap_or_default()
     }
 
     /// (errors, warnings) per file that has diagnostics — for the file
@@ -296,6 +457,27 @@ impl LspClient {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Drain queued `window/showMessage` notifications: (type, message).
+    pub fn take_messages(&self) -> Vec<(u8, String)> {
+        self.shared.lock().map(|mut s| std::mem::take(&mut s.messages)).unwrap_or_default()
+    }
+
+    /// Drain queued `window/showMessageRequest`s. Every drained request
+    /// must eventually be answered via [`Self::respond_message_request`].
+    pub fn take_message_requests(&self) -> Vec<MessageRequest> {
+        self.shared.lock().map(|mut s| std::mem::take(&mut s.message_requests)).unwrap_or_default()
+    }
+
+    /// Answer a `window/showMessageRequest`: the picked action's title, or
+    /// None for "dismissed without choosing".
+    pub fn respond_message_request(&self, id: u64, action: Option<&str>) {
+        let result = match action {
+            Some(title) => json!({ "title": title }),
+            None => Value::Null,
+        };
+        write_message(&self.writer, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     }
 
     /// The server's current work-done progress, formatted for the status bar
@@ -379,6 +561,18 @@ fn reader_loop(
         match (id, method) {
             // server → client request: answer politely so it keeps going
             (Some(id), Some(method)) => {
+                // showMessageRequest wants a user decision — park it for
+                // the UI and answer later (respond_message_request)
+                if method == "window/showMessageRequest" {
+                    if let Some(req) =
+                        message.get("params").and_then(|p| parse_message_request(id, p))
+                    {
+                        let Ok(mut s) = shared.lock() else { break };
+                        s.message_requests.push(req);
+                        s.generation += 1;
+                    }
+                    continue;
+                }
                 let result = if method == "workspace/configuration" {
                     let n = message
                         .pointer("/params/items")
@@ -389,10 +583,7 @@ fn reader_loop(
                 } else {
                     Value::Null
                 };
-                write_message(
-                    &writer,
-                    &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                );
+                write_message(&writer, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
                 // The server noticed something changed and wants us to re-pull.
                 if method == "workspace/diagnostic/refresh" {
                     send_workspace_diagnostic(&writer, &shared, &next_id);
@@ -441,16 +632,28 @@ fn reader_loop(
                         s.workspace_pending = None;
                         apply_workspace_report(&mut s, message.get("result"));
                         s.generation += 1;
+                    } else if s.links_pending.as_ref().is_some_and(|(p, _)| *p == id) {
+                        let (_, path) = s.links_pending.take().expect("checked above");
+                        let doc = s.open_docs.get(&path).cloned().unwrap_or_default();
+                        let links = parse_document_links(message.get("result"), &doc);
+                        s.links.insert(path, links);
+                        s.generation += 1;
+                    } else if s.lens_pending.as_ref().is_some_and(|(p, _)| *p == id) {
+                        let (_, path) = s.lens_pending.take().expect("checked above");
+                        let lenses = parse_code_lenses(message.get("result"));
+                        s.lenses.insert(path, lenses);
+                        s.generation += 1;
+                    } else if s.formatting_pending.as_ref().is_some_and(|(p, _)| *p == id) {
+                        let (_, path) = s.formatting_pending.take().expect("checked above");
+                        s.formatting_result = Some((path, parse_fmt_edits(message.get("result"))));
+                        s.generation += 1;
                     }
                 }
             }
             // notification from the server
             (None, Some("textDocument/publishDiagnostics")) => {
                 let Some(params) = message.get("params") else { continue };
-                let Some(path) = params
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .and_then(uri_to_path)
+                let Some(path) = params.get("uri").and_then(Value::as_str).and_then(uri_to_path)
                 else {
                     continue;
                 };
@@ -464,6 +667,15 @@ fn reader_loop(
                 s.diagnostics.insert(path, diags);
                 s.generation += 1;
             }
+            // plain server message (no buttons) — park it for a toast
+            (None, Some("window/showMessage")) => {
+                if let Some(text) = message.pointer("/params/message").and_then(Value::as_str) {
+                    let typ = message.pointer("/params/type").and_then(Value::as_u64).unwrap_or(3);
+                    let Ok(mut s) = shared.lock() else { break };
+                    s.messages.push((typ as u8, text.to_string()));
+                    s.generation += 1;
+                }
+            }
             // work-done progress: begin/report/end for a token (indexing,
             // cargo check…). `window/workDoneProgress/create` is answered in
             // the server-request arm above; the payload arrives here.
@@ -473,10 +685,7 @@ fn reader_loop(
                     continue;
                 };
                 let value = params.get("value");
-                let kind = value
-                    .and_then(|v| v.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let kind = value.and_then(|v| v.get("kind")).and_then(Value::as_str).unwrap_or("");
                 let Ok(mut s) = shared.lock() else { break };
                 match kind {
                     "begin" => {
@@ -661,22 +870,59 @@ fn parse_diagnostic(value: &Value, doc: &str) -> Option<Diagnostic> {
         col_start,
         col_end,
         severity: value.get("severity").and_then(Value::as_u64).unwrap_or(1) as u8,
-        message: value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        source: value
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        message: value.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
+        source: value.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
         code: match value.get("code") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Number(n)) => n.to_string(),
             _ => String::new(),
         },
     })
+}
+
+/// Parse a documentLink reply: DocumentLink[], keeping links that carry a
+/// target (no `documentLink/resolve` round-trip). Multi-line ranges are
+/// clamped to their first line, like diagnostics.
+fn parse_document_links(result: Option<&Value>, doc: &str) -> Vec<DocumentLink> {
+    let Some(list) = result.and_then(Value::as_array) else { return Vec::new() };
+    list.iter()
+        .filter_map(|link| {
+            let target = link.get("target")?.as_str()?;
+            let range = link.get("range")?;
+            let line = range.pointer("/start/line")?.as_u64()? as usize;
+            let end_line = range.pointer("/end/line")?.as_u64()? as usize;
+            let start_u16 = range.pointer("/start/character")?.as_u64()? as usize;
+            let end_u16 = range.pointer("/end/character")?.as_u64()? as usize;
+            let line_text = doc.lines().nth(line).unwrap_or("");
+            let col_start = utf16_to_char_col(line_text, start_u16);
+            let col_end = if end_line == line {
+                utf16_to_char_col(line_text, end_u16).max(col_start + 1)
+            } else {
+                line_text.chars().count().max(col_start + 1)
+            };
+            Some(DocumentLink {
+                line,
+                col_start,
+                col_end,
+                target: target.to_string(),
+                tooltip: link.get("tooltip").and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a codeLens reply: CodeLens[], keeping lenses whose command is
+/// already filled in (vibin declares no resolve support, so conforming
+/// servers send complete lenses).
+fn parse_code_lenses(result: Option<&Value>) -> Vec<CodeLens> {
+    let Some(list) = result.and_then(Value::as_array) else { return Vec::new() };
+    list.iter()
+        .filter_map(|lens| {
+            let title = lens.pointer("/command/title")?.as_str()?;
+            let line = lens.pointer("/range/start/line")?.as_u64()? as usize;
+            (!title.is_empty()).then(|| CodeLens { line, title: title.to_string() })
+        })
+        .collect()
 }
 
 /// Parse a definition reply: Location | Location[] | LocationLink[].
@@ -687,10 +933,7 @@ fn parse_definitions(result: Option<&Value>) -> Vec<Location> {
         let (uri, range) = if let Some(uri) = v.get("uri") {
             (uri, v.get("range")?)
         } else {
-            (
-                v.get("targetUri")?,
-                v.get("targetSelectionRange").or_else(|| v.get("targetRange"))?,
-            )
+            (v.get("targetUri")?, v.get("targetSelectionRange").or_else(|| v.get("targetRange"))?)
         };
         Some(Location {
             path: uri_to_path(uri.as_str()?)?,
@@ -775,6 +1018,12 @@ while true; do
     *'"method":"textDocument/hover"'*)
       id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
       send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"**fake hover docs**\"}}}" ;;
+    *'"method":"textDocument/documentLink"'*)
+      id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+      send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":7}},\"target\":\"https://example.com/docs\",\"tooltip\":\"open docs\"},{\"range\":{\"start\":{\"line\":0,\"character\":8},\"end\":{\"line\":0,\"character\":10}}}]}" ;;
+    *'"method":"textDocument/codeLens"'*)
+      id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+      send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"command\":{\"title\":\"run\",\"command\":\"fake.run\"}},{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"command\":{\"title\":\"3 references\",\"command\":\"fake.refs\"}},{\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":2,\"character\":1}},\"data\":{\"unresolved\":true}}]}" ;;
   esac
 done
 "##,
@@ -789,6 +1038,49 @@ done
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn parses_formatting_edits() {
+        let result = json!([
+            { "range": { "start": { "line": 0, "character": 4 },
+                          "end": { "line": 1, "character": 0 } }, "newText": "\n" },
+            { "range": { "start": { "line": 2, "character": 0 },
+                          "end": { "line": 2, "character": 2 } }, "newText": "    " }
+        ]);
+        let edits = parse_fmt_edits(Some(&result));
+        assert_eq!(
+            edits,
+            vec![
+                FmtEdit { start: (0, 4), end: (1, 0), text: "\n".into() },
+                FmtEdit { start: (2, 0), end: (2, 2), text: "    ".into() },
+            ]
+        );
+        assert!(parse_fmt_edits(None).is_empty());
+        assert!(parse_fmt_edits(Some(&Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn parses_show_message_request() {
+        let params = json!({
+            "type": 2,
+            "message": "rust-analyzer needs a reload",
+            "actions": [{ "title": "Reload" }, { "title": "Cancel" }]
+        });
+        assert_eq!(
+            parse_message_request(7, &params).unwrap(),
+            MessageRequest {
+                id: 7,
+                typ: 2,
+                message: "rust-analyzer needs a reload".into(),
+                actions: vec!["Reload".into(), "Cancel".into()],
+            }
+        );
+        // actions and type are optional; message is not
+        let plain = parse_message_request(8, &json!({ "message": "hi" })).unwrap();
+        assert_eq!(plain.typ, 3);
+        assert!(plain.actions.is_empty());
+        assert!(parse_message_request(9, &json!({ "type": 1 })).is_none());
+    }
 
     #[test]
     fn uri_round_trip() {
@@ -815,10 +1107,7 @@ mod tests {
         let markup = json!({ "contents": { "kind": "markdown", "value": "**docs**" } });
         assert_eq!(extract_hover_text(Some(&markup)).unwrap(), "**docs**");
         let marked = json!({ "contents": { "language": "rust", "value": "fn foo()" } });
-        assert_eq!(
-            extract_hover_text(Some(&marked)).unwrap(),
-            "```rust\nfn foo()\n```"
-        );
+        assert_eq!(extract_hover_text(Some(&marked)).unwrap(), "```rust\nfn foo()\n```");
         let list = json!({ "contents": ["first", { "language": "rust", "value": "x" }] });
         assert!(extract_hover_text(Some(&list)).unwrap().contains("first"));
         assert!(extract_hover_text(Some(&json!({ "contents": "" }))).is_none());
@@ -891,6 +1180,29 @@ mod tests {
         );
         assert_eq!(hover.unwrap(), "**fake hover docs**");
         assert!(client.take_hover().is_none(), "hover is consumed once");
+
+        // document links round-trip; the target-less one is dropped
+        client.request_document_links(&file);
+        assert!(
+            wait_until(5000, || !client.document_links(&file).is_empty()),
+            "documentLink reply should arrive"
+        );
+        let links = client.document_links(&file);
+        assert_eq!(links.len(), 1, "link without target dropped: {links:?}");
+        assert_eq!(links[0].target, "https://example.com/docs");
+        assert_eq!(links[0].tooltip, "open docs");
+        assert_eq!((links[0].line, links[0].col_start, links[0].col_end), (0, 3, 7));
+
+        // code lenses round-trip; the unresolved one (no command) is dropped
+        client.request_code_lenses(&file);
+        assert!(
+            wait_until(5000, || !client.code_lenses(&file).is_empty()),
+            "codeLens reply should arrive"
+        );
+        let lenses = client.code_lenses(&file);
+        assert_eq!(lenses.len(), 2, "unresolved lens dropped: {lenses:?}");
+        assert_eq!((lenses[0].line, lenses[0].title.as_str()), (0, "run"));
+        assert_eq!((lenses[1].line, lenses[1].title.as_str()), (0, "3 references"));
     }
 
     #[test]
@@ -946,8 +1258,7 @@ mod tests {
             "workspace pull should surface an unopened file"
         );
         let counts = client.diagnostic_counts();
-        let (_, &(errors, warnings)) =
-            counts.iter().find(|(p, _)| p.ends_with("lib.rs")).unwrap();
+        let (_, &(errors, warnings)) = counts.iter().find(|(p, _)| p.ends_with("lib.rs")).unwrap();
         assert_eq!((errors, warnings), (1, 0));
     }
 
@@ -995,12 +1306,14 @@ mod tests {
         assert!(
             wait_until(5000, || {
                 // peek without consuming until it arrives
-                self::LspClient::take_definition(&client).map(|locs| {
-                    assert_eq!(locs.len(), 1);
-                    assert_eq!(locs[0].line, 0);
-                    assert_eq!(locs[0].character, 3);
-                    assert_eq!(locs[0].path, file);
-                }).is_some()
+                self::LspClient::take_definition(&client)
+                    .map(|locs| {
+                        assert_eq!(locs.len(), 1);
+                        assert_eq!(locs[0].line, 0);
+                        assert_eq!(locs[0].character, 3);
+                        assert_eq!(locs[0].path, file);
+                    })
+                    .is_some()
             }),
             "definition should arrive"
         );
@@ -1028,29 +1341,14 @@ mod tests {
         // /usr/bin/true spawns successfully and exits at once — like a
         // rustup shim for an uninstalled component
         let client = LspClient::start("rust", dir.path(), &["/usr/bin/true".to_string()]).unwrap();
-        assert!(
-            wait_until(5000, || client.failed()),
-            "EOF must mark the client dead"
-        );
+        assert!(wait_until(5000, || client.failed()), "EOF must mark the client dead");
     }
 
     #[test]
     fn start_fails_gracefully_for_missing_binary() {
         let dir = tempfile::TempDir::new().unwrap();
-        let client = LspClient::start(
-            "rust",
-            dir.path(),
-            &["/definitely/not/a/server".to_string()],
-        );
+        let client =
+            LspClient::start("rust", dir.path(), &["/definitely/not/a/server".to_string()]);
         assert!(client.is_none());
-    }
-
-    #[test]
-    fn server_commands_registry() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        assert!(server_command("rust").is_some());
-        assert!(server_command("python").is_some());
-        assert!(server_command("toml").is_none());
-        assert!(server_command("text").is_none());
     }
 }

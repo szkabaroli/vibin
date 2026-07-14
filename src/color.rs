@@ -70,9 +70,7 @@ pub fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
             ((c as u16 - 35) / 40) as u8
         }
     };
-    let cube_value = |i: u8| -> u8 {
-        if i == 0 { 0 } else { 55 + i * 40 }
-    };
+    let cube_value = |i: u8| -> u8 { if i == 0 { 0 } else { 55 + i * 40 } };
     let (cr, cg, cb) = (level(r), level(g), level(b));
     let cube_idx = 16 + 36 * cr + 6 * cg + cb;
     let cube_rgb = (cube_value(cr), cube_value(cg), cube_value(cb));
@@ -87,11 +85,7 @@ pub fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
         let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2) as u32;
         d(c.0, r) + d(c.1, g) + d(c.2, b)
     };
-    if dist(cube_rgb) <= dist((gray_value, gray_value, gray_value)) {
-        cube_idx
-    } else {
-        gray_idx
-    }
+    if dist(cube_rgb) <= dist((gray_value, gray_value, gray_value)) { cube_idx } else { gray_idx }
 }
 
 #[cfg(test)]
@@ -125,9 +119,7 @@ mod tests {
             0,
             0,
             "test",
-            Style::default()
-                .fg(Color::Rgb(255, 110, 140))
-                .bg(Color::Rgb(40, 42, 48)),
+            Style::default().fg(Color::Rgb(255, 110, 140)).bg(Color::Rgb(40, 42, 48)),
         );
         quantize_buffer(&mut buf);
         for x in 0..4 {
@@ -173,9 +165,8 @@ pub fn is_light() -> bool {
     if let Some(light) = *SCHEME_LIGHT.read().unwrap() {
         return light;
     }
-    terminal_bg().is_some_and(|(r, g, b)| {
-        (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000 > 128
-    })
+    terminal_bg()
+        .is_some_and(|(r, g, b)| (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000 > 128)
 }
 
 /// The terminal's default background color, if it answered OSC 11.
@@ -239,7 +230,9 @@ pub fn wash(weight: u32) -> Option<(u8, u8, u8)> {
 /// answer just hit the short timeout. (Mid-session re-queries instead go
 /// through crossterm's query batching, which owns stdin by then.)
 pub fn detect_terminal_bg() {
-    let Some(reply) = raw_color_query() else { return };
+    let Some(reply) = raw_color_query() else {
+        return;
+    };
     if let Some(rgb) = parse_osc11(&reply) {
         set_terminal_bg(rgb);
     }
@@ -265,17 +258,31 @@ fn raw_color_query() -> Option<String> {
 /// replies (5 expected). Startup-only; see detect_terminal_bg.
 #[cfg(unix)]
 fn raw_color_query() -> Option<String> {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::time::{Duration, Instant};
-    let mut out = std::io::stdout();
     let mut query = b"\x1b]10;?\x07\x1b]11;?\x07\x1b]17;?\x07".to_vec();
     for i in (0..16).chain([238]) {
         query.extend_from_slice(format!("\x1b]4;{i};?\x07").as_bytes());
     }
+    raw_query(&query)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn raw_query(_query: &[u8]) -> Option<String> {
+    None
+}
+
+/// One raw write of `query` + a DA1 probe, one bounded read of the replies.
+/// Startup-only: must run while raw mode is active and BEFORE the crossterm
+/// event loop starts reading stdin (the replies arrive there).
+#[cfg(unix)]
+pub(crate) fn raw_query(query: &[u8]) -> Option<String> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+    let mut out = std::io::stdout();
+    let mut query = query.to_vec();
     // DA1 sentinel: every terminal answers it, and answers in order — when
-    // its reply (CSI ? ... c) arrives, all color replies we will ever get
-    // are already in the buffer. No fixed reply count, no wasted timeout.
+    // its reply (CSI ? ... c) arrives, all replies we will ever get are
+    // already in the buffer. No fixed reply count, no wasted timeout.
     query.extend_from_slice(b"\x1b[c");
     out.write_all(&query).ok()?;
     out.flush().ok()?;
@@ -307,11 +314,7 @@ fn raw_color_query() -> Option<String> {
             break;
         }
     }
-    if buf.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&buf).into_owned())
-    }
+    if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).into_owned()) }
 }
 
 /// Parse an OSC 11 reply: `]11;rgb:RRRR/GGGG/BBBB` (components are 1-4 hex
@@ -336,8 +339,7 @@ fn parse_rgb_spec(spec: &str) -> Option<(u8, u8, u8)> {
     let rgb = spec.trim_start_matches("rgba:").trim_start_matches("rgb:");
     let mut parts = rgb.split(['/', '\x07', '\x1b']).filter(|p| !p.is_empty());
     let mut comp = || -> Option<u8> {
-        let field: String =
-            parts.next()?.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        let field: String = parts.next()?.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
         let v = u32::from_str_radix(&field, 16).ok()?;
         Some(match field.len() {
             1 => (v * 17) as u8,

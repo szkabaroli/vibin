@@ -24,10 +24,7 @@ pub struct ChatEntry {
 impl ChatEntry {
     /// Compact "how long ago" label: 42s, 5m, 3h, 2d.
     pub fn age(&self, now: SystemTime) -> String {
-        let secs = now
-            .duration_since(self.modified)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let secs = now.duration_since(self.modified).map(|d| d.as_secs()).unwrap_or(0);
         match secs {
             0..=59 => format!("{secs}s"),
             60..=3599 => format!("{}m", secs / 60),
@@ -64,11 +61,7 @@ impl ChatStore {
 
     pub fn with_projects_dir(projects_dir: Option<PathBuf>, workdir: &Path) -> Self {
         let dir = projects_dir.map(|p| p.join(munge_workdir(workdir)));
-        let mut store = Self {
-            dir,
-            chats: Vec::new(),
-            selected: 0,
-        };
+        let mut store = Self { dir, chats: Vec::new(), selected: 0 };
         store.refresh();
         store
     }
@@ -87,10 +80,8 @@ impl ChatStore {
                 let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let modified = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified =
+                    entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                 chats.push(ChatEntry {
                     session_id: stem.to_string(),
                     modified,

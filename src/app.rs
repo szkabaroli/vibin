@@ -10,17 +10,22 @@ use crate::chats::ChatStore;
 use crate::diff::DiffView;
 use crate::editor::{Editor, EditorEvent};
 use crate::filetree::FileTree;
-use crate::projects::{self, RecentProject};
 use crate::git::GitState;
 use crate::input::key_to_bytes;
 use crate::lsp::LspClient;
 use crate::palette::{CommandEntry, Palette, PaletteAction};
+use crate::projects::{self, RecentProject};
 use crate::session::{SessionManager, SessionStatus};
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TREE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Frame interval for the welcome-screen gradient animation.
 const ANIM_INTERVAL: Duration = Duration::from_millis(90);
+
+/// How long a toast notification stays on screen.
+const TOAST_TTL: Duration = Duration::from_secs(4);
+/// Most toasts shown at once; older ones are dropped first.
+const TOAST_CAP: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -84,6 +89,101 @@ impl Welcome {
     }
 }
 
+/// LSP MessageType (1=error, 2=warning, 3=info, 4=log) → toast level.
+fn toast_level(typ: u8) -> ToastLevel {
+    match typ {
+        1 => ToastLevel::Error,
+        2 => ToastLevel::Warn,
+        _ => ToastLevel::Info,
+    }
+}
+
+/// Toast severity — picks the accent color of the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Where a toast's answer goes when a button is clicked (or the card is
+/// dismissed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastReply {
+    /// Answer an LSP `window/showMessageRequest` with this JSON-RPC id.
+    LspMessageRequest(u64),
+}
+
+/// A toast notification: stacked top-right. Plain toasts expire on tick;
+/// toasts with buttons stick around until the user answers or dismisses.
+pub struct Toast {
+    pub level: ToastLevel,
+    pub text: String,
+    pub born: Instant,
+    /// Action button labels — non-empty makes the toast sticky.
+    pub buttons: Vec<String>,
+    /// Recipient of the picked button (or the dismissal).
+    pub reply: Option<ToastReply>,
+}
+
+/// A right-click context menu: anchor position, entries, and the
+/// highlighted row. Entries are the same named actions keybindings use.
+/// Rendering records its item area in LayoutMap.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub pos: Position,
+    pub items: Vec<(&'static str, crate::keybind::Action)>,
+    pub selected: usize,
+}
+
+/// The menu bar's dropdowns: label → entries, entries being the same
+/// named actions keybindings and the context menu use.
+pub const MENU_BAR: &[(&str, &[(&str, crate::keybind::Action)])] = {
+    use crate::keybind::Action;
+    &[
+        (
+            "File",
+            &[
+                ("New Session", Action::NewSession),
+                ("Rename Session", Action::RenameSession),
+                ("Close Session", Action::CloseSession),
+                ("Quit", Action::Quit),
+            ],
+        ),
+        (
+            "Edit",
+            &[
+                ("Copy", Action::Copy),
+                ("Cut", Action::Cut),
+                ("Paste", Action::Paste),
+                ("Select All", Action::SelectAll),
+                ("Undo", Action::Undo),
+                ("Redo", Action::Redo),
+            ],
+        ),
+        (
+            "View",
+            &[
+                ("Agents", Action::GotoShell(Shell::Agents)),
+                ("Git", Action::GotoShell(Shell::Git)),
+                ("Code", Action::GotoShell(Shell::Code)),
+                ("Refresh", Action::Refresh),
+            ],
+        ),
+        (
+            "Tools",
+            &[
+                ("Command Palette", Action::TogglePalette),
+                ("Diff All", Action::DiffAll),
+                ("Go to Definition", Action::GotoDefinition),
+                ("Hover Docs", Action::HoverDocs),
+                ("Format Document", Action::Format),
+            ],
+        ),
+        ("Help", &[("Keybindings", Action::Help)]),
+    ]
+};
+
 /// Screen regions recorded during the last draw, for mouse hit-testing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LayoutMap {
@@ -107,19 +207,14 @@ pub struct LayoutMap {
     pub hex_tree: Rect,
     /// The hex viewer's dump area.
     pub hex_dump: Rect,
-}
-
-/// A diagnostic squiggle to re-print with undercurl (SGR 4:3) after the
-/// frame is drawn — ratatui's buffer can't express wavy underlines.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Squiggle {
-    pub x: u16,
-    pub y: u16,
-    pub text: String,
-    pub fg: Option<(u8, u8, u8)>,
-    pub bg: Option<(u8, u8, u8)>,
-    /// Curl color (severity).
-    pub curl: (u8, u8, u8),
+    /// The context menu's item rows.
+    pub context_menu: Rect,
+    /// The menu bar's top-level item labels.
+    pub menu_items: [Rect; MENU_BAR.len()],
+    /// The open menu-bar dropdown (whole box, including its border).
+    pub menu_dropdown: Rect,
+    /// The editor gutter (markers + line numbers + change rule).
+    pub editor_gutter: Rect,
 }
 
 /// Scrollable hover-documentation state: LSP hover markdown plus any
@@ -154,6 +249,15 @@ pub struct App {
     /// Read-only hex viewer for binary files; takes over the Code shell's
     /// main pane while open (the editor keeps its buffer underneath).
     pub hex: Option<crate::hex::HexView>,
+    /// Image preview for image files; covers the Code pane like the hex
+    /// viewer does.
+    pub image: Option<crate::imageview::ImageView>,
+    /// Terminal graphics capability (protocol + font size), negotiated
+    /// once at startup by main; the default is a half-block fallback.
+    pub picker: ratatui_image::picker::Picker,
+    /// The terminal answered the kitty animation-frame probe: GIFs play
+    /// terminal-side through the animation protocol.
+    pub kitty_anim: bool,
     /// Selected row of the Code shell's empty-state action list.
     pub code_home_selected: usize,
     /// Scroll of the Git shell's main diff pane.
@@ -184,12 +288,11 @@ pub struct App {
     /// Screen cell the hover popup should anchor to.
     pub hover_anchor: Option<Position>,
     /// Document position (line, char col) the pending hover was asked for.
-    hover_doc_pos: Option<(usize, usize)>,
+    pub hover_doc_pos: Option<(usize, usize)>,
     /// Where goto-definition jumped FROM: (file, char index). Ctrl+O pops.
     jump_stack: Vec<(std::path::PathBuf, usize)>,
     /// Hyperlinks visible this frame (emitted as OSC 8 after drawing).
     /// Diagnostic squiggles visible this frame (emitted as undercurl).
-    pub squiggle_overlays: Vec<Squiggle>,
     pub sessions: SessionManager,
     /// Merged settings (defaults ← global XDG ← repo `.vibin`).
     pub config: crate::config::Config,
@@ -205,6 +308,38 @@ pub struct App {
     /// mouse capture means the terminal can't open OSC 8 links on plain
     /// click, so vibin opens them itself.
     pub link_hits: Vec<(ratatui::layout::Rect, String)>,
+    /// URL under the mouse right now — shown as a browser-style preview
+    /// chip at the bottom of the screen.
+    pub hovered_link: Option<String>,
+    /// Right-click context menu, when open.
+    pub context_menu: Option<ContextMenu>,
+    /// Live toast notifications, oldest first (see [`App::notify`]).
+    pub toasts: Vec<Toast>,
+    /// Toast hitboxes of the current frame: (rect, toast index, button
+    /// index — None for the card body). Rebuilt on every draw.
+    pub toast_hits: Vec<(ratatui::layout::Rect, usize, Option<usize>)>,
+    /// Toast button under the mouse: (toast index, button index).
+    pub toast_hover: Option<(usize, usize)>,
+    /// The pointer is over some toast card — expiry pauses while true.
+    pub toast_pointer_over: bool,
+    /// Menu bar: which top-level menu's dropdown is open (hover opens).
+    pub menu_open: Option<usize>,
+    /// Highlighted row inside the open menu-bar dropdown.
+    pub menu_row: usize,
+    /// The live keybinding table (defaults + config overrides).
+    pub keybinds: crate::keybind::Keybinds,
+    /// Buffer revision an in-flight `:fmt` request was made against —
+    /// stale replies (buffer edited meanwhile) are dropped.
+    fmt_pending: Option<u64>,
+    /// HEAD content of the open file (gutter change markers baseline).
+    pub editor_head: Option<String>,
+    /// Gutter diff cache, keyed on the editor revision it was computed at.
+    editor_diff: Option<(u64, crate::diff::GutterDiff)>,
+    /// Editor line whose gutter the mouse is over (markers render filled).
+    pub gutter_hover: Option<usize>,
+    /// A mouse button is held (drag-selection in progress): hover popups
+    /// stay suppressed until release.
+    mouse_held: bool,
     /// Size for newly spawned session PTYs; updated by the UI on every draw.
     pub term_size: (u16, u16),
     /// Height of the diff overlay viewport, updated by the UI for scrolling.
@@ -228,6 +363,7 @@ pub struct App {
 impl App {
     pub fn new(workdir: PathBuf, claude_cmd: Vec<String>) -> Self {
         let config = crate::config::Config::load(&workdir);
+        let (keybinds, keybind_errors) = crate::keybind::Keybinds::from_config(&config.keybinds);
         let mut tree = FileTree::new(&workdir);
         tree.show_hidden = config.show_hidden;
         let git = GitState::open(&workdir);
@@ -244,9 +380,13 @@ impl App {
                 phase: 0.0,
                 frame: 0,
             },
-            shell: Shell::Agents,
+            // workspaces open on the code shell (file tree + editor)
+            shell: Shell::Code,
             editor: None,
             hex: None,
+            image: None,
+            picker: ratatui_image::picker::Picker::halfblocks(),
+            kitty_anim: false,
             code_home_selected: 0,
             git_diff_scroll: 0,
             git_diff_viewport: 20,
@@ -265,7 +405,6 @@ impl App {
             hover_anchor: None,
             hover_doc_pos: None,
             jump_stack: Vec::new(),
-            squiggle_overlays: Vec::new(),
             sessions: SessionManager::new(),
             tree,
             git,
@@ -274,8 +413,22 @@ impl App {
             overlay: None,
             leader_pending: false,
             should_quit: false,
-            status_msg: None,
+            status_msg: keybind_errors.first().cloned(),
             link_hits: Vec::new(),
+            hovered_link: None,
+            context_menu: None,
+            toasts: Vec::new(),
+            toast_hits: Vec::new(),
+            toast_hover: None,
+            toast_pointer_over: false,
+            menu_open: None,
+            menu_row: 0,
+            keybinds,
+            fmt_pending: None,
+            editor_head: None,
+            editor_diff: None,
+            gutter_hover: None,
+            mouse_held: false,
             term_size: (24, 80),
             diff_viewport: 20,
             statuses: Vec::new(),
@@ -313,6 +466,7 @@ impl App {
         self.chats = ChatStore::new(&self.workdir);
         self.screen = Screen::Workspace;
         self.spawn_session();
+        self.activate_workspace_lsp();
         // entering a workspace starts in the file tree
         self.focus = Focus::Sidebar;
     }
@@ -332,14 +486,20 @@ impl App {
     /// Open a file: text goes to the modal editor, binary data to
     /// the read-only hex viewer.
     pub fn open_file(&mut self, path: &std::path::Path) {
-        // reuse the open hex view or editor if it's the same file
-        if self.hex.as_ref().is_some_and(|h| h.path == path) {
+        // baseline for gutter change markers: the file as of HEAD
+        self.editor_head = self.git.head_text(path);
+        self.editor_diff = None;
+        // reuse the open image view, hex view or editor if it's the same file
+        if self.image.as_ref().is_some_and(|i| i.path == path)
+            || self.hex.as_ref().is_some_and(|h| h.path == path)
+        {
             self.shell = Shell::Code;
             self.focus = Focus::Terminal;
             return;
         }
         if self.editor.as_ref().is_some_and(|e| e.path == path) {
             self.hex = None;
+            self.image = None;
             self.shell = Shell::Code;
             self.focus = Focus::Terminal;
             return;
@@ -349,9 +509,24 @@ impl App {
                 // git's heuristic: NUL bytes mean binary (NUL is valid
                 // UTF-8, so the decode check alone misses e.g. wasm)
                 if std::str::from_utf8(&data).is_err() || data.contains(&0) {
-                    // binary: hex viewer over the editor, whose (possibly
-                    // dirty) buffer stays untouched underneath
-                    self.hex = Some(crate::hex::HexView::from_data(path, data));
+                    // binary: image preview when it decodes as one, else
+                    // the hex viewer — either way over the editor, whose
+                    // (possibly dirty) buffer stays untouched underneath
+                    match crate::imageview::ImageView::from_data(
+                        &self.picker,
+                        self.kitty_anim,
+                        path,
+                        data,
+                    ) {
+                        Ok(view) => {
+                            self.image = Some(view);
+                            self.hex = None;
+                        }
+                        Err(data) => {
+                            self.hex = Some(crate::hex::HexView::from_data(path, data));
+                            self.image = None;
+                        }
+                    }
                     self.shell = Shell::Code;
                     self.focus = Focus::Terminal;
                     return;
@@ -363,13 +538,12 @@ impl App {
             }
         }
         self.hex = None;
+        self.image = None;
         if let Some(current) = &self.editor
             && current.dirty
         {
-            self.status_msg = Some(format!(
-                "{} has unsaved changes (:w or :q! first)",
-                current.file_name()
-            ));
+            self.status_msg =
+                Some(format!("{} has unsaved changes (:w or :q! first)", current.file_name()));
             self.shell = Shell::Code;
             self.focus = Focus::Terminal;
             return;
@@ -388,6 +562,32 @@ impl App {
         }
     }
 
+    /// Eager LSP start at workspace open: if a configured `root_markers`
+    /// file is present (Cargo.toml → rust-analyzer, …), spawn its server
+    /// now so indexing and workspace diagnostics warm up before any file
+    /// opens.
+    pub fn activate_workspace_lsp(&mut self) {
+        if !self.lsp_enabled || self.lsp.is_some() {
+            return;
+        }
+        let Some(language) = self.config.lsp_activation_language(&self.workdir) else {
+            return;
+        };
+        if self.lsp_unavailable.contains(&language) {
+            return;
+        }
+        let Some(command) = self.config.lsp_command(&language) else {
+            return;
+        };
+        match LspClient::start(&language, &self.workdir, &command) {
+            Some(client) => self.lsp = Some(client),
+            None => {
+                // quietly: the user hasn't asked for this language yet
+                self.lsp_unavailable.insert(language);
+            }
+        }
+    }
+
     /// Start (or reuse) a language server for the open file and announce
     /// the document.
     fn ensure_lsp(&mut self) {
@@ -396,8 +596,8 @@ impl App {
         }
         let Some(editor) = &self.editor else { return };
         let language = crate::editor::highlight::language_name(&editor.path).to_string();
-        let Some(command) = crate::lsp::server_command(&language) else {
-            return; // language without LSP support — fine
+        let Some(command) = self.config.lsp_command(&language) else {
+            return; // language without a configured server — fine
         };
         if self.lsp.as_ref().is_none_or(|c| c.language != language) {
             if self.lsp_unavailable.contains(&language) {
@@ -417,7 +617,49 @@ impl App {
             client.did_open(&editor.path, &editor.text.to_string());
             self.lsp_synced_revision = editor.revision;
             self.lsp_doc_version = 0;
+            client.request_document_links(&editor.path);
+            client.request_code_lenses(&editor.path);
         }
+    }
+
+    /// The document link under a (line, char col) document position.
+    fn link_at(&self, line: usize, col: usize) -> Option<crate::lsp::DocumentLink> {
+        let (client, editor) = (self.lsp.as_ref()?, self.editor.as_ref()?);
+        client
+            .document_links(&editor.path)
+            .into_iter()
+            .find(|l| l.line == line && col >= l.col_start && col < l.col_end)
+    }
+
+    /// Open a document link: files land in the editor, URLs in the browser.
+    /// A `#line,col` fragment (1-based, e.g. yaml-language-server's $ref
+    /// targets) jumps to that position.
+    fn open_document_link(&mut self, link: &crate::lsp::DocumentLink) {
+        let (uri, fragment) = match link.target.split_once('#') {
+            Some((uri, frag)) => (uri, Some(frag)),
+            None => (link.target.as_str(), None),
+        };
+        if let Some(path) = crate::lsp::uri_to_path(uri) {
+            if !path.is_file() {
+                self.status_msg = Some(format!("link target not found: {}", path.display()));
+                return;
+            }
+            let pos = fragment.and_then(|f| {
+                let (line, col) = f.split_once(',')?;
+                Some((line.parse::<usize>().ok()?, col.parse::<usize>().ok()?))
+            });
+            if let Some(editor) = &self.editor {
+                self.jump_stack.push((editor.path.clone(), editor.head));
+            }
+            match pos {
+                Some((line, col)) => {
+                    self.navigate_to(&path, line.saturating_sub(1), col.saturating_sub(1))
+                }
+                None => self.open_file(&path),
+            }
+            return;
+        }
+        self.open_url(&link.target);
     }
 
     /// The empty-editor action list: (label, keybind display).
@@ -498,7 +740,28 @@ impl App {
         }
     }
 
+    /// Keys for the image preview: Esc/q close it, x flips to the hex
+    /// viewer over the same bytes.
+    fn handle_image_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.image = None;
+                self.focus = Focus::Sidebar;
+            }
+            KeyCode::Char('x') => {
+                if let Some(view) = self.image.take() {
+                    self.hex = Some(crate::hex::HexView::from_data(&view.path, view.data));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn forward_to_editor(&mut self, key: KeyEvent) {
+        if self.image.is_some() {
+            self.handle_image_key(key);
+            return;
+        }
         if self.hex.is_some() {
             self.handle_hex_key(key);
             return;
@@ -528,7 +791,8 @@ impl App {
                     let text_area = self.layout.editor_text;
                     self.hover_anchor = cursor_line.checked_sub(editor.scroll).map(|row| {
                         Position::new(
-                            text_area.x + (cursor_col as u16).min(text_area.width.saturating_sub(1)),
+                            text_area.x
+                                + (cursor_col as u16).min(text_area.width.saturating_sub(1)),
                             text_area.y + (row as u16).min(text_area.height.saturating_sub(1)),
                         )
                     });
@@ -543,6 +807,27 @@ impl App {
                     let (line, character) = editor.cursor_lsp_position();
                     client.request_definition(&editor.path, line, character);
                     self.status_msg = Some("definition…".into());
+                } else {
+                    self.status_msg = Some("no language server for this file".into());
+                }
+            }
+            EditorEvent::Format => {
+                self.sync_lsp_document();
+                if let (Some(client), Some(editor)) = (&self.lsp, &self.editor) {
+                    // options from the file's detected indentation
+                    let (tab_size, spaces) = match editor.indent_label.as_deref() {
+                        Some("tabs") => (4, false),
+                        Some(label) => (
+                            label.split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(4),
+                            true,
+                        ),
+                        None => (4, true),
+                    };
+                    client.request_formatting(&editor.path, tab_size, spaces);
+                    // edits are only valid against the buffer they were
+                    // computed from — remember which revision that is
+                    self.fmt_pending = Some(editor.revision);
+                    self.status_msg = Some("formatting…".into());
                 } else {
                     self.status_msg = Some("no language server for this file".into());
                 }
@@ -574,6 +859,9 @@ impl App {
             self.lsp_doc_version += 1;
             client.did_change(&editor.path, &editor.text.to_string(), self.lsp_doc_version);
             self.lsp_synced_revision = editor.revision;
+            // link ranges and lenses move with every edit — re-request
+            client.request_document_links(&editor.path);
+            client.request_code_lenses(&editor.path);
         }
     }
 
@@ -581,9 +869,18 @@ impl App {
     pub fn open_palette(&mut self) {
         let mut commands = vec![
             CommandEntry { label: "agent: new".into(), action: PaletteAction::NewAgent },
-            CommandEntry { label: "agent: rename current".into(), action: PaletteAction::RenameAgent },
-            CommandEntry { label: "agent: respawn current".into(), action: PaletteAction::RespawnAgent },
-            CommandEntry { label: "agent: close current".into(), action: PaletteAction::CloseAgent },
+            CommandEntry {
+                label: "agent: rename current".into(),
+                action: PaletteAction::RenameAgent,
+            },
+            CommandEntry {
+                label: "agent: respawn current".into(),
+                action: PaletteAction::RespawnAgent,
+            },
+            CommandEntry {
+                label: "agent: close current".into(),
+                action: PaletteAction::CloseAgent,
+            },
         ];
         for (i, session) in self.sessions.sessions.iter().enumerate() {
             commands.push(CommandEntry {
@@ -616,6 +913,7 @@ impl App {
                 label: "settings: toggle hidden files".into(),
                 action: PaletteAction::ToggleHidden,
             },
+            CommandEntry { label: "notify: test toast".into(), action: PaletteAction::TestToast },
             CommandEntry {
                 label: "settings: save to config".into(),
                 action: PaletteAction::SaveSettings,
@@ -662,6 +960,17 @@ impl App {
                 }
             }
             PaletteAction::DiffAll => self.open_diff(None),
+            PaletteAction::TestToast => {
+                self.notify(ToastLevel::Info, "info: this is a toast");
+                self.notify(ToastLevel::Warn, "warn: something needs a look");
+                self.notify(ToastLevel::Error, "error: something broke");
+                self.notify_actions(
+                    ToastLevel::Info,
+                    "**markdown** with a [link](https://example.com) — pick one",
+                    vec!["Sure".into(), "Nope".into()],
+                    None,
+                );
+            }
             PaletteAction::ShowFiles => self.switch_shell(Shell::Code),
             PaletteAction::ShowGit => self.switch_shell(Shell::Git),
             PaletteAction::ShowChats => {
@@ -701,6 +1010,62 @@ impl App {
         }
     }
 
+    fn send_editor_key(&mut self, key: KeyEvent) {
+        if let Some(editor) = &mut self.editor {
+            let event = editor.handle_key(key);
+            self.handle_editor_event(event);
+        }
+    }
+
+    /// Gutter change markers for the open editor, recomputed only when the
+    /// buffer revision moved. None when there's no HEAD baseline (untracked
+    /// file / no repo).
+    pub fn editor_gutter_diff(&mut self) -> Option<crate::diff::GutterDiff> {
+        let editor = self.editor.as_ref()?;
+        let base = self.editor_head.as_ref()?;
+        let rev = editor.revision;
+        if self.editor_diff.as_ref().map(|(r, _)| *r) != Some(rev) {
+            let current = editor.text.to_string();
+            self.editor_diff = Some((rev, crate::diff::gutter_diff(base, &current)));
+        }
+        self.editor_diff.as_ref().map(|(_, d)| d.clone())
+    }
+
+    /// The hover text for a gutter change marker at `line`: the hunk as a
+    /// mini diff (HEAD lines removed, buffer lines added).
+    pub fn gutter_hover_text(&mut self, line: usize) -> Option<String> {
+        let marks = self.editor_gutter_diff()?;
+        let editor = self.editor.as_ref()?;
+        let total = editor.text.len_lines();
+        let (before, after) = marks.hunk_at(line, total)?.clone();
+        let base = self.editor_head.as_ref()?;
+        let base_lines: Vec<&str> = base.lines().collect();
+        let mut out = String::from(
+            "```diff
+",
+        );
+        for i in before.clone() {
+            if let Some(l) = base_lines.get(i) {
+                out.push_str(&format!(
+                    "- {l}
+"
+                ));
+            }
+        }
+        let text = editor.text.to_string();
+        let cur_lines: Vec<&str> = text.lines().collect();
+        for i in after.clone() {
+            if let Some(l) = cur_lines.get(i) {
+                out.push_str(&format!(
+                    "+ {l}
+"
+                ));
+            }
+        }
+        out.push_str("```");
+        (before.len() + after.len() > 0).then_some(out)
+    }
+
     /// Open a URL with the system handler (macOS `open`, else `xdg-open`).
     fn open_url(&mut self, url: &str) {
         let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
@@ -724,6 +1089,8 @@ impl App {
             spell_check: editor.map_or(self.config.spell_check, |e| e.spell_check),
             mark_unicode: editor.map_or(self.config.mark_unicode, |e| e.mark_unicode),
             mouse_scroll_multiplier: self.config.mouse_scroll_multiplier,
+            keybinds: self.config.keybinds.clone(),
+            lsp: self.config.lsp.clone(),
         };
         match cfg.save_global() {
             Ok(path) => {
@@ -754,10 +1121,8 @@ impl App {
         if let Some(editor) = &mut self.editor
             && editor.path == path
         {
-            let line_text = editor
-                .text
-                .line(line.min(editor.text.len_lines().saturating_sub(1)))
-                .to_string();
+            let line_text =
+                editor.text.line(line.min(editor.text.len_lines().saturating_sub(1))).to_string();
             let col = crate::lsp::utf16_to_char_col(&line_text, character);
             editor.jump_to(line, col);
             self.shell = Shell::Code;
@@ -783,26 +1148,53 @@ impl App {
 
     /// Dwell hover: the mouse resting on a symbol in the
     /// editor for a moment requests LSP hover at that position.
-    fn maybe_dwell_hover(&mut self) {
+    /// Returns true when it changed something visible (opened a popup) —
+    /// tick() must report that, or the popup renders one event too late
+    /// (and a mouse move would dismiss it before it was ever seen).
+    fn maybe_dwell_hover(&mut self) -> bool {
         const DWELL: Duration = Duration::from_millis(450);
         if self.overlay.is_some()
             || self.leader_pending
+            || self.context_menu.is_some()
+            || self.mouse_held
             || self.shell != Shell::Code
             || self.hex.is_some()
+            || self.image.is_some()
             || self.screen != Screen::Workspace
         {
-            return;
+            return false;
         }
-        let Some((pos, since)) = self.mouse_rest else { return };
-        if since.elapsed() < DWELL
-            || self.hover_sent_for == Some(pos)
-            || !self.layout.editor_text.contains(pos)
-        {
-            return;
+        let Some((pos, since)) = self.mouse_rest else {
+            return false;
+        };
+        if since.elapsed() < DWELL || self.hover_sent_for == Some(pos) {
+            return false;
+        }
+        // gutter change markers: hovering one shows the hunk as a mini diff
+        if self.layout.editor_gutter.contains(pos) {
+            self.hover_sent_for = Some(pos);
+            let line = self
+                .editor
+                .as_ref()
+                .map(|e| e.scroll + (pos.y - self.layout.editor_gutter.y) as usize);
+            if let Some(line) = line
+                && let Some(text) = self.gutter_hover_text(line)
+            {
+                self.hover_anchor = Some(pos);
+                self.overlay =
+                    Some(Overlay::Hover(HoverDoc { text, scroll: 0, diagnostics: Vec::new() }));
+                return true;
+            }
+            return false;
+        }
+        if !self.layout.editor_text.contains(pos) {
+            return false;
         }
         // the char under the mouse, and its line, from a scoped borrow
         let (line, col, line_text) = {
-            let Some(editor) = &self.editor else { return };
+            let Some(editor) = &self.editor else {
+                return false;
+            };
             let row = (pos.y - self.layout.editor_text.y) as usize;
             let col = (pos.x - self.layout.editor_text.x) as usize;
             let line = (editor.scroll + row).min(editor.text.len_lines().saturating_sub(1));
@@ -813,24 +1205,22 @@ impl App {
         // a suspicious Unicode char under the cursor shows a describe popup
         // — this works even without a language server
         if let Some(desc) = line_text.chars().nth(col).and_then(crate::confusable::describe) {
-            self.overlay = Some(Overlay::Hover(HoverDoc {
-                text: desc,
-                scroll: 0,
-                diagnostics: Vec::new(),
-            }));
+            self.overlay =
+                Some(Overlay::Hover(HoverDoc { text: desc, scroll: 0, diagnostics: Vec::new() }));
             self.hover_sent_for = Some(pos);
             self.hover_anchor = Some(pos);
-            return;
+            return true;
         }
         self.sync_lsp_document();
         let (Some(client), Some(editor)) = (&self.lsp, &self.editor) else {
-            return;
+            return false;
         };
         let character = crate::lsp::char_to_utf16_col(&line_text, col);
         client.request_hover(&editor.path, line, character);
         self.hover_sent_for = Some(pos);
         self.hover_anchor = Some(pos);
         self.hover_doc_pos = Some((line, col));
+        false // the popup appears when the LSP response lands
     }
 
     /// Terminal cursor shape for the current state: a bar while inserting
@@ -840,6 +1230,7 @@ impl App {
             && self.shell == Shell::Code
             && self.focus == Focus::Terminal
             && self.hex.is_none()
+            && self.image.is_none()
             && self
                 .editor
                 .as_ref()
@@ -848,16 +1239,88 @@ impl App {
 
     /// Periodic housekeeping: refresh git status and the file tree.
     /// Returns true when anything visible changed (i.e. a redraw is needed).
+    /// Queue a toast notification. Toasts stack top-right, newest at the
+    /// bottom, and expire after [`TOAST_TTL`].
+    pub fn notify(&mut self, level: ToastLevel, text: impl Into<String>) {
+        self.notify_actions(level, text, Vec::new(), None);
+    }
+
+    /// Queue a toast with action buttons: sticky until the user clicks a
+    /// button (delivered to `reply`) or dismisses the card.
+    pub fn notify_actions(
+        &mut self,
+        level: ToastLevel,
+        text: impl Into<String>,
+        buttons: Vec<String>,
+        reply: Option<ToastReply>,
+    ) {
+        self.toasts.push(Toast { level, text: text.into(), born: Instant::now(), buttons, reply });
+        if self.toasts.len() > TOAST_CAP
+            && let Some(i) = self.toasts.iter().position(|t| t.buttons.is_empty())
+        {
+            // over the cap: drop the oldest plain toast, never a pending
+            // question
+            self.toasts.remove(i);
+        }
+    }
+
+    /// Remove a toast and deliver its answer: `button` is the clicked
+    /// button's index, None means dismissed.
+    pub fn resolve_toast(&mut self, index: usize, button: Option<usize>) {
+        if index >= self.toasts.len() {
+            return;
+        }
+        let toast = self.toasts.remove(index);
+        self.toast_hover = None;
+        if let Some(ToastReply::LspMessageRequest(id)) = toast.reply
+            && let Some(client) = &self.lsp
+        {
+            let action = button.and_then(|b| toast.buttons.get(b)).map(String::as_str);
+            client.respond_message_request(id, action);
+        }
+    }
+
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
+        // expire old toasts — ones with buttons wait for an answer, and a
+        // hovered stack is being read: keep it fresh instead of pruning
+        if self.toast_pointer_over {
+            for toast in &mut self.toasts {
+                toast.born = Instant::now();
+            }
+        } else {
+            let live_toasts = self.toasts.len();
+            self.toasts.retain(|t| !t.buttons.is_empty() || t.born.elapsed() < TOAST_TTL);
+            if self.toasts.len() != live_toasts {
+                changed = true;
+            }
+        }
         // gradient animation: welcome wordmark + palette/whichkey borders
         // hover popups have no animated chrome — don't burn redraws on them
         let animating = self.screen == Screen::Welcome
             || self.leader_pending
-            || self
-                .overlay
-                .as_ref()
-                .is_some_and(|o| !matches!(o, Overlay::Hover(_)));
+            || self.overlay.as_ref().is_some_and(|o| !matches!(o, Overlay::Hover(_)));
+        // image preview: pick up finished background decodes...
+        if let Some(view) = &mut self.image {
+            match view.poll(&self.picker) {
+                crate::imageview::Poll::Ready => changed = true,
+                crate::imageview::Poll::Failed => {
+                    // not decodable after all — show the bytes instead
+                    let view = self.image.take().expect("checked above");
+                    self.hex = Some(crate::hex::HexView::from_data(&view.path, view.data));
+                    changed = true;
+                }
+                crate::imageview::Poll::Pending => {}
+            }
+        }
+        // ...and advance GIF frames while visible
+        if self.screen == Screen::Workspace
+            && self.shell == Shell::Code
+            && let Some(view) = &mut self.image
+            && view.tick()
+        {
+            changed = true;
+        }
         if animating && self.last_anim.elapsed() >= ANIM_INTERVAL {
             self.welcome.phase = (self.welcome.phase + 0.015).rem_euclid(1.0);
             self.welcome.frame = self.welcome.frame.wrapping_add(1);
@@ -866,7 +1329,70 @@ impl App {
         }
         let statuses = self.sessions.statuses();
         if statuses != self.statuses {
+            // toast when a live session dies (its tab may be off-screen)
+            for (i, status) in statuses.iter().enumerate() {
+                if let crate::session::SessionStatus::Exited(code) = status
+                    && matches!(
+                        self.statuses.get(i),
+                        Some(s) if !matches!(s, crate::session::SessionStatus::Exited(_))
+                    )
+                {
+                    let title =
+                        self.sessions.sessions.get(i).map(|s| s.title.clone()).unwrap_or_default();
+                    let code = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                    self.notify(ToastLevel::Warn, format!("session {title} exited ({code})"));
+                }
+            }
             self.statuses = statuses;
+            changed = true;
+        }
+        // formatting reply: apply if it still matches the buffer it was
+        // computed from (path and revision), otherwise drop it silently
+        if let Some((path, edits)) = self.lsp.as_ref().and_then(|c| c.take_formatting()) {
+            let pending = self.fmt_pending.take();
+            if let Some(editor) = &mut self.editor
+                && editor.path == path
+                && pending == Some(editor.revision)
+            {
+                // LSP (line, utf16 col) → rope char index
+                let to_char = |editor: &crate::editor::Editor, (line, col16): (usize, usize)| {
+                    let total = editor.text.len_lines();
+                    if line >= total {
+                        return editor.text.len_chars();
+                    }
+                    let line_text = editor.text.line(line).to_string();
+                    editor.text.line_to_char(line)
+                        + crate::lsp::utf16_to_char_col(&line_text, col16)
+                };
+                let char_edits: Vec<(usize, usize, String)> = edits
+                    .into_iter()
+                    .map(|e| (to_char(editor, e.start), to_char(editor, e.end), e.text))
+                    .collect();
+                self.status_msg = if editor.apply_edits(&char_edits) {
+                    Some(format!("formatted ({} edits)", char_edits.len()))
+                } else {
+                    Some("already formatted".into())
+                };
+                changed = true;
+            }
+        }
+        // LSP window messages → toasts; showMessageRequest gets buttons
+        // and answers the server when resolved
+        let (lsp_msgs, lsp_reqs) = match &self.lsp {
+            Some(client) => (client.take_messages(), client.take_message_requests()),
+            None => (Vec::new(), Vec::new()),
+        };
+        for (typ, text) in lsp_msgs {
+            self.notify(toast_level(typ), text);
+            changed = true;
+        }
+        for req in lsp_reqs {
+            self.notify_actions(
+                toast_level(req.typ),
+                req.message,
+                req.actions,
+                Some(ToastReply::LspMessageRequest(req.id)),
+            );
             changed = true;
         }
         // LSP: push pending edits, redraw on new diagnostics/hover replies
@@ -878,7 +1404,9 @@ impl App {
                 "{} language server exited — check its installation",
                 client.language
             ));
-            self.lsp_unavailable.insert(client.language.clone());
+            let lang = client.language.clone();
+            self.notify(ToastLevel::Error, format!("{lang} language server exited"));
+            self.lsp_unavailable.insert(lang);
             self.lsp = None;
             changed = true;
         }
@@ -911,11 +1439,8 @@ impl App {
                         self.status_msg = Some("no hover info".into());
                     }
                 } else {
-                    self.overlay = Some(Overlay::Hover(HoverDoc {
-                        text: hover,
-                        scroll: 0,
-                        diagnostics,
-                    }));
+                    self.overlay =
+                        Some(Overlay::Hover(HoverDoc { text: hover, scroll: 0, diagnostics }));
                 }
                 self.hover_via_key = false;
                 changed = true;
@@ -938,7 +1463,7 @@ impl App {
             }
             changed = true;
         }
-        self.maybe_dwell_hover();
+        changed |= self.maybe_dwell_hover();
         if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
             changed |= self.git.refresh();
             self.last_git_refresh = Instant::now();
@@ -963,6 +1488,7 @@ impl App {
         if self.focus == Focus::Terminal
             && self.shell == Shell::Code
             && self.hex.is_none()
+            && self.image.is_none()
             && let Some(editor) = &mut self.editor
         {
             editor.paste_str(text);
@@ -980,6 +1506,183 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
         if self.screen == Screen::Welcome {
             return self.handle_welcome_mouse(ev);
+        }
+        // toasts float above everything: hovering highlights their buttons,
+        // clicking a button answers, clicking the card body dismisses
+        self.toast_pointer_over = {
+            let pos = Position::new(ev.column, ev.row);
+            self.toast_hits.iter().any(|(r, ..)| r.contains(pos))
+        };
+        if !self.toast_hits.is_empty() {
+            let pos = Position::new(ev.column, ev.row);
+            let hit = self.toast_hits.iter().find(|(r, ..)| r.contains(pos)).copied();
+            if ev.kind == MouseEventKind::Moved {
+                let hover = hit.and_then(|(_, t, b)| b.map(|b| (t, b)));
+                let mut redraw = false;
+                if hover != self.toast_hover {
+                    self.toast_hover = hover;
+                    redraw = true;
+                }
+                if hit.is_some() {
+                    // markdown link under the pointer → preview chip
+                    let url = self
+                        .link_hits
+                        .iter()
+                        .find(|(r, _)| r.contains(pos))
+                        .map(|(_, u)| u.clone());
+                    if url != self.hovered_link {
+                        self.hovered_link = url;
+                        redraw = true;
+                    }
+                    // over a card: don't hover whatever sits beneath it
+                    return redraw;
+                }
+                if redraw {
+                    return true;
+                }
+            } else if ev.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some((_, toast, button)) = hit
+            {
+                // a link wins over dismissal; the card stays up
+                if let Some(url) =
+                    self.link_hits.iter().find(|(r, _)| r.contains(pos)).map(|(_, u)| u.clone())
+                {
+                    self.open_url(&url);
+                    return true;
+                }
+                self.resolve_toast(toast, button);
+                return true;
+            }
+        }
+        // an open menu-bar dropdown owns the mouse: sliding along the bar
+        // switches menus, hovering rows highlights them, leaving both closes
+        if let Some(open) = self.menu_open {
+            let pos = Position::new(ev.column, ev.row);
+            let dropdown = self.layout.menu_dropdown;
+            let bar_hit = self.layout.menu_items.iter().position(|r| r.contains(pos));
+            return match ev.kind {
+                MouseEventKind::Moved => {
+                    if let Some(i) = bar_hit {
+                        if i != open {
+                            self.menu_open = Some(i);
+                            self.menu_row = 0;
+                            return true;
+                        }
+                        false
+                    } else if dropdown.contains(pos) {
+                        let row = (pos.y.saturating_sub(dropdown.y + 1)) as usize;
+                        if pos.y > dropdown.y
+                            && row < MENU_BAR[open].1.len()
+                            && self.menu_row != row
+                        {
+                            self.menu_row = row;
+                            return true;
+                        }
+                        false
+                    } else {
+                        self.menu_open = None;
+                        true
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if dropdown.contains(pos) => {
+                    let row = (pos.y.saturating_sub(dropdown.y + 1)) as usize;
+                    self.menu_open = None;
+                    if pos.y > dropdown.y
+                        && let Some(&(_, action)) = MENU_BAR[open].1.get(row)
+                    {
+                        self.run_action(action);
+                    }
+                    true
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.menu_open = None;
+                    true
+                }
+                _ => false,
+            };
+        }
+        // hovering a menu-bar label opens its dropdown
+        if matches!(ev.kind, MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left))
+            && self.overlay.is_none()
+            && !self.leader_pending
+            && self.context_menu.is_none()
+        {
+            let pos = Position::new(ev.column, ev.row);
+            if let Some(i) = self.layout.menu_items.iter().position(|r| r.contains(pos)) {
+                self.menu_open = Some(i);
+                self.menu_row = 0;
+                return true;
+            }
+        }
+        // an open context menu owns the mouse
+        if self.context_menu.is_some() {
+            let pos = Position::new(ev.column, ev.row);
+            let rect = self.layout.context_menu;
+            return match ev.kind {
+                MouseEventKind::Moved if rect.contains(pos) => {
+                    let row = (pos.y - rect.y) as usize;
+                    if let Some(menu) = &mut self.context_menu
+                        && row < menu.items.len()
+                        && menu.selected != row
+                    {
+                        menu.selected = row;
+                        return true;
+                    }
+                    false
+                }
+                MouseEventKind::Down(MouseButton::Left) if rect.contains(pos) => {
+                    let row = (pos.y - rect.y) as usize;
+                    let action =
+                        self.context_menu.as_ref().and_then(|m| m.items.get(row)).map(|&(_, a)| a);
+                    self.context_menu = None;
+                    if let Some(action) = action {
+                        self.run_action(action);
+                    }
+                    true
+                }
+                MouseEventKind::Down(_) => {
+                    self.context_menu = None;
+                    true
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.context_menu = None;
+                    true
+                }
+                _ => false,
+            };
+        }
+        // right-click in the editor: place the cursor and open the menu
+        if let MouseEventKind::Down(MouseButton::Right) = ev.kind {
+            let pos = Position::new(ev.column, ev.row);
+            if self.overlay.is_none()
+                && self.shell == Shell::Code
+                && self.hex.is_none()
+                && self.image.is_none()
+                && self.layout.editor_text.contains(pos)
+                && let Some(editor) = &mut self.editor
+            {
+                let row = (pos.y - self.layout.editor_text.y) as usize;
+                let col = (pos.x - self.layout.editor_text.x) as usize;
+                editor.click(row, col, false);
+                use crate::keybind::Action;
+                self.context_menu = Some(ContextMenu {
+                    pos,
+                    items: vec![
+                        ("Copy", Action::Copy),
+                        ("Cut", Action::Cut),
+                        ("Paste", Action::Paste),
+                        ("Select All", Action::SelectAll),
+                        ("Undo", Action::Undo),
+                        ("Redo", Action::Redo),
+                        ("Go to Definition", Action::GotoDefinition),
+                        ("Hover Docs", Action::HoverDocs),
+                        ("Format Document", Action::Format),
+                    ],
+                    selected: 0,
+                });
+                return true;
+            }
+            return false;
         }
         // Overlays first: wheel scrolls a diff, any click dismisses
         // diff/help. Prompts stay keyboard-only.
@@ -1012,13 +1715,21 @@ impl App {
             }
             Some(Overlay::Hover(doc)) => {
                 let pos = Position::new(ev.column, ev.row);
-                let inside = self.layout.hover_rect.contains(pos);
+                // "inside" includes a bridge: the anchor's whole row across
+                // the popup's width — sliding along the hovered symbol (or
+                // toward the popup) must not dismiss it
+                let inside = {
+                    let r = self.layout.hover_rect;
+                    self.layout.hover_rect.contains(pos)
+                        || self
+                            .hover_anchor
+                            .is_some_and(|a| pos.y == a.y && pos.x >= r.x && pos.x < r.right())
+                };
                 return match ev.kind {
                     // a click on a link label opens it (the terminal can't:
                     // mouse capture eats plain clicks before OSC 8 handling)
                     MouseEventKind::Down(MouseButton::Left) if inside => {
-                        if let Some((_, url)) =
-                            self.link_hits.iter().find(|(r, _)| r.contains(pos))
+                        if let Some((_, url)) = self.link_hits.iter().find(|(r, _)| r.contains(pos))
                         {
                             let url = url.clone();
                             self.open_url(&url);
@@ -1037,12 +1748,36 @@ impl App {
                         doc.scroll = doc.scroll.saturating_sub(1);
                         true
                     }
-                    MouseEventKind::Moved if inside => false,
-                    // outside: moving or clicking dismisses; scrolls also
-                    // pass through to whatever is underneath
-                    MouseEventKind::Down(_) | MouseEventKind::Moved => {
+                    MouseEventKind::Moved if inside => {
+                        // browser-style link preview: remember the URL
+                        // under the pointer so the UI can show it
+                        let url = self
+                            .link_hits
+                            .iter()
+                            .find(|(r, _)| r.contains(pos))
+                            .map(|(_, u)| u.clone());
+                        let changed = url != self.hovered_link;
+                        self.hovered_link = url;
+                        changed
+                    }
+                    // outside: clicks and drags dismiss AND pass through,
+                    // so a selection starts at the clicked spot instead of
+                    // the first click being eaten by the dismissal
+                    MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
                         self.overlay = None;
+                        self.hovered_link = None;
                         self.mouse_rest = Some((pos, Instant::now()));
+                        // re-arm: resting on the same spot again re-hovers
+                        self.hover_sent_for = None;
+                        self.handle_mouse(ev);
+                        true
+                    }
+                    // moving away just dismisses
+                    MouseEventKind::Moved => {
+                        self.overlay = None;
+                        self.hovered_link = None;
+                        self.mouse_rest = Some((pos, Instant::now()));
+                        self.hover_sent_for = None;
                         true
                     }
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1091,18 +1826,59 @@ impl App {
                     self.hover_sent_for = None;
                 }
             }
+            // hovering the gutter fills that line's change marker
+            let hover = (self.layout.editor_gutter.contains(pos))
+                .then(|| {
+                    self.editor
+                        .as_ref()
+                        .map(|e| e.scroll + (pos.y - self.layout.editor_gutter.y) as usize)
+                })
+                .flatten();
+            if hover != self.gutter_hover {
+                self.gutter_hover = hover;
+                return true;
+            }
+            // hovering a document link shows the target as a preview chip
+            if self.overlay.is_none()
+                && self.shell == Shell::Code
+                && self.hex.is_none()
+                && self.image.is_none()
+            {
+                let url = (self.layout.editor_text.contains(pos))
+                    .then(|| {
+                        let editor = self.editor.as_ref()?;
+                        let line = editor.scroll + (pos.y - self.layout.editor_text.y) as usize;
+                        let col = editor.hscroll + (pos.x - self.layout.editor_text.x) as usize;
+                        self.link_at(line, col).map(|l| l.target)
+                    })
+                    .flatten();
+                if url != self.hovered_link {
+                    self.hovered_link = url;
+                    return true;
+                }
+            }
             return false;
         }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_held = true;
                 self.click_extends = ev.modifiers.contains(KeyModifiers::SHIFT);
                 self.click_goto = ev.modifiers.contains(KeyModifiers::CONTROL);
                 self.handle_click(pos)
+            }
+            MouseEventKind::Up(_) => {
+                self.mouse_held = false;
+                // start the dwell clock fresh — no instant popup where the
+                // selection ended
+                self.mouse_rest = Some((pos, Instant::now()));
+                self.hover_sent_for = None;
+                false
             }
             // dragging sweeps a selection in the editor
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.shell == Shell::Code
                     && self.hex.is_none()
+                    && self.image.is_none()
                     && let Some(editor) = &mut self.editor
                     && self.layout.editor_text.contains(pos)
                 {
@@ -1119,6 +1895,7 @@ impl App {
                 let delta = if ev.kind == MouseEventKind::ScrollLeft { -step } else { step };
                 if self.shell == Shell::Code
                     && self.hex.is_none()
+                    && self.image.is_none()
                     && self.layout.terminal_pane.contains(pos)
                     && let Some(editor) = &mut self.editor
                 {
@@ -1146,7 +1923,8 @@ impl App {
                                     hex.scroll_by(-delta);
                                 }
                             } else if let Some(editor) = &mut self.editor {
-                                editor.scroll_by(-delta);
+                                let viewport = self.layout.editor_text.height as usize;
+                                editor.scroll_by(-delta, viewport);
                             } else {
                                 let len = Self::code_home_items().len();
                                 self.code_home_selected = if delta > 0 {
@@ -1193,8 +1971,8 @@ impl App {
         let pos = Position::new(ev.column, ev.row);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) if self.layout.welcome_list.contains(pos) => {
-                let idx = self.welcome.list.offset()
-                    + (pos.y - self.layout.welcome_list.y) as usize;
+                let idx =
+                    self.welcome.list.offset() + (pos.y - self.layout.welcome_list.y) as usize;
                 if idx < self.welcome.len() {
                     if self.welcome.selected == idx {
                         self.open_selected_project();
@@ -1261,6 +2039,7 @@ impl App {
             }
             if self.shell == Shell::Code
                 && self.hex.is_none()
+                && self.image.is_none()
                 && let Some(editor) = &mut self.editor
                 && self.layout.editor_text.contains(pos)
             {
@@ -1271,8 +2050,14 @@ impl App {
                     .is_some_and(|(at, p)| p == pos && at.elapsed() < Duration::from_millis(400));
                 editor.click(row, col, self.click_extends);
                 if self.click_goto {
-                    // ctrl+click = goto definition at the clicked spot
-                    self.handle_editor_event(EditorEvent::GotoDefinition);
+                    // ctrl+click on a document link opens it; anywhere
+                    // else it's goto definition at the clicked spot
+                    let (line, col) = editor.cursor_line_col();
+                    if let Some(link) = self.link_at(line, col) {
+                        self.open_document_link(&link);
+                    } else {
+                        self.handle_editor_event(EditorEvent::GotoDefinition);
+                    }
                     self.last_editor_click = None;
                 } else if double {
                     editor.select_word();
@@ -1349,9 +2134,59 @@ impl App {
             return;
         }
 
+        if let Some(open) = self.menu_open {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.menu_row = self.menu_row.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.menu_row = (self.menu_row + 1).min(MENU_BAR[open].1.len() - 1);
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.menu_open = Some(open.checked_sub(1).unwrap_or(MENU_BAR.len() - 1));
+                    self.menu_row = 0;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.menu_open = Some((open + 1) % MENU_BAR.len());
+                    self.menu_row = 0;
+                }
+                KeyCode::Enter => {
+                    let action = MENU_BAR[open].1[self.menu_row.min(MENU_BAR[open].1.len() - 1)].1;
+                    self.menu_open = None;
+                    self.run_action(action);
+                }
+                _ => self.menu_open = None,
+            }
+            return;
+        }
+
+        if let Some(menu) = &mut self.context_menu {
+            match key.code {
+                KeyCode::Esc => self.context_menu = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    menu.selected = menu.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    menu.selected = (menu.selected + 1).min(menu.items.len() - 1);
+                }
+                KeyCode::Enter => {
+                    let action = menu.items[menu.selected].1;
+                    self.context_menu = None;
+                    self.run_action(action);
+                }
+                _ => self.context_menu = None,
+            }
+            return;
+        }
+
         if self.leader_pending {
             self.leader_pending = false;
-            self.handle_leader_key(key);
+            match self.keybinds.lookup(true, &key) {
+                Some(action) => self.run_action(action),
+                None => {
+                    self.status_msg = Some("unknown leader key (Ctrl+A ? for help)".into());
+                }
+            }
             return;
         }
 
@@ -1370,33 +2205,13 @@ impl App {
             return;
         }
 
-        // Ctrl+K: command palette, from anywhere in the workspace
-        if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(self.overlay, Some(Overlay::Palette(_))) {
-                self.overlay = None;
-            } else {
-                self.open_palette();
-            }
+        // global (non-leader) bindings: the palette toggle works from
+        // anywhere in the workspace, everything else waits for overlays
+        if let Some(action) = self.keybinds.lookup(false, &key)
+            && (self.overlay.is_none() || action == crate::keybind::Action::TogglePalette)
+        {
+            self.run_action(action);
             return;
-        }
-
-        // F1/F2/F3: switch workspace shells
-        if self.overlay.is_none() {
-            match key.code {
-                KeyCode::F(1) => {
-                    self.switch_shell(Shell::Agents);
-                    return;
-                }
-                KeyCode::F(2) => {
-                    self.switch_shell(Shell::Git);
-                    return;
-                }
-                KeyCode::F(3) => {
-                    self.switch_shell(Shell::Code);
-                    return;
-                }
-                _ => {}
-            }
         }
 
         if self.overlay.is_some() {
@@ -1470,39 +2285,39 @@ impl App {
         }
     }
 
-    fn handle_leader_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // literal Ctrl+A passthrough
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.forward_to_terminal(key);
-            }
-            KeyCode::Char('c') => {
+    /// Execute a named action — from a keybinding or the context menu.
+    fn run_action(&mut self, action: crate::keybind::Action) {
+        use crate::keybind::Action;
+        let chord = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        match action {
+            Action::LeaderLiteral => self.forward_to_terminal(chord('a')),
+            Action::NewSession => {
                 self.spawn_session();
                 self.shell = Shell::Agents;
             }
-            KeyCode::Char('x') => {
+            Action::CloseSession => {
                 self.sessions.close_active();
                 if self.sessions.is_empty() {
                     self.status_msg = Some("no sessions — Ctrl+A c to start one".into());
                 }
             }
-            KeyCode::Char('n') | KeyCode::Tab => {
+            Action::NextSession => {
                 self.sessions.next();
                 self.shell = Shell::Agents;
                 self.focus = Focus::Terminal;
             }
-            KeyCode::Char('p') => {
+            Action::PrevSession => {
                 self.sessions.prev();
                 self.shell = Shell::Agents;
                 self.focus = Focus::Terminal;
             }
-            KeyCode::Char(c @ '1'..='9') => {
-                self.sessions.select((c as u8 - b'1') as usize);
+            Action::GotoSession(n) => {
+                self.sessions.select(n);
                 self.shell = Shell::Agents;
                 self.focus = Focus::Terminal;
             }
-            KeyCode::Char('f') => self.switch_shell(Shell::Code),
-            KeyCode::Char('e') => {
+            Action::GotoShell(shell) => self.switch_shell(shell),
+            Action::FocusEditor => {
                 if self.editor.is_some() {
                     self.shell = Shell::Code;
                     self.focus = Focus::Terminal;
@@ -1510,32 +2325,53 @@ impl App {
                     self.status_msg = Some("no file open — Enter on a file in the tree".into());
                 }
             }
-            KeyCode::Char('g') => self.switch_shell(Shell::Git),
-            KeyCode::Char('h') => {
+            Action::FocusChats => {
                 self.switch_shell(Shell::Agents);
                 self.focus = Focus::Sidebar;
             }
-            KeyCode::Char('d') => self.open_diff(None),
-            KeyCode::Char('u') => {
+            Action::DiffAll => self.open_diff(None),
+            Action::Refresh => {
                 self.tree.refresh();
                 self.git.refresh();
                 self.chats.refresh();
                 self.status_msg = Some("refreshed".into());
             }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => self.scroll_terminal(10),
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => self.scroll_terminal(-10),
-            KeyCode::Char('r') => {
+            Action::ScrollUp => self.scroll_terminal(10),
+            Action::ScrollDown => self.scroll_terminal(-10),
+            Action::RenameSession => {
                 if let Some(session) = self.sessions.active_session() {
                     self.overlay = Some(Overlay::RenamePrompt(session.title.clone()));
                 }
             }
-            KeyCode::Char('R') => match self.sessions.respawn_active() {
+            Action::RespawnSession => match self.sessions.respawn_active() {
                 Ok(()) => self.status_msg = Some("session respawned".into()),
                 Err(e) => self.status_msg = Some(format!("respawn failed: {e}")),
             },
-            KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Char('q') => self.should_quit = true,
-            _ => self.status_msg = Some("unknown leader key (Ctrl+A ? for help)".into()),
+            Action::TogglePalette => {
+                if matches!(self.overlay, Some(Overlay::Palette(_))) {
+                    self.overlay = None;
+                } else {
+                    self.open_palette();
+                }
+            }
+            Action::Help => self.overlay = Some(Overlay::Help),
+            Action::Quit => self.should_quit = true,
+            // editor-targeted: clipboard/undo replay the editor's own
+            // chords, select-all calls it directly (Ctrl+A is the leader),
+            // LSP actions reuse the editor-event dispatch
+            Action::Copy => self.send_editor_key(chord('c')),
+            Action::Cut => self.send_editor_key(chord('x')),
+            Action::Paste => self.send_editor_key(chord('v')),
+            Action::Undo => self.send_editor_key(chord('z')),
+            Action::Redo => self.send_editor_key(chord('y')),
+            Action::SelectAll => {
+                if let Some(editor) = &mut self.editor {
+                    editor.select_all();
+                }
+            }
+            Action::GotoDefinition => self.handle_editor_event(EditorEvent::GotoDefinition),
+            Action::HoverDocs => self.handle_editor_event(EditorEvent::Hover),
+            Action::Format => self.handle_editor_event(EditorEvent::Format),
         }
     }
 
@@ -1763,8 +2599,12 @@ impl App {
                                 let mut short = oid.to_string();
                                 short.truncate(7);
                                 self.status_msg = Some(format!("committed {short}"));
+                                self.notify(ToastLevel::Info, format!("committed {short}"));
                             }
-                            Err(e) => self.status_msg = Some(format!("commit failed: {e}")),
+                            Err(e) => {
+                                self.status_msg = Some(format!("commit failed: {e}"));
+                                self.notify(ToastLevel::Error, format!("commit failed: {e}"));
+                            }
                         }
                     }
                 }
@@ -1852,6 +2692,168 @@ mod tests {
         app.git.refresh();
         app.lsp_enabled = false; // no real language servers in tests
         (dir, app)
+    }
+
+    #[test]
+    fn lsp_activation_marker_picks_language() {
+        let (dir, mut app) = test_app();
+        let lang = |app: &App| app.config.lsp_activation_language(&app.workdir);
+        assert_eq!(lang(&app), None, "no marker files yet");
+        write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(lang(&app).as_deref(), Some("typescript"));
+        // entries match in name order: rust_analyzer before ts_ls
+        write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(lang(&app).as_deref(), Some("rust"));
+        // configurable: no servers → no eager activation
+        app.config.lsp.clear();
+        assert_eq!(lang(&app), None);
+        // lsp_enabled=false (test default) keeps activation a no-op
+        app.config.lsp = crate::config::Config::default().lsp;
+        app.activate_workspace_lsp();
+        assert!(app.lsp.is_none());
+    }
+
+    #[test]
+    fn gutter_diff_tracks_edits_against_head() {
+        let (dir, mut app) = git_app();
+        // commit a baseline
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        drop(repo);
+        std::fs::write(dir.path().join("file.txt"), "hello\nworld\n").unwrap();
+        app.open_file(&dir.path().join("file.txt"));
+        assert!(app.editor_head.is_some(), "HEAD baseline loaded");
+        // buffer already differs from HEAD (world line added on disk)
+        let d = app.editor_gutter_diff().expect("diff computed");
+        assert!(d.added.contains(&1), "{d:?}");
+        // typing updates the markers with the revision
+        app.focus = Focus::Terminal;
+        app.shell = Shell::Code;
+        let ed = app.editor.as_mut().unwrap();
+        ed.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        ed.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let d = app.editor_gutter_diff().unwrap();
+        assert!(d.modified.contains(&0), "first line modified: {d:?}");
+    }
+
+    #[test]
+    fn click_through_hover_popup_starts_a_selection() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("sel.txt");
+        std::fs::write(&path, "hello world\nsecond line\n").unwrap();
+        fake_layout(&mut app);
+        app.shell = Shell::Code;
+        app.open_file(&path);
+        app.focus = Focus::Terminal;
+        // a hover popup is open, placed away from the click target
+        app.overlay =
+            Some(Overlay::Hover(HoverDoc { text: "docs".into(), scroll: 0, diagnostics: vec![] }));
+        app.layout.hover_rect = Rect::new(0, 25, 10, 3);
+        // click inside the editor text, outside the popup
+        let (col, row) = (6u16, 0u16); // "world" on line 0
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.layout.editor_text.x + col,
+            row: app.layout.editor_text.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(down));
+        assert!(app.overlay.is_none(), "popup dismissed");
+        let editor = app.editor.as_ref().unwrap();
+        let (line, cursor_col) = editor.cursor_line_col();
+        assert_eq!((line, cursor_col), (0, 6), "the same click also placed the cursor");
+        // and a drag through continues the selection from that anchor
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: app.layout.editor_text.x + 10,
+            row: app.layout.editor_text.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(drag);
+        let editor = app.editor.as_ref().unwrap();
+        let (lo, hi) = editor.selection();
+        assert_eq!((lo, hi), (6, 11), "selection spans world: {lo}..{hi}");
+    }
+
+    #[test]
+    fn sliding_along_the_anchor_row_keeps_the_hover_open() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "let example_symbol = 1;\n").unwrap();
+        fake_layout(&mut app);
+        app.shell = Shell::Code;
+        app.open_file(&path);
+        app.overlay =
+            Some(Overlay::Hover(HoverDoc { text: "docs".into(), scroll: 0, diagnostics: vec![] }));
+        // popup below the anchor, 30 wide
+        app.hover_anchor = Some(Position::new(40, 5));
+        app.layout.hover_rect = Rect::new(38, 6, 30, 8);
+        let moved = |x, y| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // slide right along the anchor row, within the popup's width
+        app.handle_mouse(moved(44, 5));
+        assert!(app.overlay.is_some(), "still open while on the anchor row");
+        app.handle_mouse(moved(60, 5));
+        assert!(app.overlay.is_some(), "the whole popup-width row bridges");
+        // leave the bridge (past the popup's width) → dismissed
+        app.handle_mouse(moved(75, 5));
+        assert!(app.overlay.is_none(), "dismissed beyond the bridge");
+    }
+
+    #[test]
+    fn no_hover_while_selecting() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("sel.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        fake_layout(&mut app);
+        app.shell = Shell::Code;
+        app.open_file(&path);
+        app.focus = Focus::Terminal;
+        let (cx, cy) = (app.layout.editor_text.x + 2, app.layout.editor_text.y);
+        let at =
+            move |kind| MouseEvent { kind, column: cx, row: cy, modifiers: KeyModifiers::NONE };
+        // button down, then the mouse rests mid-drag: no popup may open
+        app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_rest = Some((Position::new(cx, cy), Instant::now() - Duration::from_secs(2)));
+        app.maybe_dwell_hover();
+        assert!(app.overlay.is_none(), "hover suppressed while the button is held");
+        // release: the dwell clock restarts, so still no instant popup
+        app.handle_mouse(at(MouseEventKind::Up(MouseButton::Left)));
+        app.maybe_dwell_hover();
+        assert!(app.overlay.is_none(), "no popup right at release");
+    }
+
+    #[test]
+    fn gutter_marker_hover_shows_the_hunk_diff() {
+        let (dir, mut app) = git_app();
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        drop(repo);
+        // change "hello" and add a line
+        std::fs::write(dir.path().join("file.txt"), "hi there\nworld\n").unwrap();
+        app.open_file(&dir.path().join("file.txt"));
+        let text = app.gutter_hover_text(0).expect("hunk hover for changed line");
+        assert!(text.contains("- hello"), "old content shown: {text}");
+        assert!(text.contains("+ hi there"), "new content shown: {text}");
+        assert!(text.starts_with("```diff"), "diff fence: {text}");
+        // unchanged-line hover has nothing to show... (line 1 is added here,
+        // so probe a line past the end instead)
+        assert!(app.gutter_hover_text(5).is_none());
+        // dwell over the gutter opens the hover overlay
+        app.layout.editor_gutter = Rect::new(0, 0, 6, 20);
+        app.shell = Shell::Code;
+        app.mouse_rest = Some((Position::new(2, 0), Instant::now() - Duration::from_secs(2)));
+        app.maybe_dwell_hover();
+        match &app.overlay {
+            Some(Overlay::Hover(doc)) => assert!(doc.text.contains("- hello"), "{}", doc.text),
+            other => panic!("expected hover overlay, got {:?}", other.is_some()),
+        }
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -1970,7 +2972,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Sidebar, "Esc stops at the top context");
     }
 
-        fn fake_chat(id: &str) -> crate::chats::ChatEntry {
+    fn fake_chat(id: &str) -> crate::chats::ChatEntry {
         crate::chats::ChatEntry {
             session_id: id.into(),
             modified: std::time::SystemTime::now(),
@@ -1997,10 +2999,7 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.focus, Focus::Terminal);
         let cmd = &app.sessions.sessions[0].command;
-        assert_eq!(
-            &cmd[cmd.len() - 2..],
-            &["--resume".to_string(), "def-456".to_string()][..]
-        );
+        assert_eq!(&cmd[cmd.len() - 2..], &["--resume".to_string(), "def-456".to_string()][..]);
         assert_eq!(app.status_msg.as_deref(), Some("resuming chat def-456"));
         // the tab is named after the chat's summary, not a funny word
         assert_eq!(app.sessions.sessions[0].title, "chat def-456");
@@ -2194,10 +3193,8 @@ mod tests {
     #[test]
     fn respawn_restarts_exited_session() {
         let dir = TempDir::new().unwrap();
-        let mut app = App::new(
-            dir.path().to_path_buf(),
-            vec!["/bin/sh".into(), "-c".into(), "true".into()],
-        );
+        let mut app =
+            App::new(dir.path().to_path_buf(), vec!["/bin/sh".into(), "-c".into(), "true".into()]);
         app.spawn_session();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.sessions.sessions[0].is_running() && std::time::Instant::now() < deadline {
@@ -2261,6 +3258,10 @@ mod tests {
             home_list: Rect::new(45, 12, 40, 5),
             hex_tree: Rect::new(31, 2, 34, 20),
             hex_dump: Rect::new(65, 2, 44, 20),
+            context_menu: Rect::default(),
+            editor_gutter: Rect::default(),
+            menu_items: Default::default(),
+            menu_dropdown: Rect::default(),
         };
     }
 
@@ -2356,6 +3357,72 @@ mod tests {
         assert_eq!(app.git.selected_entry().unwrap().path, "src/lib.rs");
         assert!(click(&mut app, 3, 4));
         assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn right_click_opens_context_menu_and_runs_actions() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("ctx.txt");
+        write(&path, "hello world\n").unwrap();
+        fake_layout(&mut app);
+        app.shell = Shell::Code;
+        app.open_file(&path);
+        // right-click inside the editor opens the menu at the click
+        let right = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: app.layout.editor_text.x + 2,
+            row: app.layout.editor_text.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(right));
+        assert!(app.context_menu.is_some(), "menu opened");
+        // keyboard: j moves the highlight, Esc closes
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none(), "esc closes");
+        // reopen, then run Select All via Enter
+        assert!(app.handle_mouse(right));
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none(), "menu closes after running");
+        let editor = app.editor.as_ref().unwrap();
+        let (lo, hi) = editor.selection();
+        assert_eq!((lo, hi), (0, editor.text.len_chars()), "select-all ran");
+        // right-click outside the editor does nothing
+        let outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!app.handle_mouse(outside));
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn no_dwell_hover_while_context_menu_is_open() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("ctx.txt");
+        write(&path, "hello world\n").unwrap();
+        fake_layout(&mut app);
+        app.shell = Shell::Code;
+        app.open_file(&path);
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: app.layout.editor_text.x + 2,
+            row: app.layout.editor_text.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        // simulate a long-settled dwell position and tick past the delay
+        app.mouse_rest = Some((
+            Position::new(app.layout.editor_text.x + 2, app.layout.editor_text.y),
+            Instant::now() - Duration::from_secs(2),
+        ));
+        app.maybe_dwell_hover();
+        assert!(app.overlay.is_none(), "no hover popup while the menu is open");
     }
 
     #[test]
@@ -2634,6 +3701,48 @@ mod tests {
         app.focus = Focus::Terminal;
         press(&mut app, KeyCode::Char('q'));
         assert!(app.hex.is_none());
+    }
+
+    #[test]
+    fn image_file_opens_preview_and_x_flips_to_hex() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("p.png");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(3, 2).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        write(&path, png.into_inner()).unwrap();
+        app.open_file(&path);
+        assert!(app.editor.is_none());
+        assert!(app.hex.is_none());
+        assert!(app.image.is_some(), "image preview open");
+        assert_eq!(app.shell, Shell::Code);
+        assert_eq!(app.focus, Focus::Terminal);
+        // the decode runs on a thread; tick() picks up the result
+        for _ in 0..1000 {
+            app.tick();
+            if app.image.as_ref().is_some_and(|v| v.ready()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let view = app.image.as_ref().expect("still an image after decode");
+        assert!(view.ready(), "decode finished");
+        assert_eq!((view.width, view.height), (3, 2));
+        // x flips to the hex viewer over the same bytes
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.image.is_none());
+        let hex = app.hex.as_ref().expect("hex viewer open");
+        assert!(hex.data.starts_with(b"\x89PNG"));
+        // reopening while the hex view is up reuses it (same as the editor)
+        app.open_file(&path);
+        assert!(app.hex.is_some() && app.image.is_none());
+        // after closing, opening again lands on the preview; esc closes it
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.hex.is_none());
+        app.open_file(&path);
+        assert!(app.image.is_some() && app.hex.is_none());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.image.is_none());
+        assert_eq!(app.focus, Focus::Sidebar);
     }
 
     #[test]

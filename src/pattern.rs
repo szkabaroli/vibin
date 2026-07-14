@@ -113,7 +113,10 @@ pub enum FieldType {
     Flags(String),
     /// `match expr { 0 = some_struct, _ = fallback }`: variant selected by
     /// the value of an expression over already-parsed fields.
-    Match { on: Expr, arms: Vec<(Option<u64>, String)> },
+    Match {
+        on: Expr,
+        arms: Vec<(Option<u64>, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,9 +396,12 @@ pub fn parse(src: &str) -> Result<Vec<Format>, String> {
                             // hex string: bare numbers would be ambiguous
                             // (is `45` decimal or hex?)
                             let Token::Str(s) = p.next()? else {
-                                return Err("magic must be a hex string, e.g. \"7f 45 4c 46\"".into());
+                                return Err(
+                                    "magic must be a hex string, e.g. \"7f 45 4c 46\"".into()
+                                );
                             };
-                            let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+                            let compact: String =
+                                s.chars().filter(|c| !c.is_whitespace()).collect();
                             if !compact.len().is_multiple_of(2) {
                                 return Err(format!("magic {s:?} has a half byte"));
                             }
@@ -411,7 +417,7 @@ pub fn parse(src: &str) -> Result<Vec<Format>, String> {
                                     other => {
                                         return Err(format!(
                                             "expected magic offset, found {other:?}"
-                                        ))
+                                        ));
                                     }
                                 }
                             }
@@ -463,7 +469,7 @@ pub fn parse(src: &str) -> Result<Vec<Format>, String> {
                                     other => {
                                         return Err(format!(
                                             "expected match value or _, found {other:?}"
-                                        ))
+                                        ));
                                     }
                                 };
                                 p.expect_punct('=')?;
@@ -666,10 +672,7 @@ fn printable(bytes: &[u8]) -> String {
         Some(last) => &bytes[..=last],
         None => &[],
     };
-    trimmed
-        .iter()
-        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '·' })
-        .collect()
+    trimmed.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '·' }).collect()
 }
 
 impl<'a> Eval<'a> {
@@ -765,7 +768,8 @@ impl<'a> Eval<'a> {
             let end = pos.checked_add(span)?.min(limit).min(self.data.len());
             let inner = Field { span: None, ..field.clone() };
             let idx = self.nodes.len();
-            if self.eval_field(&inner, pos, depth, scopes, end, endian).is_none() && self.nodes.len() == idx
+            if self.eval_field(&inner, pos, depth, scopes, end, endian).is_none()
+                && self.nodes.len() == idx
             {
                 // nothing parsed: at least show the raw bytes
                 self.push(HexNode {
@@ -913,11 +917,8 @@ impl<'a> Eval<'a> {
                     return None;
                 }
                 let bytes = self.data.get(pos..end)?;
-                let text: String = bytes
-                    .iter()
-                    .map(|&b| b as char)
-                    .filter(|c| c.is_digit(8))
-                    .collect();
+                let text: String =
+                    bytes.iter().map(|&b| b as char).filter(|c| c.is_digit(8)).collect();
                 let v = if text.is_empty() { 0 } else { u64::from_str_radix(&text, 8).ok()? };
                 scopes.last_mut().expect("scope").insert(field.name.clone(), v);
                 self.push(HexNode {
@@ -1071,7 +1072,8 @@ impl<'a> Eval<'a> {
                     }) {
                         break;
                     }
-                    let Some(end) = self.eval_struct(&def, cursor, depth + 2, scopes, limit, endian)
+                    let Some(end) =
+                        self.eval_struct(&def, cursor, depth + 2, scopes, limit, endian)
                     else {
                         // truncated element: drop its placeholder node
                         if maybe_n.is_some() {
@@ -1245,7 +1247,10 @@ mod tests {
         // array elements take their first enum child's label as their name
         assert_eq!(
             names,
-            vec!["demo", "header", "magic", "count", "items_at", "items", "alpha", "kind", "value", "beta", "kind", "value"]
+            vec![
+                "demo", "header", "magic", "count", "items_at", "items", "alpha", "kind", "value",
+                "beta", "kind", "value"
+            ]
         );
         // field references resolved across scopes: 2 items at offset 6
         let items = &nodes[5];
@@ -1295,9 +1300,11 @@ mod tests {
     #[test]
     fn parse_errors_are_reported() {
         assert!(parse(r#"format x { magic = "01"; }"#).unwrap_err().contains("root"));
-        assert!(parse(r#"struct s { f: nosuch; } format x { magic = "01"; root = s; }"#)
-            .unwrap_err()
-            .contains("nosuch"));
+        assert!(
+            parse(r#"struct s { f: nosuch; } format x { magic = "01"; root = s; }"#)
+                .unwrap_err()
+                .contains("nosuch")
+        );
         assert!(parse("struct s { f: char; }").unwrap_err().contains("length"));
         assert!(parse("wibble").unwrap_err().contains("format/struct/enum"));
     }
@@ -1514,11 +1521,8 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("png magic matched");
         assert_eq!(nodes[0].name, "png");
         // chunk elements take their type's label
-        let chunks: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "struct chunk")
-            .map(|n| n.name.as_str())
-            .collect();
+        let chunks: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "struct chunk").map(|n| n.name.as_str()).collect();
         assert_eq!(chunks, vec!["IHDR", "IEND"]);
         // big-endian dimensions and enum decode
         let get = |n: &str| nodes.iter().find(|x| x.name == n).unwrap().detail.clone();
@@ -1589,11 +1593,8 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("zip magic matched");
         assert_eq!(nodes[0].name, "zip");
         // records rename themselves after the signature enum
-        let records: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "struct record")
-            .map(|n| n.name.as_str())
-            .collect();
+        let records: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "struct record").map(|n| n.name.as_str()).collect();
         assert_eq!(records, vec!["local file", "central directory", "end of central directory"]);
         // filename, method, and flags decode; records tile the file
         assert!(nodes.iter().any(|n| n.name == "name" && n.detail == "\"a.txt\""));
@@ -1632,11 +1633,8 @@ mod tests {
         // page 1's b-tree sits after the header and fills the page
         let page1 = nodes.iter().find(|n| n.name == "page1").unwrap();
         assert_eq!((page1.start, page1.end), (100, 512));
-        let types: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.name == "type")
-            .map(|n| n.detail.as_str())
-            .collect();
+        let types: Vec<&str> =
+            nodes.iter().filter(|n| n.name == "type").map(|n| n.detail.as_str()).collect();
         assert_eq!(types, vec!["leaf table (0xd)", "interior table (0x5)"]);
         // the interior page decodes its rightmost child pointer
         assert_eq!(get("rightmost_pointer"), "7 (0x7)");
@@ -1756,11 +1754,8 @@ mod tests {
         let get = |n: &str| nodes.iter().find(|x| x.name == n).unwrap().detail.clone();
         assert_eq!(get("signature"), "\"GIF89a\"");
         // the animation has frames and control extensions, named by enum
-        let kinds: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "struct block")
-            .map(|n| n.name.as_str())
-            .collect();
+        let kinds: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "struct block").map(|n| n.name.as_str()).collect();
         assert!(kinds.contains(&"image"), "{kinds:?}");
         assert!(kinds.contains(&"extension"));
         // `until 0x3b` walks every frame: the trailer lands exactly at eof
@@ -1791,11 +1786,8 @@ mod tests {
 
         let nodes = match_and_evaluate(&data).expect("jpeg magic matched");
         assert_eq!(nodes[0].name, "jpeg");
-        let segments: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "struct segment")
-            .map(|n| n.name.as_str())
-            .collect();
+        let segments: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "struct segment").map(|n| n.name.as_str()).collect();
         assert_eq!(segments, vec!["SOI", "APP0 (JFIF)", "SOF0 (baseline)", "SOS"]);
         let get = |n: &str| nodes.iter().find(|x| x.name == n).unwrap().detail.clone();
         assert_eq!(get("identifier"), "\"JFIF\"");
@@ -1843,11 +1835,8 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("dxbc magic matched");
         assert_eq!(nodes[0].name, "dxbc");
         // parts name themselves from the fourcc enum
-        let parts: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "struct part")
-            .map(|n| n.name.as_str())
-            .collect();
+        let parts: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "struct part").map(|n| n.name.as_str()).collect();
         assert_eq!(parts, vec!["DXIL (SM6 program)", "STAT (statistics)"]);
         let get = |n: &str| nodes.iter().find(|x| x.name == n).unwrap().detail.clone();
         assert_eq!(get("dxil_magic"), "\"DXIL\"");
@@ -1889,11 +1878,8 @@ mod tests {
             .collect();
         assert_eq!(ops, vec!["OpCapability", "OpMemoryModel", "OpTypeVoid"]);
         // operand sizes derive from the packed word count
-        let sizes: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.name == "operands")
-            .map(|n| n.ty.as_str())
-            .collect();
+        let sizes: Vec<&str> =
+            nodes.iter().filter(|n| n.name == "operands").map(|n| n.ty.as_str()).collect();
         assert_eq!(sizes, vec!["u8[4]", "u8[8]", "u8[4]"]);
         // instructions tile to the end of the module
         let insts = nodes.iter().find(|n| n.name == "instructions").unwrap();
@@ -2026,11 +2012,8 @@ mod tests {
         assert_eq!(nodes[0].name, "ico");
         assert_eq!(nodes.iter().find(|n| n.name == "type").unwrap().detail, "icon (0x1)");
         // two entries, each claiming its image bytes via @ offset
-        let images: Vec<(usize, usize)> = nodes
-            .iter()
-            .filter(|n| n.name == "image")
-            .map(|n| (n.start, n.end))
-            .collect();
+        let images: Vec<(usize, usize)> =
+            nodes.iter().filter(|n| n.name == "image").map(|n| (n.start, n.end)).collect();
         assert_eq!(images, vec![(dir_end, dir_end + 4), (dir_end + 4, data.len())]);
         // the embedded PNG magic is visible in the claimed blob
         let png = nodes.iter().find(|n| n.name == "image" && n.start == dir_end + 4).unwrap();
@@ -2080,11 +2063,8 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("itunesdb magic matched");
         assert_eq!(nodes[0].name, "itunesdb");
         // the fourcc tags decode via the big-endian enum, in tree order
-        let tags: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "chunk_type")
-            .map(|n| n.detail.as_str())
-            .collect();
+        let tags: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "chunk_type").map(|n| n.detail.as_str()).collect();
         assert_eq!(
             tags,
             vec![
@@ -2101,7 +2081,8 @@ mod tests {
         assert_eq!(nodes[0].end, data.len());
         let mhit_node =
             nodes.iter().find(|n| n.detail == "mhit (track item) (0x6d686974)").unwrap();
-        let mhit_chunk = nodes.iter().find(|n| n.ty == "struct chunk" && n.start == mhit_node.start);
+        let mhit_chunk =
+            nodes.iter().find(|n| n.ty == "struct chunk" && n.start == mhit_node.start);
         assert!(mhit_chunk.is_some());
     }
 
@@ -2155,11 +2136,8 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("isobmff magic matched");
         assert_eq!(nodes[0].name, "isobmff");
         // big-endian fourcc decodes via the box_type enum, and boxes nest
-        let boxes: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "box_type")
-            .map(|n| n.detail.as_str())
-            .collect();
+        let boxes: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "box_type").map(|n| n.detail.as_str()).collect();
         assert_eq!(
             boxes,
             vec![
@@ -2186,18 +2164,12 @@ mod tests {
         let nodes = match_and_evaluate(&data).expect("der magic matched");
         assert_eq!(nodes[0].name, "der");
         // tags decode via the enum; constructed vs primitive via `tag & 0x20`
-        let tags: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "der_tag")
-            .map(|n| n.detail.as_str())
-            .collect();
+        let tags: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "der_tag").map(|n| n.detail.as_str()).collect();
         assert_eq!(tags, vec!["SEQUENCE (0x30)", "INTEGER (0x2)", "OCTET STRING (0x4)"]);
         // the variable-width length decodes: long form 0x81 0x07 = 7
-        let lengths: Vec<&str> = nodes
-            .iter()
-            .filter(|n| n.ty == "derlen")
-            .map(|n| n.detail.as_str())
-            .collect();
+        let lengths: Vec<&str> =
+            nodes.iter().filter(|n| n.ty == "derlen").map(|n| n.detail.as_str()).collect();
         assert_eq!(lengths, vec!["7 (0x7)", "1 (0x1)", "2 (0x2)"]);
         // the SEQUENCE recursed into two children; leaves hold raw bytes
         let seq = nodes.iter().find(|n| n.ty == "struct constructed").unwrap();
@@ -2423,10 +2395,8 @@ mod tests {
              <key>count</key><integer>42</integer></dict></plist>",
         )
         .unwrap();
-        let ok = std::process::Command::new("plutil")
-            .args(["-convert", "binary1"])
-            .arg(&path)
-            .status();
+        let ok =
+            std::process::Command::new("plutil").args(["-convert", "binary1"]).arg(&path).status();
         let Ok(status) = ok else { return };
         if !status.success() {
             return;
@@ -2439,7 +2409,11 @@ mod tests {
         assert_eq!(nodes[0].name, "bplist");
         // a dict with two entries → at least 5 objects (dict + 2 keys + 2 vals)
         let num = nodes.iter().find(|n| n.name == "num_objects").unwrap();
-        assert!(num.detail.starts_with("5 ") || num.detail.contains("(0x5)") || num.detail.contains("(0x6)"));
+        assert!(
+            num.detail.starts_with("5 ")
+                || num.detail.contains("(0x5)")
+                || num.detail.contains("(0x6)")
+        );
         assert!(nodes.iter().all(|n| n.end <= data.len()));
     }
 

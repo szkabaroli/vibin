@@ -29,6 +29,7 @@ pub enum PaletteAction {
     ResumeChat(String),
     ToggleHidden,
     SaveSettings,
+    TestToast,
     Help,
     Quit,
 }
@@ -86,10 +87,7 @@ impl Palette {
                 .into_iter()
                 .take(MAX_RESULTS)
                 .map(|i| {
-                    (
-                        self.files[i].clone(),
-                        PaletteAction::OpenFile(self.root.join(&self.files[i])),
-                    )
+                    (self.files[i].clone(), PaletteAction::OpenFile(self.root.join(&self.files[i])))
                 })
                 .collect()
         }
@@ -99,9 +97,7 @@ impl Palette {
     pub fn selected_action(&mut self) -> Option<PaletteAction> {
         let selected = self.selected;
         let results = self.results();
-        results
-            .get(selected.min(results.len().saturating_sub(1)))
-            .map(|(_, action)| action.clone())
+        results.get(selected.min(results.len().saturating_sub(1))).map(|(_, action)| action.clone())
     }
 
     pub fn move_selection(&mut self, down: bool) {
@@ -110,11 +106,8 @@ impl Palette {
             self.selected = 0;
             return;
         }
-        self.selected = if down {
-            (self.selected + 1).min(len - 1)
-        } else {
-            self.selected.saturating_sub(1)
-        };
+        self.selected =
+            if down { (self.selected + 1).min(len - 1) } else { self.selected.saturating_sub(1) };
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -161,7 +154,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let is_dir = crate::filetree::entry_is_dir(&entry);
         if is_dir {
             if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
                 collect_files(root, &path, out);
@@ -189,18 +182,9 @@ mod tests {
         write(dir.path().join(".git/config"), "").unwrap();
         write(dir.path().join("node_modules/junk/x.js"), "").unwrap();
         let commands = vec![
-            CommandEntry {
-                label: "agent: new".into(),
-                action: PaletteAction::NewAgent,
-            },
-            CommandEntry {
-                label: "git: stage all".into(),
-                action: PaletteAction::GitStageAll,
-            },
-            CommandEntry {
-                label: "vibin: quit".into(),
-                action: PaletteAction::Quit,
-            },
+            CommandEntry { label: "agent: new".into(), action: PaletteAction::NewAgent },
+            CommandEntry { label: "git: stage all".into(), action: PaletteAction::GitStageAll },
+            CommandEntry { label: "vibin: quit".into(), action: PaletteAction::Quit },
         ];
         let palette = Palette::new(dir.path(), commands);
         (dir, palette)

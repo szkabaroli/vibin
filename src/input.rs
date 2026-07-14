@@ -81,10 +81,7 @@ mod tests {
 
     #[test]
     fn plain_char() {
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
-            Some(vec![b'a'])
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::NONE)), Some(vec![b'a']));
     }
 
     #[test]
@@ -97,22 +94,10 @@ mod tests {
 
     #[test]
     fn ctrl_chars() {
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(vec![0x03])
-        );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            Some(vec![0x01])
-        );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Char('['), KeyModifiers::CONTROL)),
-            Some(vec![0x1b])
-        );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Char(' '), KeyModifiers::CONTROL)),
-            Some(vec![0x00])
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(vec![0x03]));
+        assert_eq!(key_to_bytes(&key(KeyCode::Char('a'), KeyModifiers::CONTROL)), Some(vec![0x01]));
+        assert_eq!(key_to_bytes(&key(KeyCode::Char('['), KeyModifiers::CONTROL)), Some(vec![0x1b]));
+        assert_eq!(key_to_bytes(&key(KeyCode::Char(' '), KeyModifiers::CONTROL)), Some(vec![0x00]));
     }
 
     #[test]
@@ -133,34 +118,19 @@ mod tests {
 
     #[test]
     fn special_keys() {
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(vec![b'\r'])
-        );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Backspace, KeyModifiers::NONE)),
-            Some(vec![0x7f])
-        );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Up, KeyModifiers::NONE)),
-            Some(b"\x1b[A".to_vec())
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::Enter, KeyModifiers::NONE)), Some(vec![b'\r']));
+        assert_eq!(key_to_bytes(&key(KeyCode::Backspace, KeyModifiers::NONE)), Some(vec![0x7f]));
+        assert_eq!(key_to_bytes(&key(KeyCode::Up, KeyModifiers::NONE)), Some(b"\x1b[A".to_vec()));
         assert_eq!(
             key_to_bytes(&key(KeyCode::PageDown, KeyModifiers::NONE)),
             Some(b"\x1b[6~".to_vec())
         );
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(vec![0x1b])
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::Esc, KeyModifiers::NONE)), Some(vec![0x1b]));
     }
 
     #[test]
     fn function_keys() {
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::F(1), KeyModifiers::NONE)),
-            Some(b"\x1bOP".to_vec())
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::F(1), KeyModifiers::NONE)), Some(b"\x1bOP".to_vec()));
         assert_eq!(
             key_to_bytes(&key(KeyCode::F(5), KeyModifiers::NONE)),
             Some(b"\x1b[15~".to_vec())
@@ -170,9 +140,6 @@ mod tests {
 
     #[test]
     fn unmapped_key() {
-        assert_eq!(
-            key_to_bytes(&key(KeyCode::CapsLock, KeyModifiers::NONE)),
-            None
-        );
+        assert_eq!(key_to_bytes(&key(KeyCode::CapsLock, KeyModifiers::NONE)), None);
     }
 }

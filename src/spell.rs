@@ -43,11 +43,7 @@ pub fn available() -> bool {
 use std::collections::HashSet;
 
 fn load_words(text: &str) -> HashSet<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect()
+    text.lines().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string).collect()
 }
 
 /// Universal programming vocabulary (cspell software-terms + fullstack),
@@ -214,7 +210,9 @@ fn ranges_against(
             continue;
         }
         let start = i;
-        while i < chars.len() && is_word_char(chars[i]) && spellable.get(i).copied().unwrap_or(false)
+        while i < chars.len()
+            && is_word_char(chars[i])
+            && spellable.get(i).copied().unwrap_or(false)
         {
             i += 1;
         }
@@ -378,8 +376,19 @@ mod tests {
     fn project_vocabulary_from_the_patch_is_accepted() {
         let dict = dictionary().unwrap();
         for w in [
-            "workspaces", "namespaces", "ratatui", "crossterm", "truecolor", "endianness",
-            "undercurl", "worktrees", "renderer", "scrollback", "fourcc", "varint", "glyphs",
+            "workspaces",
+            "namespaces",
+            "ratatui",
+            "crossterm",
+            "truecolor",
+            "endianness",
+            "undercurl",
+            "worktrees",
+            "renderer",
+            "scrollback",
+            "fourcc",
+            "varint",
+            "glyphs",
         ] {
             assert!(known(dict, w, "text"), "patch should accept {w:?}");
         }

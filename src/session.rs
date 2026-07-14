@@ -79,12 +79,7 @@ impl Session {
         let (program, args) = command.split_first().context("empty command")?;
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| anyhow::anyhow!("openpty failed: {e}"))?;
 
         let mut cmd = CommandBuilder::new(program);
@@ -103,12 +98,10 @@ impl Session {
         drop(pair.slave);
 
         let master = pair.master;
-        let writer = master
-            .take_writer()
-            .map_err(|e| anyhow::anyhow!("take_writer failed: {e}"))?;
-        let mut reader = master
-            .try_clone_reader()
-            .map_err(|e| anyhow::anyhow!("clone_reader failed: {e}"))?;
+        let writer =
+            master.take_writer().map_err(|e| anyhow::anyhow!("take_writer failed: {e}"))?;
+        let mut reader =
+            master.try_clone_reader().map_err(|e| anyhow::anyhow!("clone_reader failed: {e}"))?;
 
         let bells = Arc::new(AtomicU64::new(0));
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
@@ -173,16 +166,9 @@ impl Session {
         if self.has_attention() {
             return SessionStatus::Attention;
         }
-        let recent = self
-            .last_output
-            .lock()
-            .map(|at| at.elapsed() < WORKING_WINDOW)
-            .unwrap_or(false);
-        if recent {
-            SessionStatus::Working
-        } else {
-            SessionStatus::Idle
-        }
+        let recent =
+            self.last_output.lock().map(|at| at.elapsed() < WORKING_WINDOW).unwrap_or(false);
+        if recent { SessionStatus::Working } else { SessionStatus::Idle }
     }
 
     pub fn has_attention(&self) -> bool {
@@ -211,12 +197,7 @@ impl Session {
             return;
         }
         self.size = (rows, cols);
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         if let Ok(mut parser) = self.parser.lock() {
             parser.screen_mut().set_size(rows, cols);
         }
@@ -274,10 +255,7 @@ impl Session {
     /// Visible screen text — used by tests and for debugging.
     #[allow(dead_code)]
     pub fn screen_text(&self) -> String {
-        self.parser
-            .lock()
-            .map(|p| p.screen().contents())
-            .unwrap_or_default()
+        self.parser.lock().map(|p| p.screen().contents()).unwrap_or_default()
     }
 }
 
@@ -328,11 +306,7 @@ impl Default for SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self {
-            sessions: Vec::new(),
-            active: 0,
-            next_id: 1,
-        }
+        Self { sessions: Vec::new(), active: 0, next_id: 1 }
     }
 
     pub fn spawn(&mut self, command: &[String], cwd: &Path, rows: u16, cols: u16) -> Result<()> {
@@ -398,9 +372,7 @@ impl SessionManager {
     /// adding/removing sessions changes the fingerprint too.
     pub fn render_generation(&self) -> u64 {
         self.sessions.iter().fold(self.active as u64, |acc, s| {
-            acc.wrapping_mul(1_000_003)
-                .wrapping_add(s.generation())
-                .wrapping_add(s.id as u64)
+            acc.wrapping_mul(1_000_003).wrapping_add(s.generation()).wrapping_add(s.id as u64)
         })
     }
 
@@ -490,11 +462,7 @@ mod tests {
             80,
         )
         .unwrap();
-        assert!(
-            wait_for(&session, "colorterm=truecolor"),
-            "screen: {:?}",
-            session.screen_text()
-        );
+        assert!(wait_for(&session, "colorterm=truecolor"), "screen: {:?}", session.screen_text());
         assert!(wait_for(&session, "term=xterm-256color"));
     }
 
@@ -502,7 +470,8 @@ mod tests {
     fn runs_in_given_cwd() {
         let dir = tempfile::TempDir::new().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        let session = Session::spawn(1, "t".into(), &sh("pwd; sleep 5"), &canonical, 24, 80).unwrap();
+        let session =
+            Session::spawn(1, "t".into(), &sh("pwd; sleep 5"), &canonical, 24, 80).unwrap();
         assert!(
             wait_for(&session, canonical.to_str().unwrap()),
             "screen: {:?}",
@@ -513,7 +482,8 @@ mod tests {
     #[test]
     fn forwards_input() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut session = Session::spawn(1, "t".into(), &sh("read x; echo got:$x"), dir.path(), 24, 80).unwrap();
+        let mut session =
+            Session::spawn(1, "t".into(), &sh("read x; echo got:$x"), dir.path(), 24, 80).unwrap();
         session.write_input(b"ping\r").unwrap();
         assert!(wait_for(&session, "got:ping"), "screen: {:?}", session.screen_text());
     }
@@ -532,7 +502,8 @@ mod tests {
     #[test]
     fn kill_stops_child() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut session = Session::spawn(1, "t".into(), &sh("sleep 60"), dir.path(), 24, 80).unwrap();
+        let mut session =
+            Session::spawn(1, "t".into(), &sh("sleep 60"), dir.path(), 24, 80).unwrap();
         assert!(session.is_running());
         session.kill();
         assert!(!session.is_running());
@@ -541,7 +512,8 @@ mod tests {
     #[test]
     fn resize_updates_parser_and_pty() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut session = Session::spawn(1, "t".into(), &sh("sleep 5"), dir.path(), 24, 80).unwrap();
+        let mut session =
+            Session::spawn(1, "t".into(), &sh("sleep 5"), dir.path(), 24, 80).unwrap();
         session.resize(30, 100);
         assert_eq!(session.size, (30, 100));
         let parser = session.parser.lock().unwrap();
@@ -551,7 +523,8 @@ mod tests {
     #[test]
     fn resize_ignores_zero_and_same_size() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut session = Session::spawn(1, "t".into(), &sh("sleep 5"), dir.path(), 24, 80).unwrap();
+        let mut session =
+            Session::spawn(1, "t".into(), &sh("sleep 5"), dir.path(), 24, 80).unwrap();
         session.resize(0, 0);
         assert_eq!(session.size, (24, 80));
     }
@@ -677,8 +650,7 @@ mod tests {
     #[test]
     fn status_exited_carries_exit_code() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut session =
-            Session::spawn(1, "t".into(), &sh("exit 3"), dir.path(), 24, 80).unwrap();
+        let mut session = Session::spawn(1, "t".into(), &sh("exit 3"), dir.path(), 24, 80).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while session.is_running() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
@@ -727,7 +699,8 @@ mod tests {
     #[test]
     fn output_bumps_generation() {
         let dir = tempfile::TempDir::new().unwrap();
-        let session = Session::spawn(1, "t".into(), &sh("echo out; sleep 5"), dir.path(), 24, 80).unwrap();
+        let session =
+            Session::spawn(1, "t".into(), &sh("echo out; sleep 5"), dir.path(), 24, 80).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while session.generation() == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));

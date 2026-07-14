@@ -4,9 +4,10 @@
 //! layers override earlier ones, so a project's `.vibin` wins over the
 //! user's global config. Settings persist via [`Config::save_global`].
 
-use figment::providers::{Format, Serialized, Toml};
 use figment::Figment;
+use figment::providers::{Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +24,79 @@ pub struct Config {
     /// so multiplying again would compound), the classic 3 elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_scroll_multiplier: Option<u16>,
+    /// Keybinding overrides: `"trigger=action"` entries layered over the
+    /// defaults, e.g. `keybinds = ["f4=diff_all", "ctrl+a>d=unbind"]`.
+    /// `vibin +list-actions` names every action.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keybinds: Vec<String>,
+    /// Language servers, in the shape of Neovim's `vim.lsp.config`: each
+    /// `[lsp.<name>]` table declares the command, the languages it serves,
+    /// and the workspace marker files that start it eagerly at workspace
+    /// open. User entries deep-merge over the built-ins, so overriding one
+    /// field keeps the rest:
+    ///
+    /// ```toml
+    /// [lsp.rust_analyzer]
+    /// cmd = ["rust-analyzer", "--log-file", "/tmp/ra.log"]
+    ///
+    /// [lsp.clangd]                # a server vibin doesn't ship
+    /// cmd = ["clangd"]
+    /// filetypes = ["c", "cpp"]
+    /// root_markers = ["compile_commands.json"]
+    /// ```
+    pub lsp: BTreeMap<String, LspServer>,
+}
+
+/// One language-server definition (see [`Config::lsp`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LspServer {
+    /// Command and arguments to spawn the server.
+    pub cmd: Vec<String>,
+    /// Languages this server handles (vibin's language names, as shown in
+    /// the editor status bar).
+    pub filetypes: Vec<String>,
+    /// Files whose presence in the workspace root starts this server at
+    /// workspace open, before any file is opened. Empty = lazy only.
+    pub root_markers: Vec<String>,
+}
+
+fn default_lsp() -> BTreeMap<String, LspServer> {
+    fn server(cmd: &[&str], filetypes: &[&str], root_markers: &[&str]) -> LspServer {
+        let owned = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
+        LspServer {
+            cmd: owned(cmd),
+            filetypes: owned(filetypes),
+            root_markers: owned(root_markers),
+        }
+    }
+    BTreeMap::from([
+        (
+            "rust_analyzer".to_string(),
+            server(&["rust-analyzer"], &["rust"], &["Cargo.toml", "rust-project.json"]),
+        ),
+        (
+            "ts_ls".to_string(),
+            server(
+                &["typescript-language-server", "--stdio"],
+                &["typescript", "javascript"],
+                &["package.json"],
+            ),
+        ),
+        (
+            "pyright".to_string(),
+            server(
+                &["pyright-langserver", "--stdio"],
+                &["python"],
+                &["pyproject.toml", "setup.py"],
+            ),
+        ),
+        ("gopls".to_string(), server(&["gopls"], &["go"], &["go.mod", "go.work"])),
+        ("bashls".to_string(), server(&["bash-language-server", "start"], &["bash"], &[])),
+        ("yamlls".to_string(), server(&["yaml-language-server", "--stdio"], &["yaml"], &[])),
+        ("dockerls".to_string(), server(&["docker-langserver", "--stdio"], &["dockerfile"], &[])),
+        ("protols".to_string(), server(&["protols"], &["protobuf"], &[])),
+    ])
 }
 
 impl Default for Config {
@@ -32,11 +106,41 @@ impl Default for Config {
             spell_check: true,
             mark_unicode: true,
             mouse_scroll_multiplier: None,
+            keybinds: Vec::new(),
+            lsp: default_lsp(),
         }
     }
 }
 
 impl Config {
+    /// The server command for a language: the first `[lsp.*]` entry (in
+    /// name order) whose filetypes include it. `VIBIN_LSP_CMD` overrides
+    /// every language (tests; also handy for one-off custom servers).
+    pub fn lsp_command(&self, language: &str) -> Option<Vec<String>> {
+        if let Ok(cmd) = std::env::var("VIBIN_LSP_CMD") {
+            let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+            if !parts.is_empty() {
+                return Some(parts);
+            }
+        }
+        self.lsp
+            .values()
+            .find(|s| !s.cmd.is_empty() && s.filetypes.iter().any(|f| f == language))
+            .map(|s| s.cmd.clone())
+    }
+
+    /// The language to start eagerly for a workspace: the first `[lsp.*]`
+    /// entry (in name order) with a root marker present in `root`.
+    pub fn lsp_activation_language(&self, root: &Path) -> Option<String> {
+        self.lsp.values().find_map(|s| {
+            s.root_markers
+                .iter()
+                .any(|m| root.join(m).is_file())
+                .then(|| s.filetypes.first().cloned())
+                .flatten()
+        })
+    }
+
     /// Lines per wheel event: the configured multiplier if set, else the
     /// terminal-aware fallback.
     pub fn scroll_step(&self) -> usize {
@@ -69,10 +173,7 @@ pub fn global_path() -> Option<PathBuf> {
 
 /// The nearest `.vibin/config.toml` at or above `workdir`.
 fn local_path(workdir: &Path) -> Option<PathBuf> {
-    workdir
-        .ancestors()
-        .map(|d| d.join(".vibin").join("config.toml"))
-        .find(|p| p.exists())
+    workdir.ancestors().map(|d| d.join(".vibin").join("config.toml")).find(|p| p.exists())
 }
 
 impl Config {
@@ -96,13 +197,13 @@ impl Config {
     /// Write these settings to the global XDG config, creating the directory.
     pub fn save_global(&self) -> std::io::Result<PathBuf> {
         use std::io::{Error, ErrorKind};
-        let path =
-            global_path().ok_or_else(|| Error::new(ErrorKind::NotFound, "no HOME / XDG_CONFIG_HOME"))?;
+        let path = global_path()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "no HOME / XDG_CONFIG_HOME"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let body = toml::to_string_pretty(self)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let body =
+            toml::to_string_pretty(self).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
         std::fs::write(&path, body)?;
         Ok(path)
     }
@@ -119,6 +220,44 @@ mod tests {
         let cfg = Config::load_with(None, None);
         assert_eq!(cfg, Config::default());
         assert!(!cfg.show_hidden && cfg.spell_check && cfg.mark_unicode);
+    }
+
+    #[test]
+    fn lsp_command_resolves_by_filetype() {
+        let _guard = crate::lsp::ENV_LOCK.lock().unwrap();
+        let cfg = Config::default();
+        assert_eq!(cfg.lsp_command("rust").unwrap()[0], "rust-analyzer");
+        assert_eq!(cfg.lsp_command("javascript").unwrap()[0], "typescript-language-server");
+        assert!(cfg.lsp_command("toml").is_none());
+    }
+
+    #[test]
+    fn lsp_tables_deep_merge_over_builtins() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("config.toml");
+        fs::write(
+            &global,
+            r#"
+[lsp.rust_analyzer]
+cmd = ["ra-custom"]
+
+[lsp.gopls]
+cmd = ["gopls"]
+filetypes = ["go"]
+root_markers = ["go.mod"]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_with(Some(global), None);
+        // overriding one field keeps the built-in rest (vim.lsp.config-style)
+        let ra = &cfg.lsp["rust_analyzer"];
+        assert_eq!(ra.cmd, vec!["ra-custom"]);
+        assert_eq!(ra.filetypes, vec!["rust"]);
+        assert_eq!(ra.root_markers, vec!["Cargo.toml", "rust-project.json"]);
+        // brand-new servers join the registry
+        assert_eq!(cfg.lsp["gopls"].filetypes, vec!["go"]);
+        // untouched built-ins survive
+        assert!(cfg.lsp.contains_key("pyright"));
     }
 
     #[test]

@@ -1,0 +1,56 @@
+name: demo shots
+
+# Regenerate the README product shots (assets/hero-{light,dark}.png) with
+# vhs. Run manually, or automatically when the demo tooling changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["demo/**"]
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install vibin
+        run: cargo install --path . --locked
+
+      # ttyd + ffmpeg + a headless chrome come with vhs-action's setup
+      - name: Install vhs
+        uses: charmbracelet/vhs-action@v2
+        with:
+          install-only: true
+
+      - name: Record
+        run: demo/record.sh
+
+      # gifs are gitignored (regenerable); publish them as run artifacts
+      - name: Upload recordings
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-recordings
+          path: |
+            assets/demo-light.gif
+            assets/demo-dark.gif
+            assets/hero-light.png
+            assets/hero-dark.png
+
+      - name: Commit refreshed heroes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add assets/hero-light.png assets/hero-dark.png
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "Regenerate demo shots [skip ci]"
+          git push

@@ -1,15 +1,17 @@
 //! Rendering: layout, sidebar, terminal panes, overlays, status bar.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Tabs};
-use ratatui::Frame;
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Tabs,
+};
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, Focus, Overlay, Screen, Shell};
-use crate::editor::Mode;
 use crate::diff::{DiffLine, DiffLineKind};
+use crate::editor::Mode;
 use crate::git::{GitView, StatusKind};
 use crate::projects::display_path;
 use crate::session::SessionStatus;
@@ -60,20 +62,30 @@ const PARROT_GAP: u16 = 4;
 fn rainbow_line(text: &str, phase: f32) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(2);
+    // the double-line box glyphs are the FIGlet art's shadow scaffolding,
+    // not the letters — keep them dim so the solid blocks carry the color
+    let scaffold =
+        wash(80).unwrap_or_else(|| adaptive(Color::Rgb(58, 61, 70), Color::Rgb(196, 200, 208)));
     Line::from(
         chars
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let t = i as f32 / (n - 1) as f32 + phase;
-                Span::styled(c.to_string(), Style::default().fg(gradient_color(t)))
+                let style =
+                    if matches!(c, '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦' | '╩' | '╬')
+                    {
+                        Style::default().fg(scaffold)
+                    } else {
+                        let t = i as f32 / (n - 1) as f32 + phase;
+                        Style::default().fg(gradient_color(t))
+                    };
+                Span::styled(c.to_string(), style)
             })
             .collect::<Vec<_>>(),
     )
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    app.squiggle_overlays.clear();
     app.link_hits.clear();
     if app.screen == Screen::Welcome {
         draw_welcome(frame, app);
@@ -81,16 +93,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
         .split(frame.area());
+    draw_menu_bar(frame, app, outer[0]);
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(10)])
-        .split(outer[0]);
+        .split(outer[1]);
 
     draw_sidebar(frame, app, main[0]);
-    draw_main_area(frame, app, main[1]);
-    draw_status_bar(frame, app, outer[1]);
+    // collapsed borders: the main pane overlaps the sidebar's right border
+    // column so the two share one line; junctions are arm-unions (┬ ┴ ├)
+    let shared_x = main[0].right().saturating_sub(1);
+    let pane = Rect::new(shared_x, main[1].y, main[1].width + 1, main[1].height);
+    let prior: Vec<String> = (pane.y..pane.bottom())
+        .map(|y| frame.buffer_mut()[(shared_x, y)].symbol().to_string())
+        .collect();
+    draw_main_area(frame, app, pane);
+    merge_shared_column(frame.buffer_mut(), shared_x, pane.y, &prior);
+    draw_status_bar(frame, app, outer[2]);
+    draw_menu_dropdown(frame, app);
 
     // modal dimming: with a dialog or the leader menu up, everything
     // behind it steps back (hover popups are tooltips, not modals)
@@ -107,9 +129,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     if modal_open {
         dim_background(frame.buffer_mut());
-        // squiggles are re-printed post-draw at full color — skip them
-        // while dimmed or they'd glow through the veil
-        app.squiggle_overlays.clear();
     }
 
     match &app.overlay {
@@ -126,17 +145,325 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         None => {}
     }
 
+    // browser-style link preview: the URL under the pointer, in a chip
+    // at the bottom-left (above the status bar) — hover-popup links and
+    // LSP document links in the editor both land in hovered_link
+    if let Some(url) = &app.hovered_link {
+        let area = frame.area();
+        let text = format!(" {url} ");
+        let w = (text.chars().count() as u16).min(area.width);
+        let chip = Rect::new(area.x, area.bottom().saturating_sub(2), w, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(STATUS_DIM()).bg(DIALOG_BG()))),
+            chip,
+        );
+    }
+
+    // right-click context menu, above everything but the debug overlay
+    if app.context_menu.is_some() {
+        draw_context_menu(frame, app);
+    }
+
+    // toast notifications float above everything, undimmed
+    draw_toasts(frame, app);
+
     // which-key: the leader menu shows itself the moment Ctrl+A is pressed
     if app.leader_pending {
         draw_whichkey(frame, app);
+    }
+
+    // debug builds: VIBIN_HITBOXES=1 outlines every tracked mouse target
+    #[cfg(debug_assertions)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VIBIN_HITBOXES").is_some()) {
+            draw_hitbox_debug(frame, app);
+        }
     }
 }
 
 /// Bottom-anchored menu of every leader binding, shown while the leader is
 /// pending — no memorization needed.
+/// Debug overlay (VIBIN_HITBOXES=1, debug builds only): draw a colored
+/// outline + label over every rect the mouse code hit-tests against, plus
+/// the per-frame link hitboxes. For eyeballing why a click landed where
+/// it did — deliberately crude, draws over everything.
+#[cfg(debug_assertions)]
+fn draw_hitbox_debug(frame: &mut Frame, app: &App) {
+    let boxes: Vec<(&str, Rect)> = vec![
+        ("sidebar", app.layout.sidebar_list),
+        ("tabs", app.layout.session_tabs),
+        ("term", app.layout.terminal_pane),
+        ("welcome", app.layout.welcome_list),
+        ("editor", app.layout.editor_text),
+        ("palette", app.layout.palette_list),
+        ("hover", app.layout.hover_rect),
+        ("home", app.layout.home_list),
+        ("hextree", app.layout.hex_tree),
+        ("hexdump", app.layout.hex_dump),
+    ];
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    let mut tint = |label: &str, rect: Rect, i: usize| {
+        let rect = rect.intersection(area);
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        // fill the whole hitbox with the pattern color's dark shade so the
+        // content underneath stays readable; overlaps simply overpaint
+        let (fill, bright) = pattern_color(i);
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::default().bg(fill));
+                }
+            }
+        }
+        // label in the top-left corner, in the bright shade
+        for (n, ch) in label.chars().enumerate() {
+            let x = rect.x + n as u16;
+            if x >= rect.right() {
+                break;
+            }
+            if let Some(cell) = buf.cell_mut((x, rect.y)) {
+                cell.set_symbol(&ch.to_string());
+                cell.set_style(Style::default().fg(bright).bg(fill).add_modifier(Modifier::BOLD));
+            }
+        }
+    };
+    for (i, (label, rect)) in boxes.iter().enumerate() {
+        tint(label, *rect, i);
+    }
+    for (i, (rect, _)) in app.link_hits.iter().enumerate() {
+        tint("link", *rect, boxes.len() + i);
+    }
+    // per-tab click ranges inside the session tab bar — stored as x spans,
+    // the only hit targets that aren't whole rects
+    let tabs_y = app.layout.session_tabs.y;
+    for (i, &(x0, x1, session)) in app.session_tab_hits.iter().enumerate() {
+        let label = format!("t{session}");
+        let rect = Rect::new(x0, tabs_y, x1.saturating_sub(x0), 1);
+        tint(&label, rect, boxes.len() + app.link_hits.len() + i);
+    }
+}
+
+/// Right-click menu: a small bordered list anchored at the click, below
+/// it when there's room, above otherwise. The item area is recorded in
+/// the layout map for mouse hit-testing.
+fn draw_context_menu(frame: &mut Frame, app: &mut App) {
+    let Some(menu) = &app.context_menu else { return };
+    let area = frame.area();
+    let width = (menu.items.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(8) as u16 + 4)
+        .min(area.width);
+    let height = (menu.items.len() as u16 + 2).min(area.height);
+    let x = menu.pos.x.min(area.right().saturating_sub(width));
+    let below = menu.pos.y + 1;
+    let y = if below + height <= area.bottom() {
+        below
+    } else {
+        menu.pos.y.saturating_sub(height).max(area.y)
+    };
+    let rect = Rect::new(x, y, width, height).intersection(area);
+    draw_dialog_base(frame, rect);
+    let items: Vec<Line> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let style = if i == menu.selected {
+                Style::default().bg(SELECTION_BG())
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!(" {label:w$}", w = width as usize - 4), style))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(items).style(Style::default().bg(DIALOG_BG())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(DIALOG_BORDER())),
+        ),
+        rect,
+    );
+    app.layout.context_menu = Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+}
+
+/// Severity-tinted toast fill: the accent blended gently into the
+/// terminal background, so cards sit in the theme instead of on it.
+fn toast_tint(accent: Color) -> Color {
+    let (br, bg, bb) = crate::color::terminal_bg().unwrap_or(if crate::color::is_light() {
+        (250, 250, 252)
+    } else {
+        (24, 26, 32)
+    });
+    match accent {
+        Color::Rgb(r, g, b) => {
+            let mix = |a: u8, base: u8| ((a as u32 * 52 + base as u32 * 204) / 256) as u8;
+            Color::Rgb(mix(r, br), mix(g, bg), mix(b, bb))
+        }
+        _ => DIALOG_BG(),
+    }
+}
+
+/// Toast notifications: borderless cards stacked top-right under the menu
+/// bar, oldest on top. Each is a severity-tinted block with a bold accent
+/// bar on the left and the app's slant tail on the right — same slant
+/// language as the chips. Cards with buttons grow a button row and stick
+/// around until answered; plain ones expire in `App::tick`. Hitboxes for
+/// buttons and card bodies land in `app.toast_hits`.
+fn draw_toasts(frame: &mut Frame, app: &mut App) {
+    app.toast_hits.clear();
+    if app.toasts.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let max_text = 40.min(area.width.saturating_sub(8) as usize);
+    let fancy = crate::color::fancy_glyphs();
+    let hover = app.toast_hover;
+    let mut hits: Vec<(Rect, usize, Option<usize>)> = Vec::new();
+    // below the menu bar and the panes' top border row
+    let mut y = area.y + 3;
+    for (index, toast) in app.toasts.iter().enumerate() {
+        let accent = match toast.level {
+            crate::app::ToastLevel::Info => chip_accent(6, (134, 220, 214), (1, 132, 188)),
+            crate::app::ToastLevel::Warn => severity_color(2),
+            crate::app::ToastLevel::Error => severity_color(1),
+        };
+        let fill = toast_tint(accent);
+        // markdown body: bold, code spans, links… (links become OSC 8
+        // cells + hitboxes below, like the hover popup)
+        let (mut lines, mut links) = crate::markdown::render_with_links(&toast.text, max_text);
+        // trim blank framing rows, keeping link line indices in step
+        while lines.first().is_some_and(|l| l.width() == 0) {
+            lines.remove(0);
+            links.retain_mut(|l| {
+                if l.line == 0 {
+                    false
+                } else {
+                    l.line -= 1;
+                    true
+                }
+            });
+        }
+        while lines.last().is_some_and(|l| l.width() == 0) {
+            lines.pop();
+        }
+        links.retain(|l| l.line < lines.len());
+        if lines.is_empty() {
+            lines.push(Line::default());
+        }
+        // each inner button boundary is a two-cell slant notch (◤◢); the
+        // group's outer edges stay vertical
+        let buttons_w: usize = toast.buttons.iter().map(|b| b.chars().count() + 2).sum::<usize>()
+            + 2 * toast.buttons.len().saturating_sub(1);
+        let text_w = lines.iter().map(|l| l.width()).max().unwrap_or(0).max(buttons_w);
+        // the slant tail only reads right on one-line, button-free cards;
+        // taller ones keep a straight edge
+        let tail = fancy && lines.len() == 1 && toast.buttons.is_empty();
+        let w = (text_w as u16 + 3 + tail as u16).min(area.width); // ▌ + padding (+ ◤)
+        let h = lines.len() as u16 + (!toast.buttons.is_empty()) as u16;
+        if y + h > area.bottom().saturating_sub(1) {
+            break;
+        }
+        // inset from the right edge: clear of the pane border and its
+        // scrollbar column
+        let rect = Rect::new(area.right().saturating_sub(w + 3), y, w, h);
+        let mut rows: Vec<Line> = lines
+            .iter()
+            .map(|l| {
+                let pad = text_w.saturating_sub(l.width());
+                let mut spans =
+                    vec![Span::styled("▌", Style::default().fg(accent)), Span::raw(" ")];
+                spans.extend(l.spans.iter().cloned());
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                if tail {
+                    // the tail sits outside the card: default background
+                    spans.push(Span::styled("◤", Style::default().fg(fill).bg(Color::Reset)));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        if !toast.buttons.is_empty() {
+            let mut spans = vec![
+                Span::styled("▌", Style::default().fg(accent).bg(fill)),
+                Span::styled(" ", Style::default().bg(fill)),
+            ];
+            let button_y = rect.y + lines.len() as u16;
+            let mut x = rect.x + 2;
+            let last = toast.buttons.len() - 1;
+            for (b, label) in toast.buttons.iter().enumerate() {
+                let chip = format!(" {label} ");
+                let bg = if hover == Some((index, b)) { accent } else { MENU_TINT() };
+                let style = if hover == Some((index, b)) {
+                    Style::default().fg(chip_text()).bg(bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(bg)
+                };
+                let cap = |s: &'static str| {
+                    Span::styled(if fancy { s } else { " " }, Style::default().fg(bg).bg(fill))
+                };
+                let mut chip_w = chip.chars().count() as u16;
+                if b > 0 {
+                    spans.push(cap("◢"));
+                    chip_w += 1;
+                }
+                spans.push(Span::styled(chip, style));
+                if b < last {
+                    spans.push(cap("◤"));
+                    chip_w += 1;
+                }
+                hits.push((Rect::new(x, button_y, chip_w, 1), index, Some(b)));
+                x += chip_w;
+            }
+            let used = 2 + buttons_w;
+            spans.push(Span::styled(
+                " ".repeat((w as usize).saturating_sub(used)),
+                Style::default().bg(fill),
+            ));
+            rows.push(Line::from(spans));
+        }
+        frame.render_widget(Paragraph::new(rows).style(Style::default().bg(fill)), rect);
+        // clickable markdown links: OSC 8 cells + hitboxes, exactly like
+        // the hover popup (see draw_hover_overlay)
+        for link in &links {
+            if link.col + link.text.chars().count() > text_w {
+                continue; // clipped labels would render a broken sequence
+            }
+            let (x, y) = (rect.x + 2 + link.col as u16, rect.y + link.line as u16);
+            let hitbox = Rect::new(x, y, link.text.chars().count().max(1) as u16, 1);
+            let style = frame.buffer_mut().cell((x, y)).map(|c| c.style()).unwrap_or_default();
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                use unicode_width::UnicodeWidthStr;
+                let label_width = link.text.as_str().width().max(1) as u16;
+                cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", link.url, link.text));
+                cell.set_style(style);
+                cell.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(
+                    std::num::NonZeroU16::new(label_width).expect("max(1) above"),
+                ));
+            }
+            app.link_hits.push((hitbox, link.url.clone()));
+        }
+        // the body hit comes after the button hits: find() prefers buttons
+        hits.push((rect, index, None));
+        y += h; // flush stack — tint and ragged widths separate the cards
+    }
+    app.toast_hits = hits;
+}
+
 fn draw_whichkey(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let key = |k: &str| Span::styled(format!(" {k:<5}"), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let key = |k: &str| {
+        Span::styled(
+            format!(" {k:<5}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    };
     let label = |l: &str| Span::styled(format!("{l:<18}"), Style::default());
     let head = |t: &str| {
         Span::styled(
@@ -148,29 +475,44 @@ fn draw_whichkey(frame: &mut Frame, app: &App) {
     let rows: Vec<Line> = vec![
         Line::from(vec![head("── agents"), head("── panels"), head("── other")]),
         Line::from(vec![
-            key("c"), label("new agent"),
-            key("F1/h"), label("agents shell"),
-            key("r"), label("rename agent"),
+            key("c"),
+            label("new agent"),
+            key("F1/h"),
+            label("agents shell"),
+            key("r"),
+            label("rename agent"),
         ]),
         Line::from(vec![
-            key("1-9"), label("jump to agent"),
-            key("F2/g"), label("git shell"),
-            key("R"), label("respawn agent"),
+            key("1-9"),
+            label("jump to agent"),
+            key("F2/g"),
+            label("git shell"),
+            key("R"),
+            label("respawn agent"),
         ]),
         Line::from(vec![
-            key("⇥/n"), label("next agent"),
-            key("F3/f"), label("code shell"),
-            key("u"), label("refresh panels"),
+            key("⇥/n"),
+            label("next agent"),
+            key("F3/f"),
+            label("code shell"),
+            key("u"),
+            label("refresh panels"),
         ]),
         Line::from(vec![
-            key("p"), label("previous agent"),
-            key("e"), label(editor_label),
-            key("k/j"), label("scroll terminal"),
+            key("p"),
+            label("previous agent"),
+            key("e"),
+            label(editor_label),
+            key("k/j"),
+            label("scroll terminal"),
         ]),
         Line::from(vec![
-            key("x"), label("close agent"),
-            key("d"), label("diff all changes"),
-            key("q"), label("quit vibin"),
+            key("x"),
+            label("close agent"),
+            key("d"),
+            label("diff all changes"),
+            key("q"),
+            label("quit vibin"),
         ]),
         Line::from(Span::styled(
             " esc cancel · ctrl+a ctrl+a literal · ctrl+k palette · ? full help",
@@ -188,9 +530,7 @@ fn draw_whichkey(frame: &mut Frame, app: &App) {
     .intersection(area);
     draw_dialog_base(frame, rect);
     frame.render_widget(
-        Paragraph::new(rows)
-            .style(Style::default().bg(DIALOG_BG()))
-            .block(dialog_block()),
+        Paragraph::new(rows).style(Style::default().bg(DIALOG_BG())).block(dialog_block()),
         rect,
     );
     draw_dialog_frame(frame, rect, "", app.welcome.phase);
@@ -226,10 +566,7 @@ fn draw_palette(frame: &mut Frame, app: &mut App) {
         Span::raw(input.clone()),
     ]));
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   no matches",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("   no matches", Style::default().fg(Color::DarkGray))));
     }
     for (i, label) in rows.iter().enumerate() {
         let style = if i == selected {
@@ -242,23 +579,14 @@ fn draw_palette(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from(Span::styled(format!(" {marker}{text}"), style)));
     }
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(DIALOG_BG()))
-            .block(dialog_block()),
+        Paragraph::new(lines).style(Style::default().bg(DIALOG_BG())).block(dialog_block()),
         rect,
     );
     // result rows start after title + input
-    app.layout.palette_list = Rect {
-        x: rect.x,
-        y: rect.y + 2,
-        width: rect.width,
-        height: rect.height.saturating_sub(3),
-    };
+    app.layout.palette_list =
+        Rect { x: rect.x, y: rect.y + 2, width: rect.width, height: rect.height.saturating_sub(3) };
     let prefix = if is_cmd { 3 } else { 4 }; // " ❯ " vs " 🔍 " (emoji is 2 wide)
-    frame.set_cursor_position((
-        rect.x + 2 + prefix + input.chars().count() as u16,
-        rect.y + 1,
-    ));
+    frame.set_cursor_position((rect.x + 2 + prefix + input.chars().count() as u16, rect.y + 1));
     draw_dialog_frame(frame, rect, "", app.welcome.phase);
 }
 
@@ -289,11 +617,8 @@ fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
     let anchor = app.hover_anchor;
     // inline code and unlabeled fences highlight as the hovered file's
     // language, so docs read like the source they describe
-    let hover_lang = app
-        .editor
-        .as_ref()
-        .map(|e| crate::editor::highlight::language_name(&e.path))
-        .unwrap_or("");
+    let hover_lang =
+        app.editor.as_ref().map(|e| crate::editor::highlight::language_name(&e.path)).unwrap_or("");
     let Some(Overlay::Hover(doc)) = &mut app.overlay else {
         return;
     };
@@ -304,7 +629,9 @@ fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
     let mut diag_lines: Vec<Line> = Vec::new();
     for diag in &doc.diagnostics {
         let color = severity_color(diag.severity);
-        for (i, piece) in wrap_text(&diag.message, wrap_width.saturating_sub(2)).into_iter().enumerate() {
+        for (i, piece) in
+            wrap_text(&diag.message, wrap_width.saturating_sub(2)).into_iter().enumerate()
+        {
             let prefix = if i == 0 { "■ " } else { "  " };
             diag_lines.push(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(color)),
@@ -421,12 +748,12 @@ fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
         content_rect,
     );
     if has_header {
-        // static header: a hairline rule matching the footer
-        let rule = "─".repeat(rect.width.saturating_sub(2) as usize);
+        // static header: double rule with corner pieces that step down to
+        // a single stub (╒ ╕) at the card's edges
+        let rule = format!("╒{}╕", "═".repeat(rect.width.saturating_sub(2) as usize));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(rule, Style::default().fg(DIALOG_BORDER()))))
-                .style(Style::default().bg(DIALOG_BG()))
-                .block(Block::default().padding(Padding::horizontal(1))),
+                .style(Style::default().bg(DIALOG_BG())),
             Rect::new(rect.x, rect.y, rect.width, 1).intersection(area),
         );
     }
@@ -434,16 +761,18 @@ fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
         // static footer row: a hairline rule with the scroll position
         // right-aligned; content scrolls above it, this row never moves
         let hint = format!(" ↕ {}/{} ", (scroll + viewport).min(total), total);
-        let fill = rect.width.saturating_sub(2) as usize;
-        let rule_len = fill.saturating_sub(hint.chars().count());
+        let inner = rect.width.saturating_sub(2) as usize;
+        let rule_len = inner.saturating_sub(hint.chars().count());
         let footer = Line::from(vec![
-            Span::styled("─".repeat(rule_len), Style::default().fg(DIALOG_BORDER())),
+            Span::styled(
+                format!("╘{}", "═".repeat(rule_len)),
+                Style::default().fg(DIALOG_BORDER()),
+            ),
             Span::styled(hint, Style::default().fg(STATUS_DIM())),
+            Span::styled("╛", Style::default().fg(DIALOG_BORDER())),
         ]);
         frame.render_widget(
-            Paragraph::new(footer)
-                .style(Style::default().bg(DIALOG_BG()))
-                .block(Block::default().padding(Padding::horizontal(1))),
+            Paragraph::new(footer).style(Style::default().bg(DIALOG_BG())),
             Rect::new(rect.x, rect.bottom().saturating_sub(1), rect.width, 1).intersection(area),
         );
     }
@@ -495,19 +824,10 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
     // parrot faces right, so it sits LEFT of the title, looking at it.
     // Dropped on narrow terminals.
     let parrot_width = crate::parrot::width();
-    let with_parrot =
-        parrot_width > 0 && area.width >= LOGO_WIDTH + PARROT_GAP + parrot_width + 2;
-    let total = if with_parrot {
-        LOGO_WIDTH + PARROT_GAP + parrot_width
-    } else {
-        LOGO_WIDTH
-    };
+    let with_parrot = parrot_width > 0 && area.width >= LOGO_WIDTH + PARROT_GAP + parrot_width + 2;
+    let total = if with_parrot { LOGO_WIDTH + PARROT_GAP + parrot_width } else { LOGO_WIDTH };
     let start_x = area.x + area.width.saturating_sub(total) / 2;
-    let logo_x = if with_parrot {
-        start_x + parrot_width + PARROT_GAP
-    } else {
-        start_x
-    };
+    let logo_x = if with_parrot { start_x + parrot_width + PARROT_GAP } else { start_x };
     let width = LOGO_WIDTH.min(area.width);
     // parrot and wordmark are the same height, top-aligned on the same rows
     let logo_y = chunks[1].y;
@@ -527,14 +847,10 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
         }
     }
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let version_rect =
-        Rect::new(logo_x, logo_y + LOGO.len() as u16, width, 1).intersection(area);
+    let version_rect = Rect::new(logo_x, logo_y + LOGO.len() as u16, width, 1).intersection(area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            version,
-            Style::default().fg(Color::DarkGray),
-        )))
-        .right_aligned(),
+        Paragraph::new(Line::from(Span::styled(version, Style::default().fg(Color::DarkGray))))
+            .right_aligned(),
         version_rect,
     );
 
@@ -565,7 +881,10 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
             if project.chat_count == 1 { "" } else { "s" }
         );
         items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{:>4}  ", project.age(now)), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:>4}  ", project.age(now)),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::raw(display_path(&project.path)),
             Span::styled(format!("  · {chats}"), Style::default().fg(Color::DarkGray)),
         ])));
@@ -589,6 +908,83 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
     );
 }
 
+/// Experimental top menu bar: borderless — a blank spacer row, then the
+/// entries as slightly tinted chips, user + gear dimmed on the right.
+/// Each label's rect lands in the layout map; hovering one opens its
+/// dropdown (see [`draw_menu_dropdown`]).
+fn draw_menu_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    use unicode_width::UnicodeWidthStr;
+    if area.height < 2 || area.width < 4 {
+        return;
+    }
+    let tint = MENU_TINT();
+    // slanted chips, same slant language as the dialog badges and the mode
+    // chip: ◢ label ◤ back to back — the caps carve the gap themselves
+    let fancy = crate::color::fancy_glyphs();
+    let mut spans = vec![Span::raw(" ")];
+    let mut used: u16 = 1;
+    for (i, (item, _)) in crate::app::MENU_BAR.iter().enumerate() {
+        let label = format!(" {item} ");
+        let bg = if app.menu_open == Some(i) { SELECTION_BG() } else { tint };
+        let cap =
+            |s: &'static str| Span::styled(if fancy { s } else { " " }, Style::default().fg(bg));
+        let chip_width = label.width() as u16 + 2;
+        spans.push(cap("◢"));
+        spans.push(Span::styled(label, Style::default().bg(bg)));
+        spans.push(cap("◤"));
+        app.layout.menu_items[i] = Rect::new(area.x + used, area.y + 1, chip_width, 1);
+        used += chip_width;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "you".into());
+    let right = format!("{user}     ⚙   ");
+    let pad = (area.width as usize).saturating_sub(used as usize + right.width());
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+}
+
+/// The open menu-bar dropdown, anchored under its label — same surface,
+/// border, and selection treatment as the right-click context menu.
+fn draw_menu_dropdown(frame: &mut Frame, app: &mut App) {
+    let Some(open) = app.menu_open else {
+        app.layout.menu_dropdown = Rect::default();
+        return;
+    };
+    let (_, items) = crate::app::MENU_BAR[open];
+    let anchor = app.layout.menu_items[open];
+    let area = frame.area();
+    let width = (items.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(8) as u16 + 4)
+        .min(area.width);
+    let height = (items.len() as u16 + 2).min(area.height.saturating_sub(anchor.bottom()));
+    let x = anchor.x.saturating_sub(1).min(area.right().saturating_sub(width));
+    let rect = Rect::new(x, anchor.bottom(), width, height).intersection(area);
+    draw_dialog_base(frame, rect);
+    let rows: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let style = if i == app.menu_row {
+                Style::default().bg(SELECTION_BG())
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!(" {label:w$}", w = width as usize - 4), style))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(rows).style(Style::default().bg(DIALOG_BG())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(DIALOG_BORDER())),
+        ),
+        rect,
+    );
+    app.layout.menu_dropdown = rect;
+}
+
 /// Dashboard glyph and color for a session status.
 fn status_indicator(status: SessionStatus) -> (&'static str, Color) {
     match status {
@@ -599,12 +995,15 @@ fn status_indicator(status: SessionStatus) -> (&'static str, Color) {
     }
 }
 
+/// Hairline chrome grey shared by unfocused pane borders and the editor's
+/// gutter rule — derived from the terminal's own colors (wash), so the two
+/// always match and follow light/dark theme flips together.
+fn chrome_grey() -> Color {
+    wash(70).unwrap_or_else(|| adaptive(Color::Rgb(70, 74, 84), Color::Rgb(178, 182, 190)))
+}
+
 fn border_style(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
+    if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(chrome_grey()) }
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -619,6 +1018,7 @@ fn draw_chats_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     app.layout.sidebar_list = block.inner(area);
 
@@ -689,7 +1089,7 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|item| {
             let indent = "  ".repeat(item.depth);
             let icon = if item.is_dir {
-                if item.expanded { "📂 " } else { "📁 " }
+                if item.expanded { "[▼] " } else { "[▶] " }
             } else {
                 "   " // aligns with the double-width folder emoji
             };
@@ -709,8 +1109,10 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(icon.to_string()),
                 Span::styled(item.name.clone(), name_style),
             ];
-            // problem badge, right-aligned at the row's edge:
-            // red count for errors, yellow for warnings
+            // right-aligned badges at the row's edge: a dim link arrow for
+            // symlinks (VS Code's overlay), then the problem count
+            // (red for errors, yellow for warnings) rightmost
+            let link = item.is_symlink.then_some("↪");
             let badge = diag.get(&item.path).and_then(|&(errors, warnings)| {
                 if errors > 0 {
                     Some(((errors + warnings).to_string(), severity_color(1), true))
@@ -720,17 +1122,31 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                     None
                 }
             });
-            if let Some((count, color, bold)) = badge {
-                // indent (2/level) + icon (3 cols) + name, then pad to the edge
-                let used = indent.chars().count() + 3 + item.name.chars().count();
-                let inner_w = area.width.saturating_sub(2) as usize; // inside borders
-                let pad = inner_w.saturating_sub(used + count.chars().count()).max(1);
+            if link.is_some() || badge.is_some() {
+                // indent (2/level) + icon (4 cols for dirs, 3 for files) +
+                // name, then pad to the edge
+                let used =
+                    indent.chars().count() + icon.chars().count() + item.name.chars().count();
+                let right = link.map_or(0, |_| 1)
+                    + badge.as_ref().map_or(0, |(c, ..)| c.chars().count())
+                    + (link.is_some() && badge.is_some()) as usize;
+                // inside the borders, with one column of air on the right
+                let inner_w = area.width.saturating_sub(3) as usize;
+                let pad = inner_w.saturating_sub(used + right).max(1);
                 spans.push(Span::raw(" ".repeat(pad)));
-                let mut style = Style::default().fg(color);
-                if bold {
-                    style = style.add_modifier(Modifier::BOLD);
+                if let Some(arrow) = link {
+                    spans.push(Span::styled(arrow, Style::default().fg(STATUS_DIM())));
+                    if badge.is_some() {
+                        spans.push(Span::raw(" "));
+                    }
                 }
-                spans.push(Span::styled(count, style));
+                if let Some((count, color, bold)) = badge {
+                    let mut style = Style::default().fg(color);
+                    if bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    spans.push(Span::styled(count, style));
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -738,6 +1154,7 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     app.layout.sidebar_list = block.inner(area);
     let list = List::new(items)
@@ -769,6 +1186,7 @@ fn draw_git_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     app.layout.sidebar_list = block.inner(area);
 
@@ -806,10 +1224,8 @@ fn draw_git_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         GitView::Tree => {
             let rows = app.git.tree_rows();
-            let selected_row = rows
-                .iter()
-                .position(|r| r.entry == Some(app.git.selected))
-                .unwrap_or(0);
+            let selected_row =
+                rows.iter().position(|r| r.entry == Some(app.git.selected)).unwrap_or(0);
             let items: Vec<ListItem> = rows
                 .iter()
                 .map(|row| {
@@ -857,7 +1273,9 @@ fn draw_main_area(frame: &mut Frame, app: &mut App, area: Rect) {
         Shell::Git => draw_git_diff_main(frame, app, area),
         Shell::Code => {
             app.layout.terminal_pane = area;
-            if app.hex.is_some() {
+            if app.image.is_some() {
+                draw_image_view(frame, app, area);
+            } else if app.hex.is_some() {
                 draw_hex_view(frame, app, area);
             } else if app.editor.is_some() {
                 draw_editor(frame, app, area);
@@ -874,16 +1292,12 @@ fn draw_editor_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Terminal;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    const MARK: [&str; 4] = [
-        "  ▗▄▄▖  ",
-        " ▟████▙ ",
-        " ▜██▛▀  ",
-        "  ▝▀▘   ",
-    ];
+    const MARK: [&str; 4] = ["  ▗▄▄▖  ", " ▟████▙ ", " ▜██▛▀  ", "  ▝▀▘   "];
     let dim = Color::Rgb(70, 74, 84);
     let label_fg = Color::Rgb(150, 156, 168);
     let keys_fg = Color::Rgb(105, 110, 122);
@@ -912,11 +1326,8 @@ fn draw_editor_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let selected = i == app.code_home_selected;
-        let base = if selected {
-            Style::default().bg(Color::Rgb(58, 62, 78))
-        } else {
-            Style::default()
-        };
+        let base =
+            if selected { Style::default().bg(Color::Rgb(58, 62, 78)) } else { Style::default() };
         let marker = if selected { "▸ " } else { "  " };
         let pad = (row_width as usize)
             .saturating_sub(2 + label.chars().count() + keys.chars().count() + 1);
@@ -951,6 +1362,7 @@ fn draw_git_diff_main(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     let inner = block.inner(area);
     let lines = crate::diff::parse(&text);
@@ -1015,28 +1427,19 @@ fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(selected_tab)
         .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
         )
         .divider("|");
     frame.render_widget(tabs, chunks[0]);
 
     let focused = app.focus == Focus::Terminal;
-    let active_exited = matches!(
-        statuses.get(app.sessions.active),
-        Some(SessionStatus::Exited(_))
-    );
+    let active_exited = matches!(statuses.get(app.sessions.active), Some(SessionStatus::Exited(_)));
     let pane = chunks[1];
     app.layout.terminal_pane = pane;
-    let block = Block::default().borders(Borders::ALL).border_style(
-        if active_exited {
-            Style::default().fg(Color::Red)
-        } else {
-            border_style(focused)
-        },
-    );
+    let block =
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(
+            if active_exited { Style::default().fg(Color::Red) } else { border_style(focused) },
+        );
 
     let inner = block.inner(pane);
     // Remember pane size for new sessions and keep the active one in sync.
@@ -1053,10 +1456,7 @@ fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.sessions.active_session() {
         Some(session) => {
             let title = if let Some(code) = session.exit_code() {
-                format!(
-                    " {} — exited ({code}) · Ctrl+A R respawn · Ctrl+A x close ",
-                    session.title
-                )
+                format!(" {} — exited ({code}) · Ctrl+A R respawn · Ctrl+A x close ", session.title)
             } else if scroll_offset > 0 {
                 format!(" {} [scroll:{}] ", session.title, scroll_offset)
             } else {
@@ -1092,10 +1492,7 @@ fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
                     "  Ctrl+A c  start a new Claude session",
                     Style::default().fg(Color::Cyan),
                 )),
-                Line::from(Span::styled(
-                    "  Ctrl+A ?  help",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(Span::styled("  Ctrl+A ?  help", Style::default().fg(Color::DarkGray))),
             ])
             .block(block.title(" vibin "));
             frame.render_widget(msg, pane);
@@ -1103,13 +1500,51 @@ fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-// Mode segment colors.
-fn mode_colors(mode: Mode) -> (Color, Color) {
-    match mode {
-        Mode::Normal => (Color::Rgb(122, 132, 160), Color::Rgb(16, 18, 24)),
-        Mode::Insert => (Color::Rgb(166, 218, 149), Color::Rgb(16, 18, 24)),
-        Mode::Select => (Color::Rgb(198, 160, 246), Color::Rgb(16, 18, 24)),
+/// Chip label color: the terminal background — readable on any accent.
+fn chip_text() -> Color {
+    match crate::color::terminal_bg() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => adaptive(Color::Rgb(16, 18, 24), Color::Rgb(240, 240, 244)),
     }
+}
+
+/// Subtle chip fill shared by the menu-bar items and other clickable
+/// chips (like the status-bar branch box).
+#[allow(non_snake_case)]
+fn MENU_TINT() -> Color {
+    wash(40).unwrap_or_else(|| adaptive(Color::Rgb(48, 51, 58), Color::Rgb(226, 228, 233)))
+}
+
+/// A slanted chip in the menu-bar shape: ◢ label ◤. Pass a text color for
+/// bold accent chips (modes), None for quiet default-text chips. The caps
+/// degrade to spaces without fancy glyphs, keeping widths stable.
+fn slant_chip(label: String, bg: Color, fg: Option<Color>) -> [Span<'static>; 3] {
+    let fancy = crate::color::fancy_glyphs();
+    let cap = |s: &'static str| Span::styled(if fancy { s } else { " " }, Style::default().fg(bg));
+    let mut style = Style::default().bg(bg);
+    if let Some(fg) = fg {
+        style = style.fg(fg).add_modifier(Modifier::BOLD);
+    }
+    [cap("◢"), Span::styled(label, style), cap("◤")]
+}
+
+/// Chip accent from the terminal palette, with dark/light fallbacks.
+fn chip_accent(slot: usize, dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
+    let (r, g, b) =
+        crate::color::ansi16(slot).unwrap_or(if crate::color::is_light() { light } else { dark });
+    Color::Rgb(r, g, b)
+}
+
+/// Mode chip colors, from the terminal theme: NORMAL stays a quiet grey
+/// (the resting state), INSERT is the theme's green, SELECT its magenta.
+fn mode_colors(mode: Mode) -> (Color, Color) {
+    let bg = match mode {
+        Mode::Normal => wash(150)
+            .unwrap_or_else(|| adaptive(Color::Rgb(122, 132, 160), Color::Rgb(120, 126, 140))),
+        Mode::Insert => chip_accent(2, (166, 218, 149), (60, 140, 60)),
+        Mode::Select => chip_accent(5, (198, 160, 246), (150, 60, 150)),
+    };
+    (bg, chip_text())
 }
 
 /// dark-vs-light pick, keyed off the OSC 11 terminal-background luminance
@@ -1117,9 +1552,130 @@ fn adaptive(dark: Color, light: Color) -> Color {
     if crate::color::is_light() { light } else { dark }
 }
 
+/// Visible characters of a cell symbol that embeds escape sequences
+/// (CSI ... letter, OSC ... BEL/ST).
+fn strip_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC: runs to BEL or ESC \
+                while let Some(n) = chars.next() {
+                    if n == '\x07' {
+                        break;
+                    }
+                    if n == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// Box-drawing arms (light set): U=1 D=2 L=4 R=8.
+fn box_arms(sym: &str) -> Option<u8> {
+    Some(match sym {
+        "─" => 4 | 8,
+        "│" => 1 | 2,
+        "┌" | "╭" => 2 | 8,
+        "┐" | "╮" => 2 | 4,
+        "└" | "╰" => 1 | 8,
+        "┘" | "╯" => 1 | 4,
+        "├" => 1 | 2 | 8,
+        "┤" => 1 | 2 | 4,
+        "┬" => 2 | 4 | 8,
+        "┴" => 1 | 4 | 8,
+        "┼" => 1 | 2 | 4 | 8,
+        _ => return None,
+    })
+}
+
+fn arms_box(arms: u8) -> Option<&'static str> {
+    Some(match arms {
+        0b1100 => "─",
+        0b0011 => "│",
+        // corners come back rounded: only pane borders get merged, and
+        // panes draw rounded corners
+        0b1010 => "╭",
+        0b0110 => "╮",
+        0b1001 => "╰",
+        0b0101 => "╯",
+        0b1011 => "├",
+        0b0111 => "┤",
+        0b1110 => "┬",
+        0b1101 => "┴",
+        0b1111 => "┼",
+        _ => return None,
+    })
+}
+
+/// Collapse-borders merge for the column two panes share: each cell's
+/// final glyph is the arm-union of what the sidebar drew there and what
+/// the overlapping main pane drew on top (┌∪┐=┬, └∪┘=┴, ┌∪│=├). A pane
+/// cell that erased a sidebar border glyph with a blank gets it back.
+fn merge_shared_column(buf: &mut ratatui::buffer::Buffer, x: u16, y0: u16, prior: &[String]) {
+    for (i, before) in prior.iter().enumerate() {
+        let y = y0 + i as u16;
+        let Some(prev_arms) = box_arms(before) else { continue };
+        let cell = &mut buf[(x, y)];
+        match box_arms(cell.symbol()) {
+            Some(cur_arms) => {
+                if let Some(merged) = arms_box(cur_arms | prev_arms) {
+                    cell.set_symbol(merged);
+                }
+            }
+            // blank content over a former border glyph: restore the border
+            None if cell.symbol() == " " => {
+                cell.set_symbol(before);
+            }
+            None => {}
+        }
+    }
+}
+
 /// Theme-native grey (see color::wash), as a ratatui Color.
 fn wash(weight: u32) -> Option<Color> {
     crate::color::wash(weight).map(|(r, g, b)| Color::Rgb(r, g, b))
+}
+
+/// Wavy undercurl as plain cell style: the custom [`crate::backend::UNDERCURL`]
+/// modifier plus `underline_color` for the curl. The backend wrapper
+/// renders the SGR 4:3; here it's ordinary per-char styling that diffs,
+/// clips, and dims like any other cell.
+fn render_undercurl(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    text: &str,
+    curl: (u8, u8, u8),
+) {
+    let (r, g, b) = curl;
+    for i in 0..text.chars().count() as u16 {
+        if let Some(cell) = buf.cell_mut((x + i, y)) {
+            let style = cell
+                .style()
+                .add_modifier(crate::backend::UNDERCURL)
+                .underline_color(Color::Rgb(r, g, b));
+            cell.set_style(style);
+        }
+    }
 }
 
 /// Recolor every cell toward the terminal background so an open modal
@@ -1127,8 +1683,11 @@ fn wash(weight: u32) -> Option<Color> {
 /// background, default-colored text gets an explicit dim wash (there is
 /// no RGB to blend), and indexed colors lean on the DIM attribute.
 fn dim_background(buf: &mut ratatui::buffer::Buffer) {
-    let (br, bgc, bb) = crate::color::terminal_bg()
-        .unwrap_or(if crate::color::is_light() { (255, 255, 255) } else { (0, 0, 0) });
+    let (br, bgc, bb) = crate::color::terminal_bg().unwrap_or(if crate::color::is_light() {
+        (255, 255, 255)
+    } else {
+        (0, 0, 0)
+    });
     let default_fg =
         wash(110).unwrap_or_else(|| adaptive(Color::Rgb(90, 94, 104), Color::Rgb(172, 176, 184)));
     let blend = |c: u8, base: u8| ((c as u32 * 115 + base as u32 * 141) / 256) as u8;
@@ -1140,6 +1699,12 @@ fn dim_background(buf: &mut ratatui::buffer::Buffer) {
     for y in area.y..area.bottom() {
         for x in area.x..area.right() {
             let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            // escape-packed cells (undercurls, OSC 8 links) would keep
+            // their embedded colors under the veil — flatten them to text
+            if cell.symbol().contains('\x1b') {
+                let plain = strip_escapes(cell.symbol());
+                cell.set_symbol(&plain);
+            }
             let style = cell.style();
             let fg = match style.fg {
                 Some(Color::Reset) | None => Some(default_fg),
@@ -1148,13 +1713,11 @@ fn dim_background(buf: &mut ratatui::buffer::Buffer) {
             let bg = style.bg.map(dim_color);
             let underline = style.underline_color.map(dim_color);
             cell.set_style(
-                Style { fg, bg, underline_color: underline, ..style }
-                    .add_modifier(Modifier::DIM),
+                Style { fg, bg, underline_color: underline, ..style }.add_modifier(Modifier::DIM),
             );
         }
     }
 }
-
 
 /// Status/app bar background: a whisper above the terminal background.
 #[allow(non_snake_case)]
@@ -1170,11 +1733,11 @@ fn STATUS_DIM() -> Color {
 
 /// Gutter line numbers: 256-color palette slot 238 (a mid grey) when
 /// available; theme-derived washes otherwise.
-fn gutter_nr_fg() -> Color {
-    if let Some((r, g, b)) = crate::color::ansi16(238) {
-        return Color::Rgb(r, g, b);
-    }
-    wash(60).unwrap_or_else(|| adaptive(Color::Rgb(58, 61, 70), Color::Rgb(196, 200, 208)))
+#[allow(non_snake_case)]
+fn HOVER_SPAN_BG() -> Color {
+    // background tint for the symbol a hover popup describes — its
+    // origin stays marked while the popup is up
+    wash(52).unwrap_or_else(|| adaptive(Color::Rgb(48, 52, 64), Color::Rgb(214, 218, 228)))
 }
 
 /// Selection background, best source first: the terminal's own highlight
@@ -1192,9 +1755,7 @@ fn SELECTION_BG() -> Color {
     let blue = crate::color::ansi16(12).or(crate::color::ansi16(4));
     let cyan = crate::color::ansi16(14).or(crate::color::ansi16(6));
     let accent = match (blue, cyan) {
-        (Some(b), Some(c)) => {
-            Some(((b.0 / 2 + c.0 / 2), (b.1 / 2 + c.1 / 2), (b.2 / 2 + c.2 / 2)))
-        }
+        (Some(b), Some(c)) => Some(((b.0 / 2 + c.0 / 2), (b.1 / 2 + c.1 / 2), (b.2 / 2 + c.2 / 2))),
         (b, c) => b.or(c),
     };
     if let (Some((ar, ag, ab)), Some((br, bg, bb))) = (accent, crate::color::terminal_bg()) {
@@ -1244,18 +1805,16 @@ fn INVISIBLE_BG() -> Color {
     adaptive(Color::Rgb(74, 62, 24), Color::Rgb(250, 236, 184))
 }
 
-
 /// Diagnostic colors, from the terminal's own ANSI palette when it
 /// answered OSC 4 (error = red slot, warning = yellow, info = blue), so
 /// they match the active theme; hardcoded fallbacks otherwise.
 fn severity_rgb(severity: u8) -> (u8, u8, u8) {
     let (slot, dark, light) = match severity {
-        1 => (1, (240, 90, 105), (200, 40, 50)), // error: red
-        2 => (3, (250, 210, 60), (176, 130, 10)), // warning: yellow/amber
+        1 => (1, (240, 90, 105), (200, 40, 50)),   // error: red
+        2 => (3, (250, 210, 60), (176, 130, 10)),  // warning: yellow/amber
         _ => (4, (140, 170, 200), (60, 110, 160)), // info/hint: blue
     };
-    crate::color::ansi16(slot)
-        .unwrap_or(if crate::color::is_light() { light } else { dark })
+    crate::color::ansi16(slot).unwrap_or(if crate::color::is_light() { light } else { dark })
 }
 
 fn severity_color(severity: u8) -> Color {
@@ -1265,12 +1824,31 @@ fn severity_color(severity: u8) -> Color {
 
 fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
     let focused = app.focus == Focus::Terminal;
+    // git change markers for the gutter (added/modified/deleted vs HEAD)
+    let gutter_marks = app.editor_gutter_diff().unwrap_or_default();
     let diagnostics = match (&app.lsp, &app.editor) {
         (Some(client), Some(editor)) => client.diagnostics(&editor.path),
         _ => Vec::new(),
     };
+    let doc_links = match (&app.lsp, &app.editor) {
+        (Some(client), Some(editor)) => client.document_links(&editor.path),
+        _ => Vec::new(),
+    };
+    // code lens titles per line, joined for the end-of-line annotation
+    let mut lens_titles: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    if let (Some(client), Some(editor)) = (&app.lsp, &app.editor) {
+        for lens in client.code_lenses(&editor.path) {
+            let slot = lens_titles.entry(lens.line).or_default();
+            if !slot.is_empty() {
+                slot.push_str(" · ");
+            }
+            slot.push_str(&lens.title);
+        }
+    }
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     let inner = block.inner(pane);
     let Some(editor) = &mut app.editor else {
@@ -1287,8 +1865,8 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
     }
 
     let total_lines = editor.text.len_lines();
-    // marker column + right-aligned number + trailing space
-    let gutter_width = (total_lines.max(1).ilog10() as u16 + 3).max(5);
+    // marker column + right-aligned number + space + border rule
+    let gutter_width = (total_lines.max(1).ilog10() as u16 + 4).max(6);
     let text_area = Rect::new(
         inner.x + gutter_width,
         inner.y,
@@ -1296,6 +1874,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         inner.height,
     );
     app.layout.editor_text = text_area;
+    app.layout.editor_gutter = Rect::new(inner.x, inner.y, gutter_width, inner.height);
 
     let (cursor_line, cursor_col) = editor.cursor_line_col();
     let (sel_lo, sel_hi) = editor.selection();
@@ -1335,13 +1914,11 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         let nr_style = if line_idx == cursor_line {
             Style::default().fg(CURSORLINE_NR())
         } else {
-            Style::default().fg(gutter_nr_fg())
+            // same dim as the status bar's secondary text
+            Style::default().fg(STATUS_DIM())
         };
-        let line_severity = diagnostics
-            .iter()
-            .filter(|d| d.line == line_idx)
-            .map(|d| d.severity)
-            .min();
+        let line_severity =
+            diagnostics.iter().filter(|d| d.line == line_idx).map(|d| d.severity).min();
         // gutter sign letters: E(rror) W(arning) H(int/info)
         let marker = match line_severity {
             Some(sev) => Span::styled(
@@ -1354,14 +1931,39 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
             ),
             None => Span::raw(" "),
         };
+        // change markers live in the gutter rule itself: the │ turns into
+        // a double ║ in green (added) or amber (modified), and a red ▸
+        // marks a boundary where lines were deleted
+        let last_content_line = total_lines.saturating_sub(1);
+        // hovering a marker fills its whole hunk — the contiguous group
+        // of added/modified rows thickens together, previewing exactly
+        // what the dwell popup will describe
+        let hovered = app
+            .gutter_hover
+            .and_then(|l| gutter_marks.hover_range(l, total_lines))
+            .is_some_and(|r| r.contains(&line_idx));
+        let fill = |glyph| if hovered { "█" } else { glyph };
+        let (rule_glyph, rule_color) = if gutter_marks.deleted_at.contains(&line_idx)
+            || (line_idx == last_content_line && gutter_marks.deleted_at.contains(&total_lines))
+        {
+            (fill("▸"), REMOVE_ACCENT())
+        } else if gutter_marks.added.contains(&line_idx) {
+            (fill("║"), ADD_ACCENT())
+        } else if gutter_marks.modified.contains(&line_idx) {
+            (fill("║"), MOD_ACCENT())
+        } else {
+            // plain rule: same grey as the pane borders it joins into
+            ("│", chrome_grey())
+        };
         let gutter = Rect::new(inner.x, inner.y + row as u16, gutter_width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 marker,
                 Span::styled(
-                    format!("{:>w$} ", line_idx + 1, w = (gutter_width - 2) as usize),
+                    format!("{:>w$} ", line_idx + 1, w = (gutter_width - 3) as usize),
                     nr_style,
                 ),
+                Span::styled(rule_glyph, Style::default().fg(rule_color)),
             ])),
             gutter,
         );
@@ -1435,11 +2037,22 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         if !fancy {
             for diag in diagnostics.iter().filter(|d| d.line == line_idx) {
                 let upto = diag.col_end.saturating_sub(hscroll).min(styles.len());
-                for slot in styles.iter_mut().take(upto).skip(diag.col_start.saturating_sub(hscroll)) {
+                for slot in
+                    styles.iter_mut().take(upto).skip(diag.col_start.saturating_sub(hscroll))
+                {
                     *slot = slot
                         .add_modifier(Modifier::UNDERLINED)
                         .underline_color(severity_color(diag.severity));
                 }
+            }
+        }
+        // document links (LSP): quiet colored underline, ctrl+click opens
+        for link in doc_links.iter().filter(|l| l.line == line_idx) {
+            let upto = link.col_end.saturating_sub(hscroll).min(styles.len());
+            for slot in styles.iter_mut().take(upto).skip(link.col_start.saturating_sub(hscroll)) {
+                *slot = slot
+                    .add_modifier(Modifier::UNDERLINED)
+                    .underline_color(crate::markdown::LINK_FG());
             }
         }
         // cursor-line tint first, so the selection background below wins
@@ -1447,6 +2060,31 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         if on_cursor_line {
             for slot in styles.iter_mut() {
                 *slot = slot.bg(cursorline_bg());
+            }
+        }
+        // hover origin: while an LSP hover popup is open, the word it
+        // describes keeps a marker tint
+        if let (Some(crate::app::Overlay::Hover(_)), Some((h_line, h_col))) =
+            (&app.overlay, app.hover_doc_pos)
+            && line_idx == h_line
+        {
+            let chars: Vec<char> = content.chars().collect();
+            let is_word = |c: &char| c.is_alphanumeric() || *c == '_';
+            let col = h_col.min(chars.len());
+            if chars.get(col).is_some_and(is_word) {
+                let mut lo = col;
+                while lo > 0 && is_word(&&chars[lo - 1]) {
+                    lo -= 1;
+                }
+                let mut hi = col;
+                while hi < chars.len() && is_word(&&chars[hi]) {
+                    hi += 1;
+                }
+                let (lo, hi) = (lo.saturating_sub(hscroll), hi.saturating_sub(hscroll));
+                let upto = hi.min(styles.len());
+                for slot in styles.iter_mut().take(upto).skip(lo) {
+                    *slot = slot.bg(HOVER_SPAN_BG());
+                }
             }
         }
         // selection background (Normal/Select; hidden while inserting)
@@ -1478,11 +2116,15 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
                 _ => segments.push(Span::styled(glyph.to_string(), st)),
             }
         }
-        let row_base = if on_cursor_line {
-            Style::default().bg(cursorline_bg())
-        } else {
-            Style::default()
-        };
+        // code lens annotation: dim italic command titles after the code
+        if let Some(titles) = lens_titles.get(&line_idx) {
+            segments.push(Span::styled(
+                format!("  ▸ {titles}"),
+                Style::default().fg(STATUS_DIM()).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        let row_base =
+            if on_cursor_line { Style::default().bg(cursorline_bg()) } else { Style::default() };
         frame.render_widget(
             Paragraph::new(Line::from(segments)).style(row_base),
             Rect::new(text_area.x, inner.y + row as u16, text_area.width, 1),
@@ -1499,10 +2141,6 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
                     continue;
                 }
                 let curl = severity_rgb(diag.severity);
-                let as_rgb = |c: Option<Color>| match c {
-                    Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
-                    _ => None,
-                };
                 let mut run_start = start;
                 while run_start < end {
                     let style = styles[run_start];
@@ -1510,53 +2148,47 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
                     while run_end < end && styles[run_end] == style {
                         run_end += 1;
                     }
-                    app.squiggle_overlays.push(crate::app::Squiggle {
-                        x: text_area.x + run_start as u16,
-                        y: inner.y + row as u16,
-                        text: visible_chars[run_start..run_end].iter().collect(),
-                        fg: as_rgb(style.fg),
-                        bg: as_rgb(style.bg),
+                    let text: String = visible_chars[run_start..run_end].iter().collect();
+                    render_undercurl(
+                        frame.buffer_mut(),
+                        text_area.x + run_start as u16,
+                        inner.y + row as u16,
+                        &text,
                         curl,
-                    });
+                    );
                     run_start = run_end;
                 }
             }
-            // spell squiggles: same wavy overlay, muted color
+            // spell squiggles: same wavy cells, muted color
             let visible_chars: Vec<char> = visible.chars().collect();
-            let as_rgb = |c: Option<Color>| match c {
-                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
-                _ => None,
-            };
-            let mut wavy = |ranges: &[(usize, usize)], curl: (u8, u8, u8)| {
-                for &(s, e) in ranges {
-                    let end = e.min(visible_chars.len());
-                    let mut run_start = s.min(end);
-                    while run_start < end {
-                        let style = styles[run_start];
-                        let mut run_end = run_start + 1;
-                        while run_end < end && styles[run_end] == style {
-                            run_end += 1;
-                        }
-                        app.squiggle_overlays.push(crate::app::Squiggle {
-                            x: text_area.x + run_start as u16,
-                            y: inner.y + row as u16,
-                            text: visible_chars[run_start..run_end].iter().collect(),
-                            fg: as_rgb(style.fg),
-                            bg: as_rgb(style.bg),
-                            curl,
-                        });
-                        run_start = run_end;
+            for &(s, e) in &spell_ranges {
+                let end = e.min(visible_chars.len());
+                let mut run_start = s.min(end);
+                while run_start < end {
+                    let style = styles[run_start];
+                    let mut run_end = run_start + 1;
+                    while run_end < end && styles[run_end] == style {
+                        run_end += 1;
                     }
+                    let text: String = visible_chars[run_start..run_end].iter().collect();
+                    render_undercurl(
+                        frame.buffer_mut(),
+                        text_area.x + run_start as u16,
+                        inner.y + row as u16,
+                        &text,
+                        SPELL_CURL(),
+                    );
+                    run_start = run_end;
                 }
-            };
-            wavy(&spell_ranges, SPELL_CURL());
+            }
         }
     }
 
     // real terminal cursor on the text — only when the pane is focused
     // and nothing (overlay or leader menu) is drawn on top
     let cursor_allowed = focused && app.overlay.is_none() && !app.leader_pending;
-    if cursor_allowed && editor.command.is_none() && cursor_line >= scroll && cursor_col >= hscroll {
+    if cursor_allowed && editor.command.is_none() && cursor_line >= scroll && cursor_col >= hscroll
+    {
         let row = (cursor_line - scroll) as u16;
         if row < text_area.height {
             let col = (cursor_col - hscroll) as u16;
@@ -1565,21 +2197,105 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         }
     }
 
+    // the gutter rule joins the pane border with proper junctions
+    {
+        let x = inner.x + gutter_width - 1;
+        let buf = frame.buffer_mut();
+        for (y, arm) in [(pane.y, 2u8), (pane.bottom().saturating_sub(1), 1u8)] {
+            let cell = &mut buf[(x, y)];
+            if let Some(arms) = box_arms(cell.symbol())
+                && let Some(merged) = arms_box(arms | arm)
+            {
+                cell.set_symbol(merged);
+            }
+        }
+    }
+
     // scrollbars drawn over the pane borders: vertical right, horizontal
     // bottom (both hide themselves when everything fits)
-    let vbar = Rect::new(
-        pane.right().saturating_sub(1),
-        pane.y + 1,
-        1,
-        pane.height.saturating_sub(2),
-    );
+    // one cell inside the frame, floating over the content edge rather
+    // than sitting on the border line itself
+    let vbar =
+        Rect::new(pane.right().saturating_sub(2), pane.y + 1, 1, pane.height.saturating_sub(2));
     draw_pane_scrollbar(frame, vbar, total_lines, text_height, scroll);
-    let hbar = Rect::new(text_area.x, pane.bottom().saturating_sub(1), text_area.width, 1);
+    let hbar = Rect::new(
+        text_area.x,
+        pane.bottom().saturating_sub(2),
+        text_area.width.saturating_sub(1),
+        1,
+    );
     draw_pane_hscrollbar(frame, hbar, widest, text_area.width as usize, hscroll);
 }
 
-/// Editor variant of the bottom bar: mode │ file │ diagnostics … E/W · pos
-/// · language · branch. The `:` command line also renders here.
+/// Image preview: the decoded image centered in the pane, drawn through
+/// the negotiated terminal graphics protocol — pixel-perfect where the
+/// terminal supports one, colored half-block cells elsewhere.
+fn draw_image_view(frame: &mut Frame, app: &mut App, pane: Rect) {
+    let focused = app.focus == Focus::Terminal;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(focused));
+    let inner = block.inner(pane);
+    frame.render_widget(block, pane);
+    let Some(view) = &mut app.image else { return };
+    if inner.width < 2 || inner.height < 2 {
+        return;
+    }
+    use ratatui_image::{Resize, StatefulImage};
+    let font = app.picker.font_size();
+    let (px_w, px_h) = view.frame_px;
+    // stills may upscale 2x (hidpi cells report physical pixels, so 1x
+    // looks half-size); widget GIFs stay 1x -- every displayed pixel of
+    // every frame is re-encoded and transmitted on these terminals
+    let upscale = if view.frame_count() == 1 { 2 } else { 1 };
+    match view.visual() {
+        // decode still running on its thread; poll() swaps this in
+        crate::imageview::Visual::Loading => {
+            let row = Rect::new(inner.x, inner.y + inner.height / 2, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new("decoding image…")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(STATUS_DIM())),
+                row,
+            );
+        }
+        // Never upscale the widget path: the render area decides how many
+        // pixels get encoded and pushed through the pty — upscaling to
+        // hidpi pane resolution costs megabytes per image, and for a GIF
+        // pays that once per frame. Cap at the natural cell size, centered.
+        crate::imageview::Visual::Widget(protocol) => {
+            let natural_w =
+                (px_w * upscale).div_ceil(font.width.max(1) as u32).min(u16::MAX as u32) as u16;
+            let natural_h =
+                (px_h * upscale).div_ceil(font.height.max(1) as u32).min(u16::MAX as u32) as u16;
+            let fit = protocol.size_for(
+                Resize::Fit(None),
+                ratatui::layout::Size::new(inner.width.min(natural_w), inner.height.min(natural_h)),
+            );
+            let area = Rect::new(
+                inner.x + (inner.width.saturating_sub(fit.width)) / 2,
+                inner.y + (inner.height.saturating_sub(fit.height)) / 2,
+                fit.width.min(inner.width),
+                fit.height.min(inner.height),
+            );
+            frame.render_stateful_widget(StatefulImage::default(), area, protocol);
+        }
+        // kitty animation: pixels were transmitted once, the placeholder
+        // grid scales on the GPU — fill the pane freely
+        crate::imageview::Visual::Anim(anim) => {
+            let (cols, rows) = anim.grid(font, (inner.width, inner.height));
+            let area = Rect::new(
+                inner.x + (inner.width.saturating_sub(cols)) / 2,
+                inner.y + (inner.height.saturating_sub(rows)) / 2,
+                cols.min(inner.width),
+                rows.min(inner.height),
+            );
+            anim.render(area, frame.buffer_mut());
+        }
+    }
+}
+
 /// Read-only hex viewer: structure tree on the left (for recognized
 /// formats), offset + hex + ascii dump on the right. The selected tree
 /// node's byte range is tinted in the dump.
@@ -1588,6 +2304,7 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
     let focused = app.focus == Focus::Terminal;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     let inner = block.inner(pane);
     frame.render_widget(block, pane);
@@ -1605,11 +2322,8 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
 
     // hex layout: dump on top, "pattern data" table pane at the bottom
     let has_tree = !hex.nodes.is_empty();
-    let body_rows = if has_tree && inner.height >= 10 {
-        ((inner.height as usize) / 3).clamp(3, 12)
-    } else {
-        0
-    };
+    let body_rows =
+        if has_tree && inner.height >= 10 { ((inner.height as usize) / 3).clamp(3, 12) } else { 0 };
     // pattern pane = rule + header + body
     let pattern_h = if body_rows > 0 { body_rows as u16 + 2 } else { 0 };
     let dump = Rect::new(inner.x, inner.y, inner.width, inner.height - pattern_h);
@@ -1619,7 +2333,13 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
 
     // 8 hex offset + 2 gap + N*3 hex (+1 mid gap) + 2 gap + N ascii
     let fits = |n: u16| 8 + 2 + n * 3 + 1 + 2 + n <= dump_body.width;
-    let bpr = if fits(16) { 16 } else if fits(8) { 8 } else { 4 };
+    let bpr = if fits(16) {
+        16
+    } else if fits(8) {
+        8
+    } else {
+        4
+    };
     hex.bytes_per_row = bpr as usize;
     hex.viewport_rows = dump_body.height as usize;
     let max_scroll = hex.total_rows().saturating_sub(hex.viewport_rows);
@@ -1683,11 +2403,8 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
         for i in 0..hex.bytes_per_row {
             let offset = base_offset + i;
             let Some(&b) = hex.data.get(offset) else { break };
-            let (ch, fg) = if (0x20..0x7f).contains(&b) {
-                (b as char, label_fg)
-            } else {
-                ('·', zero_fg)
-            };
+            let (ch, fg) =
+                if (0x20..0x7f).contains(&b) { (b as char, label_fg) } else { ('·', zero_fg) };
             let mut style = Style::default().fg(fg);
             if let Some(bg) = byte_bg(hex, offset) {
                 style = style.bg(bg);
@@ -1718,14 +2435,11 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
         )),
         Rect::new(inner.x, rule_y, inner.width, 1),
     );
-    let table_area = Rect::new(
-        inner.x,
-        rule_y + 1,
-        inner.width.saturating_sub(1),
-        body_rows as u16 + 1,
-    );
+    let table_area =
+        Rect::new(inner.x, rule_y + 1, inner.width.saturating_sub(1), body_rows as u16 + 1);
     // click hit-testing targets the body rows below the header
-    app.layout.hex_tree = Rect::new(table_area.x, table_area.y + 1, table_area.width, body_rows as u16);
+    app.layout.hex_tree =
+        Rect::new(table_area.x, table_area.y + 1, table_area.width, body_rows as u16);
 
     let guide_fg = Color::Rgb(70, 74, 84);
     let rows: Vec<ratatui::widgets::Row> = hex
@@ -1808,14 +2522,14 @@ fn draw_hex_view(frame: &mut Frame, app: &mut App, pane: Rect) {
 fn pattern_color(node: usize) -> (Color, Color) {
     type Rgb = (u8, u8, u8);
     const COLORS: [(Rgb, Rgb); 8] = [
-        ((96, 48, 48), (150, 75, 75)),   // red
-        ((52, 82, 50), (82, 130, 78)),   // green
-        ((92, 84, 40), (145, 132, 62)),  // yellow
-        ((44, 62, 92), (70, 98, 145)),   // blue
-        ((84, 50, 88), (132, 78, 138)),  // magenta
-        ((42, 80, 84), (66, 126, 132)),  // cyan
-        ((96, 64, 38), (150, 100, 60)),  // orange
-        ((60, 56, 92), (94, 88, 145)),   // purple
+        ((96, 48, 48), (150, 75, 75)),  // red
+        ((52, 82, 50), (82, 130, 78)),  // green
+        ((92, 84, 40), (145, 132, 62)), // yellow
+        ((44, 62, 92), (70, 98, 145)),  // blue
+        ((84, 50, 88), (132, 78, 138)), // magenta
+        ((42, 80, 84), (66, 126, 132)), // cyan
+        ((96, 64, 38), (150, 100, 60)), // orange
+        ((60, 56, 92), (94, 88, 145)),  // purple
     ];
     let ((dr, dg, db), (br, bg, bb)) = COLORS[node.saturating_sub(1) % COLORS.len()];
     (Color::Rgb(dr, dg, db), Color::Rgb(br, bg, bb))
@@ -1823,7 +2537,13 @@ fn pattern_color(node: usize) -> (Color, Color) {
 
 /// Vertical scrollbar on the right edge of `pane`, hidden when everything
 /// fits.
-fn draw_pane_scrollbar(frame: &mut Frame, pane: Rect, total: usize, viewport: usize, scroll: usize) {
+fn draw_pane_scrollbar(
+    frame: &mut Frame,
+    pane: Rect,
+    total: usize,
+    viewport: usize,
+    scroll: usize,
+) {
     use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
     if total <= viewport || pane.height == 0 || pane.width == 0 {
         return;
@@ -1837,15 +2557,25 @@ fn draw_pane_scrollbar(frame: &mut Frame, pane: Rect, total: usize, viewport: us
             .end_symbol(None)
             .track_symbol(Some("│"))
             .thumb_symbol("┃")
-            .thumb_style(Style::default().fg(adaptive(Color::Rgb(96, 101, 112), Color::Rgb(150, 155, 166))))
-            .track_style(Style::default().fg(adaptive(Color::Rgb(44, 47, 56), Color::Rgb(216, 219, 226)))),
+            .thumb_style(
+                Style::default().fg(adaptive(Color::Rgb(96, 101, 112), Color::Rgb(150, 155, 166))),
+            )
+            .track_style(
+                Style::default().fg(adaptive(Color::Rgb(44, 47, 56), Color::Rgb(216, 219, 226))),
+            ),
         pane,
         &mut state,
     );
 }
 
 /// Horizontal twin of draw_pane_scrollbar, on the bottom edge of `pane`.
-fn draw_pane_hscrollbar(frame: &mut Frame, pane: Rect, total: usize, viewport: usize, scroll: usize) {
+fn draw_pane_hscrollbar(
+    frame: &mut Frame,
+    pane: Rect,
+    total: usize,
+    viewport: usize,
+    scroll: usize,
+) {
     use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
     if total <= viewport || pane.height == 0 || pane.width == 0 {
         return;
@@ -1859,28 +2589,62 @@ fn draw_pane_hscrollbar(frame: &mut Frame, pane: Rect, total: usize, viewport: u
             .end_symbol(None)
             .track_symbol(Some("─"))
             .thumb_symbol("━")
-            .thumb_style(Style::default().fg(adaptive(Color::Rgb(96, 101, 112), Color::Rgb(150, 155, 166))))
-            .track_style(Style::default().fg(adaptive(Color::Rgb(44, 47, 56), Color::Rgb(216, 219, 226)))),
+            .thumb_style(
+                Style::default().fg(adaptive(Color::Rgb(96, 101, 112), Color::Rgb(150, 155, 166))),
+            )
+            .track_style(
+                Style::default().fg(adaptive(Color::Rgb(44, 47, 56), Color::Rgb(216, 219, 226))),
+            ),
         pane,
         &mut state,
     );
 }
 
 /// The app bar while the hex viewer is open: HEX chip, file, selected
+/// Status bar while the image preview is open: name on the left,
+/// pixel dimensions and file size on the right.
+fn draw_image_status_bar(
+    frame: &mut Frame,
+    app: &App,
+    view: &crate::imageview::ImageView,
+    area: Rect,
+) {
+    let chip_bg = chip_accent(6, (136, 192, 208), (60, 120, 150));
+    let mut left = vec![Span::raw(" ")];
+    left.extend(slant_chip(" IMG ".into(), chip_bg, Some(chip_text())));
+    left.push(Span::raw(format!(" {} [read-only]", view.file_name())));
+    if let Some(msg) = &app.status_msg {
+        left.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
+    }
+    let detail = if !view.ready() {
+        "decoding…  ".to_string()
+    } else if view.frame_count() > 1 {
+        format!("{} frames  {}×{}  ", view.frame_count(), view.width, view.height)
+    } else {
+        format!("{}×{}  ", view.width, view.height)
+    };
+    let right = vec![Span::styled(
+        format!("{detail}{}", crate::hex::human_size(view.data.len())),
+        Style::default().fg(STATUS_DIM()),
+    )];
+    let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let pad = (area.width as usize).saturating_sub(left_width + right_width + 1);
+    left.push(Span::raw(" ".repeat(pad)));
+    left.extend(right);
+    left.push(Span::raw(" "));
+    frame.render_widget(
+        Paragraph::new(Line::from(left)).style(Style::default().bg(STATUSBAR_BG())),
+        area,
+    );
+}
+
 /// section with its byte range, total size.
 fn draw_hex_status_bar(frame: &mut Frame, app: &App, hex: &crate::hex::HexView, area: Rect) {
-    let chip_bg = Color::Rgb(180, 142, 173);
-    let mut left = vec![
-        Span::styled(
-            " HEX ",
-            Style::default().bg(chip_bg).fg(Color::Rgb(20, 22, 28)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if crate::color::fancy_glyphs() { "◤" } else { "" },
-            Style::default().fg(chip_bg),
-        ),
-        Span::raw(format!(" {} [read-only]", hex.file_name())),
-    ];
+    let chip_bg = chip_accent(13, (180, 142, 173), (150, 90, 140));
+    let mut left = vec![Span::raw(" ")];
+    left.extend(slant_chip(" HEX ".into(), chip_bg, Some(chip_text())));
+    left.push(Span::raw(format!(" {} [read-only]", hex.file_name())));
     if let Some(msg) = &app.status_msg {
         left.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
     }
@@ -1907,7 +2671,14 @@ fn draw_hex_status_bar(frame: &mut Frame, app: &App, hex: &crate::hex::HexView, 
     );
 }
 
-fn draw_editor_status_bar(frame: &mut Frame, app: &App, editor: &crate::editor::Editor, area: Rect) {
+/// Editor variant of the bottom bar: mode │ file │ diagnostics … E/W · pos
+/// · language · branch. The `:` command line also renders here.
+fn draw_editor_status_bar(
+    frame: &mut Frame,
+    app: &App,
+    editor: &crate::editor::Editor,
+    area: Rect,
+) {
     // `:` command line takes over the whole bar
     if let Some(cmd) = &editor.command {
         frame.render_widget(
@@ -1927,28 +2698,17 @@ fn draw_editor_status_bar(frame: &mut Frame, app: &App, editor: &crate::editor::
     let (cursor_line, cursor_col) = editor.cursor_line_col();
     let dirty = if editor.dirty { " [+]" } else { "" };
     let (chip_bg, chip_fg) = mode_colors(editor.mode);
-    let mut left = vec![
-        Span::styled(
-            format!(" {} ", editor.mode.label()),
-            Style::default().bg(chip_bg).fg(chip_fg).add_modifier(Modifier::BOLD),
-        ),
-        // angled cap, same slant language as the dialog badges
-        Span::styled(
-            if crate::color::fancy_glyphs() { "◤" } else { "" },
-            Style::default().fg(chip_bg),
-        ),
-        Span::raw(format!(" {}{}", editor.file_name(), dirty)),
-    ];
+    let mut left = vec![Span::raw(" ")];
+    left.extend(slant_chip(format!(" {} ", editor.mode.label()), chip_bg, Some(chip_fg)));
+    // branch chip right after the mode chip, same as the app bar
+    if let Some(branch) = &app.git.branch {
+        left.extend(slant_chip(format!(" {branch} "), MENU_TINT(), None));
+    }
+    left.push(Span::raw(format!(" {}{}", editor.file_name(), dirty)));
     if let Some(msg) = &app.status_msg {
-        left.push(Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::Yellow),
-        ));
+        left.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
     } else if let Some(msg) = &editor.status {
-        left.push(Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::Yellow),
-        ));
+        left.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
     } else if let Some(diag) = diagnostics.iter().find(|d| d.line == cursor_line) {
         let msg: String = diag.message.replace('\n', " ").chars().take(80).collect();
         left.push(Span::styled(
@@ -1963,38 +2723,27 @@ fn draw_editor_status_bar(frame: &mut Frame, app: &App, editor: &crate::editor::
     if let Some(prog) = app.lsp.as_ref().and_then(|c| c.progress()) {
         let prog: String = prog.chars().take(40).collect();
         let spin = if crate::color::fancy_glyphs() { "⟳ " } else { "" };
-        right.push(Span::styled(
-            format!("{spin}{prog}   "),
-            Style::default().fg(STATUS_DIM()),
-        ));
+        right.push(Span::styled(format!("{spin}{prog}   "), Style::default().fg(STATUS_DIM())));
     }
     if errors > 0 {
-        right.push(Span::styled(
-            format!("E {errors} "),
-            Style::default().fg(severity_color(1)),
-        ));
+        right.push(Span::styled(format!("E {errors} "), Style::default().fg(severity_color(1))));
     }
     if warnings > 0 {
-        right.push(Span::styled(
-            format!("W {warnings} "),
-            Style::default().fg(severity_color(2)),
-        ));
+        right.push(Span::styled(format!("W {warnings} "), Style::default().fg(severity_color(2))));
     }
-    right.push(Span::styled(
-        format!(
-            "{}:{}  {}",
-            cursor_line + 1,
-            cursor_col + 1,
-            crate::editor::highlight::language_name(&editor.path)
-        ),
-        Style::default().fg(STATUS_DIM()),
-    ));
-    if let Some(branch) = &app.git.branch {
-        right.push(Span::styled(
-            format!("   {branch} "),
-            Style::default().fg(Color::Magenta),
-        ));
+    let selected = editor.selected_chars();
+    if selected > 0 {
+        right.push(Span::styled(format!("{selected} sel "), Style::default().fg(STATUS_DIM())));
     }
+    let mut meta = format!("{}:{}", cursor_line + 1, cursor_col + 1);
+    if let Some(indent) = &editor.indent_label {
+        meta.push_str(&format!(" {indent}"));
+    }
+    meta.push_str(if editor.crlf { " crlf" } else { " lf" });
+    // read_to_string guarantees the buffer is UTF-8
+    meta.push_str(" utf-8");
+    meta.push_str(&format!(" {} ", crate::editor::highlight::language_name(&editor.path)));
+    right.push(Span::styled(meta, Style::default().fg(STATUS_DIM())));
     let left_width: usize = left.iter().map(|s| s.content.chars().count()).sum();
     let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(left_width + right_width);
@@ -2009,6 +2758,10 @@ fn draw_editor_status_bar(frame: &mut Frame, app: &App, editor: &crate::editor::
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // with the editor or hex viewer active, the app bar IS its statusline
     if app.screen == Screen::Workspace && app.shell == Shell::Code {
+        if let Some(view) = &app.image {
+            draw_image_status_bar(frame, app, view, area);
+            return;
+        }
         if let Some(hex) = &app.hex {
             draw_hex_status_bar(frame, app, hex, area);
             return;
@@ -2018,31 +2771,29 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             return;
         }
     }
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
     if app.leader_pending {
-        spans.push(Span::styled(
-            " LEADER ",
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+        spans.extend(slant_chip(
+            " LEADER ".into(),
+            chip_accent(3, (250, 210, 60), (176, 130, 10)),
+            Some(chip_text()),
         ));
     } else {
-        spans.push(Span::styled(
+        spans.extend(slant_chip(
             format!(" {} ", app.shell.label()),
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            chip_accent(6, (134, 220, 214), (1, 132, 188)),
+            Some(chip_text()),
         ));
     }
     if let Some(branch) = &app.git.branch {
-        spans.push(Span::styled(
-            format!("  {branch} "),
-            Style::default().fg(Color::Magenta),
-        ));
+        // quiet menu-tint box — same treatment as the menu-bar chips
+        // (clickable someday); back to back, the caps carve the gap
+        spans.extend(slant_chip(format!(" {branch} "), MENU_TINT(), None));
     }
     // message before the workdir: the path is the least important part and
     // the only span that may safely fall off the right edge
     if let Some(msg) = &app.status_msg {
-        spans.push(Span::styled(
-            format!(" · {msg}"),
-            Style::default().fg(Color::Yellow),
-        ));
+        spans.push(Span::styled(format!(" · {msg}"), Style::default().fg(Color::Yellow)));
     }
     spans.push(Span::styled(
         format!(" · {}", app.workdir.display()),
@@ -2104,10 +2855,7 @@ fn draw_dialog_frame(frame: &mut Frame, rect: Rect, title: &str, phase: f32) {
         i += 1;
         spans.push(Span::styled(
             c.to_string(),
-            Style::default()
-                .bg(at(i))
-                .fg(Color::Rgb(8, 8, 10))
-                .add_modifier(Modifier::BOLD),
+            Style::default().bg(at(i)).fg(Color::Rgb(8, 8, 10)).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(if fancy {
@@ -2127,11 +2875,7 @@ fn dialog_block() -> Block<'static> {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIALOG_BORDER()))
         .padding(Padding::horizontal(1));
-    if crate::color::fancy_glyphs() {
-        block.border_set(HAIRLINE)
-    } else {
-        block
-    }
+    if crate::color::fancy_glyphs() { block.border_set(HAIRLINE) } else { block }
 }
 
 /// Repaint a dialog's border cells with the flowing pastel gradient —
@@ -2165,12 +2909,8 @@ fn rainbow_border(frame: &mut Frame, rect: Rect, phase: f32) {
 /// content into `rect`.
 fn draw_dialog_base(frame: &mut Frame, rect: Rect) {
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(DIALOG_BG())),
-        rect,
-    );
+    frame.render_widget(Block::default().style(Style::default().bg(DIALOG_BG())), rect);
 }
-
 
 // Claude Code-style diff palette: tinted full-width rows on dark background.
 // One accent per side, used for BOTH the line number and the +/- marker, so
@@ -2179,6 +2919,15 @@ fn draw_dialog_base(frame: &mut Frame, rect: Rect) {
 /// Diff accents from the terminal's ANSI green/red when available, and
 /// backgrounds blended from that accent and the real terminal background
 /// (~18% accent) — theme-true tints in both light and dark schemes.
+/// Modified-line gutter marker: the theme's yellow.
+#[allow(non_snake_case)]
+fn MOD_ACCENT() -> Color {
+    match crate::color::ansi16(3) {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => adaptive(Color::Rgb(229, 192, 123), Color::Rgb(176, 130, 10)),
+    }
+}
+
 #[allow(non_snake_case)]
 fn ADD_ACCENT() -> Color {
     match crate::color::ansi16(2) {
@@ -2265,10 +3014,7 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
     match line.kind {
         DiffLineKind::FileHeader => Line::from(vec![
             Span::styled("● ", Style::default().fg(Color::Green)),
-            Span::styled(
-                "Update(",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("Update(", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 line.text.clone(),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2279,17 +3025,13 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
             Span::styled("  └ ", Style::default().fg(Color::DarkGray)),
             Span::styled(line.text.clone(), Style::default().fg(Color::Gray)),
         ]),
-        DiffLineKind::HunkSep => Line::from(Span::styled(
-            "      ⋯",
-            Style::default().fg(Color::DarkGray),
-        )),
+        DiffLineKind::HunkSep => {
+            Line::from(Span::styled("      ⋯", Style::default().fg(Color::DarkGray)))
+        }
         DiffLineKind::Add => {
             let bg = Style::default().bg(ADD_BG());
             let mut spans = vec![
-                Span::styled(
-                    format!("{:>5} ", line.new_no.unwrap_or(0)),
-                    bg.fg(ADD_ACCENT()),
-                ),
+                Span::styled(format!("{:>5} ", line.new_no.unwrap_or(0)), bg.fg(ADD_ACCENT())),
                 Span::styled("+ ", bg.fg(ADD_ACCENT()).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(diff_code_spans(line, Some(ADD_BG())));
@@ -2299,10 +3041,7 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
         DiffLineKind::Remove => {
             let bg = Style::default().bg(REMOVE_BG());
             let mut spans = vec![
-                Span::styled(
-                    format!("{:>5} ", line.old_no.unwrap_or(0)),
-                    bg.fg(REMOVE_ACCENT()),
-                ),
+                Span::styled(format!("{:>5} ", line.old_no.unwrap_or(0)), bg.fg(REMOVE_ACCENT())),
                 Span::styled("- ", bg.fg(REMOVE_ACCENT()).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(diff_code_spans(line, Some(REMOVE_BG())));
@@ -2350,18 +3089,13 @@ fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
         view.lines.len()
     );
     let (diff_total, diff_scroll) = (view.lines.len(), view.scroll);
-    let paragraph = Paragraph::new(visible)
-        .style(Style::default().bg(DIALOG_BG()))
-        .block(dialog_block());
+    let paragraph =
+        Paragraph::new(visible).style(Style::default().bg(DIALOG_BG())).block(dialog_block());
     frame.render_widget(paragraph, area);
     draw_dialog_frame(frame, area, &title, app.welcome.phase);
     // vertical scrollbar over the right border of the dialog
-    let bar = Rect::new(
-        area.right().saturating_sub(1),
-        area.y + 1,
-        1,
-        area.height.saturating_sub(2),
-    );
+    let bar =
+        Rect::new(area.right().saturating_sub(1), area.y + 1, 1, area.height.saturating_sub(2));
     draw_pane_scrollbar(frame, bar, diff_total, inner_height, diff_scroll);
 }
 
@@ -2417,9 +3151,7 @@ fn draw_help_overlay(frame: &mut Frame, phase: f32) {
     };
     draw_dialog_base(frame, rect);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().bg(DIALOG_BG())).block(
-            dialog_block(),
-        ),
+        Paragraph::new(text).style(Style::default().bg(DIALOG_BG())).block(dialog_block()),
         rect,
     );
     draw_dialog_frame(frame, rect, "", phase);
@@ -2449,8 +3181,8 @@ fn draw_prompt(frame: &mut Frame, title: &str, buf: &str, phase: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render(app: &mut App) -> ratatui::buffer::Buffer {
         unsafe { std::env::set_var("VIBIN_FANCY", "1") };
@@ -2461,10 +3193,7 @@ mod tests {
     }
 
     fn bg_count(buf: &ratatui::buffer::Buffer, color: Color) -> usize {
-        buf.content()
-            .iter()
-            .filter(|cell| cell.style().bg == Some(color))
-            .count()
+        buf.content().iter().filter(|cell| cell.style().bg == Some(color)).count()
     }
 
     /// Quadrant corner cells of the hairline dialog border.
@@ -2491,6 +3220,8 @@ mod tests {
     #[test]
     fn dialogs_have_gray_base_and_plain_border() {
         let (_dir, mut app) = test_app();
+        // agents shell: the code shell's home card shares the dialog chrome
+        app.shell = Shell::Agents;
         // no overlay → neither dialog base nor shadow anywhere
         let buf = render(&mut app);
         assert_eq!(bg_count(&buf, DIALOG_BG()), 0);
@@ -2648,25 +3379,23 @@ mod tests {
         app.open_file(&path);
         assert!(app.editor.as_ref().unwrap().spell_check, "spell on by default");
         let buf = render(&mut app);
-        let _ = buf;
-        // the misspelled comment words are recorded as spell-colored squiggles
-        let spell: Vec<&str> = app
-            .squiggle_overlays
-            .iter()
-            .filter(|s| s.curl == SPELL_CURL())
-            .map(|s| s.text.as_str())
-            .collect();
-        let joined = spell.join(" ");
-        assert!(joined.contains("teh"), "flagged 'teh': {spell:?}");
-        assert!(joined.contains("mispeld"), "flagged 'mispeld': {spell:?}");
-        // the correctly-spelled code identifier `ok` is NOT flagged
-        assert!(!spell.contains(&"ok"), "code not spell-checked");
+        // misspelled comment words carry the UNDERCURL modifier in the
+        // spell curl color
+        let (r, g, b) = SPELL_CURL();
+        let is_spell_curl = |c: &ratatui::buffer::Cell| {
+            c.style().add_modifier.contains(crate::backend::UNDERCURL)
+                && c.style().underline_color == Some(Color::Rgb(r, g, b))
+        };
+        let spell: String =
+            buf.content().iter().filter(|c| is_spell_curl(c)).map(|c| c.symbol()).collect();
+        assert!(spell.contains("teh"), "flagged 'teh': {spell:?}");
+        assert!(spell.contains("mispeld"), "flagged 'mispeld': {spell:?}");
+        assert!(!spell.contains("ok"), "code not spell-checked");
 
         // :spell toggles it off
         app.editor.as_mut().unwrap().spell_check = false;
-        app.squiggle_overlays.clear();
-        let _ = render(&mut app);
-        assert!(app.squiggle_overlays.iter().all(|s| s.curl != SPELL_CURL()), "toggled off");
+        let buf = render(&mut app);
+        assert!(!buf.content().iter().any(|c| is_spell_curl(c)), "toggled off");
     }
 
     #[test]
@@ -2714,16 +3443,12 @@ mod tests {
             .any(|c| c.symbol() == "\u{0430}" && c.style().bg == Some(INVISIBLE_BG()));
         assert!(confusable_hit, "confusable highlighted");
         // the invisible nbsp renders as a ▒ on the amber bg
-        let invisible_hit = buf
-            .content()
-            .iter()
-            .any(|c| c.symbol() == "▒" && c.style().bg == Some(INVISIBLE_BG()));
+        let invisible_hit =
+            buf.content().iter().any(|c| c.symbol() == "▒" && c.style().bg == Some(INVISIBLE_BG()));
         assert!(invisible_hit, "invisible char shown as ▒");
         // legitimate 'é' is NOT highlighted
-        let accent_clean = buf
-            .content()
-            .iter()
-            .any(|c| c.symbol() == "é" && c.style().bg != Some(INVISIBLE_BG()));
+        let accent_clean =
+            buf.content().iter().any(|c| c.symbol() == "é" && c.style().bg != Some(INVISIBLE_BG()));
         assert!(accent_clean, "legit accent accepted");
 
         // :unicode toggles it off — nothing carries the highlight bg
@@ -2757,16 +3482,80 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let buf = render(&mut app);
-        assert!(!app.squiggle_overlays.is_empty(), "squiggle recorded");
-        // the span may split into style runs (cursor/selection/syntax);
-        // together they cover the diagnostic range
-        let combined: String = app.squiggle_overlays.iter().map(|s| s.text.as_str()).collect();
+        // the diagnostic span carries the UNDERCURL modifier in the
+        // error-red curl color, covering the whole range
+        let curl_cells: Vec<&ratatui::buffer::Cell> = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().add_modifier.contains(crate::backend::UNDERCURL))
+            .collect();
+        assert!(!curl_cells.is_empty(), "undercurl cells rendered");
+        let combined: String = curl_cells.iter().map(|c| c.symbol()).collect();
         assert_eq!(combined, "fn ");
-        let s = &app.squiggle_overlays[0];
-        assert_eq!(s.curl, (240, 90, 105), "error red curl");
-        // fancy mode: no straight underline in the buffer for that span
-        let cell = &buf[(s.x, s.y)];
-        assert!(!cell.style().add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(
+            curl_cells[0].style().underline_color,
+            Some(Color::Rgb(240, 90, 105)),
+            "error red curl"
+        );
+        // fancy mode: wavy, not the straight-underline fallback
+        assert!(!curl_cells[0].style().add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn hitbox_debug_overlay_outlines_rects() {
+        // call the overlay directly — flipping the env var would race the
+        // other render tests running in parallel
+        let (_dir, mut app) = test_app();
+        unsafe { std::env::set_var("VIBIN_FANCY", "1") };
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw(f, &mut app);
+                draw_hitbox_debug(f, &app);
+            })
+            .unwrap();
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(text.contains("sidebar"), "sidebar hitbox labeled");
+        assert!(text.contains("term"), "terminal hitbox labeled");
+    }
+
+    #[test]
+    fn gutter_rule_joins_the_pane_border() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        app.open_file(&path);
+        let buf = render(&mut app);
+        // find the rule column: the │ right of the line numbers (the pane
+        // top border sits below the two menu-bar rows)
+        let pane_y = 2u16;
+        let row1 = 3u16;
+        let x = (0..buf.area.width)
+            .find(|&x| {
+                buf[(x, row1)].symbol() == "│"
+                    && x > SIDEBAR_WIDTH
+                    && buf[(x, pane_y)].symbol() != "│"
+            })
+            .expect("gutter rule rendered");
+        assert_eq!(buf[(x, pane_y)].symbol(), "┬", "joins the top border");
+        assert_eq!(buf[(x, buf.area.bottom() - 2)].symbol(), "┴", "joins the bottom border");
+    }
+
+    #[test]
+    fn pane_borders_collapse_into_shared_junctions() {
+        let (_dir, mut app) = test_app();
+        app.shell = Shell::Code;
+        let buf = render(&mut app);
+        let x = SIDEBAR_WIDTH - 1; // the shared border column
+        // pane top border sits below the two menu-bar rows
+        let (top, bottom) = (2u16, buf.area.bottom() - 2); // above the status bar
+        assert_eq!(buf[(x, top)].symbol(), "┬", "top junction merged");
+        assert_eq!(buf[(x, bottom)].symbol(), "┴", "bottom junction merged");
+        // single shared line: the next column is pane content, not a border
+        let mid = (top + bottom) / 2;
+        assert_eq!(buf[(x, mid)].symbol(), "│");
+        assert_ne!(buf[(x + 1, mid)].symbol(), "│", "no doubled border");
     }
 
     #[test]
@@ -2791,23 +3580,50 @@ mod tests {
     }
 
     #[test]
+    fn hover_origin_span_gets_a_marker_tint() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "let example = 1;\n").unwrap();
+        app.open_file(&path);
+        app.overlay = Some(Overlay::Hover(crate::app::HoverDoc {
+            text: "docs".into(),
+            scroll: 0,
+            diagnostics: vec![],
+        }));
+        app.hover_doc_pos = Some((0, 6)); // inside "example"
+        let buf = render(&mut app);
+        let tinted: String = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(HOVER_SPAN_BG()))
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(tinted, "example", "exactly the hovered word: {tinted:?}");
+        // popup closed → tint gone
+        app.overlay = None;
+        let buf = render(&mut app);
+        assert!(!buf.content().iter().any(|c| c.style().bg == Some(HOVER_SPAN_BG())));
+    }
+
+    #[test]
     fn hover_footer_is_static_and_tracks_scroll() {
         let (_dir, mut app) = test_app();
         let long: String = (1..=40).map(|i| format!("doc line {i}\n\n")).collect();
-        app.overlay =
-            Some(Overlay::Hover(crate::app::HoverDoc { text: long, scroll: 0, diagnostics: vec![] }));
+        app.overlay = Some(Overlay::Hover(crate::app::HoverDoc {
+            text: long,
+            scroll: 0,
+            diagnostics: vec![],
+        }));
         let footer_row = |buf: &ratatui::buffer::Buffer, rect: Rect| -> String {
             let y = rect.bottom() - 1;
-            (rect.x..rect.right())
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect()
+            (rect.x..rect.right()).map(|x| buf[(x, y)].symbol().to_string()).collect()
         };
         let buf = render(&mut app);
         let rect = app.layout.hover_rect;
         // static header: a rule row, no content on it
         let header: String =
             (rect.x..rect.right()).map(|x| buf[(x, rect.y)].symbol().to_string()).collect();
-        assert!(header.contains("─"), "header rule rendered: {header:?}");
+        assert!(header.contains("═"), "header rule rendered: {header:?}");
         assert!(!header.contains("doc line"), "header row is not content: {header:?}");
         // first content row sits below the header
         let first: String =
@@ -2829,6 +3645,38 @@ mod tests {
     }
 
     #[test]
+    fn hovering_a_link_shows_a_url_preview_chip() {
+        let (_dir, mut app) = test_app();
+        app.overlay = Some(Overlay::Hover(crate::app::HoverDoc {
+            text: "docs: [example](https://example.com/page)".into(),
+            scroll: 0,
+            diagnostics: vec![],
+        }));
+        let _ = render(&mut app);
+        let (hit, _) = app.link_hits[0].clone();
+        // rest the pointer on the link label
+        let changed = app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: hit.x,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(changed, "hovering the link requests a redraw");
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(text.contains("https://example.com/page"), "chip shows the URL");
+        // moving off the link clears the preview
+        let changed = app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: app.layout.hover_rect.x,
+            row: app.layout.hover_rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(changed);
+        assert_eq!(app.hovered_link, None);
+    }
+
+    #[test]
     fn hover_code_panel_padding_is_symmetric() {
         let (_dir, mut app) = test_app();
         app.overlay = Some(Overlay::Hover(crate::app::HoverDoc {
@@ -2846,9 +3694,8 @@ mod tests {
         let code_bg = |x: u16, y: u16| buf[(x, y)].style().bg;
         let row = (rect.y..rect.bottom())
             .find(|&y| {
-                (rect.x..rect.right()).any(|x| {
-                    buf[(x, y)].symbol() == "f" && buf[(x + 1, y)].symbol() == "n"
-                })
+                (rect.x..rect.right())
+                    .any(|x| buf[(x, y)].symbol() == "f" && buf[(x + 1, y)].symbol() == "n")
             })
             .expect("code row rendered");
         let left_inner = code_bg(rect.x + 1, row);
@@ -2908,11 +3755,8 @@ mod tests {
             .expect("link cell rendered");
         assert!(cell.symbol().contains("example"), "label embedded: {:?}", cell.symbol());
         assert!(cell.symbol().ends_with("\x1b]8;;\x1b\\"), "sequence closed");
-        let pos = buf
-            .content()
-            .iter()
-            .position(|c| c.symbol().contains("]8;;https"))
-            .unwrap() as u16;
+        let pos =
+            buf.content().iter().position(|c| c.symbol().contains("]8;;https")).unwrap() as u16;
         let (x, y) = (pos % buf.area.width, pos / buf.area.width);
         assert!(rect.contains(ratatui::layout::Position::new(x, y)), "inside the popup");
         // clicking the link label opens it instead of dismissing the popup
@@ -2933,6 +3777,158 @@ mod tests {
     }
 
     #[test]
+    fn menu_bar_hover_opens_dropdown_and_click_runs_action() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        let moved = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        render(&mut app);
+        // hovering the "View" label opens its dropdown
+        let view = crate::app::MENU_BAR.iter().position(|(l, _)| *l == "View").unwrap();
+        let label = app.layout.menu_items[view];
+        assert!(app.handle_mouse(moved(label.x, label.y)), "hover opens");
+        assert_eq!(app.menu_open, Some(view));
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(text.contains("Agents"), "dropdown entries rendered");
+        // sliding along the bar switches dropdowns without a click
+        let file = app.layout.menu_items[0];
+        assert!(app.handle_mouse(moved(file.x, file.y)));
+        assert_eq!(app.menu_open, Some(0));
+        assert!(app.handle_mouse(moved(label.x, label.y)));
+        render(&mut app);
+        // hover highlights a row, click runs its action (View → Git)
+        let dd = app.layout.menu_dropdown;
+        let git_row = crate::app::MENU_BAR[view].1.iter().position(|(l, _)| *l == "Git").unwrap();
+        let row_y = dd.y + 1 + git_row as u16;
+        assert!(app.handle_mouse(moved(dd.x + 2, row_y)));
+        assert_eq!(app.menu_row, git_row);
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: dd.x + 2,
+            row: row_y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.menu_open, None, "click closes the menu");
+        assert_eq!(app.shell, Shell::Git, "action ran");
+        // moving away from bar and dropdown closes without running anything
+        render(&mut app);
+        let label = app.layout.menu_items[view];
+        app.handle_mouse(moved(label.x, label.y));
+        render(&mut app);
+        assert!(app.handle_mouse(moved(40, 15)));
+        assert_eq!(app.menu_open, None, "stray hover closes");
+    }
+
+    #[test]
+    fn toast_markdown_renders_and_links_click_open() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notify(ToastLevel::Info, "see the [manual](https://example.com/man) for more");
+        let buf = render(&mut app);
+        // the link label is packed into an OSC 8 cell
+        assert!(
+            buf.content().iter().any(|c| c.symbol().contains("\x1b]8;;https://example.com/man")),
+            "toast link becomes an OSC 8 cell"
+        );
+        let (hit, url) = app.link_hits[0].clone();
+        assert_eq!(url, "https://example.com/man");
+        // clicking the link opens it and keeps the toast up
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.status_msg.as_deref(), Some("opened https://example.com/man"));
+        assert_eq!(app.toasts.len(), 1, "link click does not dismiss");
+    }
+
+    #[test]
+    fn buttoned_toasts_stick_and_resolve_on_click() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notify_actions(
+            ToastLevel::Info,
+            "restart server?",
+            vec!["Yes".into(), "No".into()],
+            None,
+        );
+        // sticky: outlives the TTL
+        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        app.tick();
+        assert_eq!(app.toasts.len(), 1, "buttoned toast survives expiry");
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(text.contains("restart server?"));
+        assert!(text.contains(" Yes "));
+        assert!(text.contains(" No "));
+        // hover the second button, then click it
+        let (rect, _, _) =
+            *app.toast_hits.iter().find(|(_, t, b)| *t == 0 && *b == Some(1)).unwrap();
+        let at =
+            |kind| MouseEvent { kind, column: rect.x, row: rect.y, modifiers: KeyModifiers::NONE };
+        assert!(app.handle_mouse(at(MouseEventKind::Moved)));
+        assert_eq!(app.toast_hover, Some((0, 1)));
+        assert!(app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left))));
+        assert!(app.toasts.is_empty(), "click resolves and removes the toast");
+    }
+
+    #[test]
+    fn hovered_toasts_do_not_expire() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notify(ToastLevel::Info, "hover pins me");
+        render(&mut app);
+        let (rect, ..) = app.toast_hits[0];
+        let moved = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // pointer over the card: expiry pauses even far past the TTL
+        app.handle_mouse(moved(rect.x + 1, rect.y));
+        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        app.tick();
+        assert_eq!(app.toasts.len(), 1, "hovered toast survives");
+        // pointer leaves: the timer restarts, then runs out normally
+        app.handle_mouse(moved(5, 20));
+        app.tick();
+        assert_eq!(app.toasts.len(), 1, "fresh TTL after unhover");
+        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        app.tick();
+        assert!(app.toasts.is_empty(), "expires once unhovered");
+    }
+
+    #[test]
+    fn toasts_render_and_expire() {
+        use crate::app::ToastLevel;
+        let (_dir, mut app) = test_app();
+        app.notify(ToastLevel::Info, "toast says hi");
+        app.notify(ToastLevel::Error, "toast says ouch");
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(text.contains("toast says hi"), "info toast rendered");
+        assert!(text.contains("toast says ouch"), "error toast rendered");
+        // an expired toast is pruned by tick (and triggers a redraw)
+        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert!(app.tick());
+        assert_eq!(app.toasts.len(), 1);
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(!text.contains("toast says hi"), "expired toast gone");
+        assert!(text.contains("toast says ouch"), "fresh toast stays");
+    }
+
+    #[test]
     fn whichkey_menu_appears_while_leader_pending() {
         let (_dir, mut app) = test_app();
         let buf = render(&mut app);
@@ -2948,6 +3944,8 @@ mod tests {
     #[test]
     fn prompt_dialog_uses_gray_base() {
         let (_dir, mut app) = test_app();
+        // agents shell: the code shell's home card shares the dialog chrome
+        app.shell = Shell::Agents;
         app.overlay = Some(Overlay::CommitPrompt("msg".into()));
         let buf = render(&mut app);
         assert!(bg_count(&buf, DIALOG_BG()) > 50);

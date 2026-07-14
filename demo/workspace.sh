@@ -78,5 +78,6 @@ fn main() {
     }
 }
 RS
-git init -qb main && git add -A && git commit -qm "init"
+git init -qb main && git add -A
+git -c user.name=demo -c user.email=demo@example.com commit -qm "init"
 printf 'pub struct Remote { pub url: String, pub token: Option<u64> }\n' >> src/remote.rs

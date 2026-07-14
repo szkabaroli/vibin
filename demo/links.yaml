@@ -1,0 +1,35 @@
+# Demo: LSP document links. Open this in vibin with yaml-language-server
+# installed — the $ref values below get the blue link underline. Hover one
+# to see its target in the chip at the bottom; ctrl+click jumps to the
+# referenced schema.
+
+openapi: 3.1.0
+info:
+  title: vibin demo api
+  version: 1.0.0
+paths:
+  /parrots:
+    get:
+      summary: List all parrots
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Parrot"
+  /parrots/{name}:
+    get:
+      summary: One parrot by name
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Parrot"
+components:
+  schemas:
+    Parrot:
+      type: object
+      properties:
+        name: { type: string }
+        vibe: { type: string, enum: [chill, chaotic] }

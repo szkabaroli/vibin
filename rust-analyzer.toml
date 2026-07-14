@@ -1,0 +1,10 @@
+# rust-analyzer project config (workspace ratoml — still work-in-progress
+# upstream; kept minimal).
+
+[check]
+# clippy lints in the diagnostics, not just rustc errors
+command = "clippy"
+
+[imports.granularity]
+# match the codebase style: one `use` per module path
+group = "module"

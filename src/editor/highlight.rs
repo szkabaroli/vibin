@@ -7,7 +7,7 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 
 /// Capture names we recognize, in matching-priority order (tree-sitter
 /// picks the first name that is a prefix of the capture).
-const HIGHLIGHT_NAMES: [&str; 26] = [
+const HIGHLIGHT_NAMES: [&str; 29] = [
     "attribute",
     "comment",
     "constant.builtin",
@@ -36,6 +36,10 @@ const HIGHLIGHT_NAMES: [&str; 26] = [
     // can scan identifier names; see is_spell_region
     "variable",
     "parameter",
+    // diff/patch files (assets/diff-highlights.scm)
+    "diff.plus",
+    "diff.minus",
+    "diff.delta",
 ];
 
 /// Whether a highlight marks text the spell-checker should scan: comments
@@ -76,9 +80,7 @@ pub fn style_for(highlight: usize) -> Style {
         Color::Rgb(r, g, b)
     };
     match HIGHLIGHT_NAMES[highlight] {
-        "comment" => s
-            .fg(ansi(8, (105, 110, 118), (160, 161, 167)))
-            .add_modifier(Modifier::ITALIC),
+        "comment" => s.fg(ansi(8, (105, 110, 118), (160, 161, 167))).add_modifier(Modifier::ITALIC),
         "keyword" | "operator" => s.fg(ansi(5, (183, 148, 244), (166, 38, 164))),
         "function" | "function.method" | "function.builtin" => {
             s.fg(ansi(2, (130, 170, 255), (64, 120, 242)))
@@ -87,11 +89,14 @@ pub fn style_for(highlight: usize) -> Style {
         "function.macro" | "attribute" => s.fg(ansi(5, (134, 220, 214), (1, 132, 188))),
         "string" | "string.special" => s.fg(ansi(10, (152, 195, 121), (80, 161, 79))),
         "escape" => s.fg(ansi(12, (134, 220, 214), (1, 132, 188))),
-        "number" | "constant" | "constant.builtin" => {
-            s.fg(ansi(4, (239, 159, 118), (152, 104, 1)))
-        }
+        "number" | "constant" | "constant.builtin" => s.fg(ansi(4, (239, 159, 118), (152, 104, 1))),
         "type" | "type.builtin" | "constructor" => s.fg(ansi(12, (229, 200, 144), (193, 132, 1))),
         "label" | "tag" => s.fg(ansi(6, (134, 220, 214), (1, 132, 188))),
+        // diff/patch: added green, removed red; the +/-/@@ markers render
+        // teal (split_diff_markers carves them off the line captures)
+        "diff.plus" => s.fg(ansi(10, (152, 195, 121), (80, 161, 79))),
+        "diff.minus" => s.fg(ansi(9, (240, 90, 105), (202, 18, 67))),
+        "diff.delta" => s.fg(ansi(6, (134, 220, 214), (1, 132, 188))),
         // self/this: keyword-colored —
         // red (slot 1) read as a diagnostic, not code
         "variable.builtin" => s.fg(ansi(5, (183, 148, 244), (166, 38, 164))),
@@ -124,9 +129,7 @@ fn filename_language(path: &std::path::Path) -> Option<&'static str> {
         "go.mod" | "go.work" => "gomod",
         // lock files are TOML / JSON / YAML under the hood
         "cargo.lock" | "poetry.lock" | "uv.lock" | "gopls.lock" => "toml",
-        "flake.lock" | "composer.lock" | "deno.lock" | "pipfile.lock" | "cargo.lock.json" => {
-            "json"
-        }
+        "flake.lock" | "composer.lock" | "deno.lock" | "pipfile.lock" | "cargo.lock.json" => "json",
         "podfile.lock" => "yaml",
         // Ruby-DSL manifests (the .lock siblings are custom text, left alone)
         "gemfile" | "rakefile" | "podfile" | "brewfile" | "vagrantfile" | "guardfile"
@@ -160,13 +163,9 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             "",
         ),
         // .xcstrings is Apple's String Catalog — JSON, not XML
-        "json" | "xcstrings" | "jsonc" | "jsonl" | "webmanifest" => (
-            tree_sitter_json::LANGUAGE,
-            "json",
-            tree_sitter_json::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "json" | "xcstrings" | "jsonc" | "jsonl" | "webmanifest" => {
+            (tree_sitter_json::LANGUAGE, "json", tree_sitter_json::HIGHLIGHTS_QUERY, "", "")
+        }
         "js" | "jsx" | "mjs" | "cjs" | "javascript" => (
             tree_sitter_javascript::LANGUAGE,
             "javascript",
@@ -188,27 +187,15 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             tree_sitter_javascript::INJECTIONS_QUERY,
             tree_sitter_typescript::LOCALS_QUERY,
         ),
-        "py" | "python" => (
-            tree_sitter_python::LANGUAGE,
-            "python",
-            tree_sitter_python::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
-        "sh" | "bash" | "zsh" | "shell" | "console" => (
-            tree_sitter_bash::LANGUAGE,
-            "bash",
-            tree_sitter_bash::HIGHLIGHT_QUERY,
-            "",
-            "",
-        ),
-        "yaml" | "yml" => (
-            tree_sitter_yaml::LANGUAGE,
-            "yaml",
-            tree_sitter_yaml::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "py" | "python" => {
+            (tree_sitter_python::LANGUAGE, "python", tree_sitter_python::HIGHLIGHTS_QUERY, "", "")
+        }
+        "sh" | "bash" | "zsh" | "shell" | "console" => {
+            (tree_sitter_bash::LANGUAGE, "bash", tree_sitter_bash::HIGHLIGHT_QUERY, "", "")
+        }
+        "yaml" | "yml" => {
+            (tree_sitter_yaml::LANGUAGE, "yaml", tree_sitter_yaml::HIGHLIGHTS_QUERY, "", "")
+        }
         "dockerfile" | "docker" => (
             dockerfile_language(),
             "dockerfile",
@@ -223,13 +210,9 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             "",
             "",
         ),
-        "toml" => (
-            tree_sitter_toml_ng::LANGUAGE,
-            "toml",
-            tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "toml" => {
+            (tree_sitter_toml_ng::LANGUAGE, "toml", tree_sitter_toml_ng::HIGHLIGHTS_QUERY, "", "")
+        }
         "md" | "markdown" => (
             tree_sitter_md::LANGUAGE,
             "markdown",
@@ -244,48 +227,27 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             tree_sitter_html::INJECTIONS_QUERY,
             "",
         ),
-        _ if is_xml_ext(lang) => (
-            tree_sitter_xml::LANGUAGE_XML,
-            "xml",
-            tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+        _ if is_xml_ext(lang) => {
+            (tree_sitter_xml::LANGUAGE_XML, "xml", tree_sitter_xml::XML_HIGHLIGHT_QUERY, "", "")
+        }
+        "c" | "h" => (tree_sitter_c::LANGUAGE, "c", tree_sitter_c::HIGHLIGHT_QUERY, "", ""),
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" => {
+            (tree_sitter_cpp::LANGUAGE, "cpp", cpp_highlights(), "", "")
+        }
+        "go" | "golang" => {
+            (tree_sitter_go::LANGUAGE, "go", tree_sitter_go::HIGHLIGHTS_QUERY, "", "")
+        }
+        "gomod" => {
+            (gomod_language(), "gomod", include_str!("../../assets/gomod-highlights.scm"), "", "")
+        }
+        "diff" | "patch" => (
+            tree_sitter_diff::LANGUAGE,
+            "diff",
+            include_str!("../../assets/diff-highlights.scm"),
             "",
             "",
         ),
-        "c" | "h" => (
-            tree_sitter_c::LANGUAGE,
-            "c",
-            tree_sitter_c::HIGHLIGHT_QUERY,
-            "",
-            "",
-        ),
-        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" => (
-            tree_sitter_cpp::LANGUAGE,
-            "cpp",
-            cpp_highlights(),
-            "",
-            "",
-        ),
-        "go" | "golang" => (
-            tree_sitter_go::LANGUAGE,
-            "go",
-            tree_sitter_go::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
-        "gomod" => (
-            gomod_language(),
-            "gomod",
-            include_str!("../../assets/gomod-highlights.scm"),
-            "",
-            "",
-        ),
-        "css" => (
-            tree_sitter_css::LANGUAGE,
-            "css",
-            tree_sitter_css::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "css" => (tree_sitter_css::LANGUAGE, "css", tree_sitter_css::HIGHLIGHTS_QUERY, "", ""),
         "php" | "phtml" => (
             tree_sitter_php::LANGUAGE_PHP,
             "php",
@@ -293,22 +255,14 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             tree_sitter_php::INJECTIONS_QUERY,
             "",
         ),
-        "sql" | "ddl" | "dml" | "mysql" | "pgsql" | "psql" => (
-            tree_sitter_sequel::LANGUAGE,
-            "sql",
-            tree_sitter_sequel::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "sql" | "ddl" | "dml" | "mysql" | "pgsql" | "psql" => {
+            (tree_sitter_sequel::LANGUAGE, "sql", tree_sitter_sequel::HIGHLIGHTS_QUERY, "", "")
+        }
         // INI covers .cfg/.conf/.properties, systemd units, and .desktop
         "ini" | "cfg" | "conf" | "cnf" | "properties" | "prefs" | "desktop" | "service"
-        | "socket" | "timer" | "target" | "mount" | "path" | "automount" => (
-            tree_sitter_ini::LANGUAGE,
-            "ini",
-            tree_sitter_ini::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        | "socket" | "timer" | "target" | "mount" | "path" | "automount" => {
+            (tree_sitter_ini::LANGUAGE, "ini", tree_sitter_ini::HIGHLIGHTS_QUERY, "", "")
+        }
         "m" | "objc" | "objective-c" => (
             tree_sitter_objc::LANGUAGE,
             "objc",
@@ -323,13 +277,7 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             tree_sitter_swift::INJECTIONS_QUERY,
             tree_sitter_swift::LOCALS_QUERY,
         ),
-        "java" => (
-            tree_sitter_java::LANGUAGE,
-            "java",
-            tree_sitter_java::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "java" => (tree_sitter_java::LANGUAGE, "java", tree_sitter_java::HIGHLIGHTS_QUERY, "", ""),
         "kt" | "kts" | "kotlin" => (
             tree_sitter_kotlin_ng::LANGUAGE,
             "kotlin",
@@ -358,13 +306,9 @@ pub fn config_for_lang(lang: &str) -> Option<HighlightConfiguration> {
             tree_sitter_odin::INJECTIONS_QUERY,
             tree_sitter_odin::LOCALS_QUERY,
         ),
-        "cs" | "csharp" | "c#" => (
-            tree_sitter_c_sharp::LANGUAGE,
-            "c#",
-            tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
+        "cs" | "csharp" | "c#" => {
+            (tree_sitter_c_sharp::LANGUAGE, "c#", tree_sitter_c_sharp::HIGHLIGHTS_QUERY, "", "")
+        }
         _ => return None,
     };
     // Many grammars (nvim-treesitter lineage) tag nodes with pseudo-captures
@@ -420,11 +364,7 @@ fn gomod_language() -> tree_sitter_language::LanguageFn {
 fn cpp_highlights() -> &'static str {
     static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     QUERY.get_or_init(|| {
-        format!(
-            "{}\n{}",
-            tree_sitter_c::HIGHLIGHT_QUERY,
-            tree_sitter_cpp::HIGHLIGHT_QUERY
-        )
+        format!("{}\n{}", tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY)
     })
 }
 
@@ -467,6 +407,7 @@ pub fn language_name(path: &std::path::Path) -> &'static str {
         "sql" | "ddl" | "dml" => "sql",
         "ini" | "cfg" | "conf" | "cnf" | "properties" | "prefs" | "desktop" | "service"
         | "socket" | "timer" | "target" | "mount" | "path" | "automount" => "ini",
+        "diff" | "patch" => "diff",
         "m" => "objc",
         "swift" => "swift",
         "java" => "java",
@@ -529,9 +470,7 @@ pub fn line_spans(lang: &str, text: &str) -> Vec<HighlightSpan> {
     }
     CONFIGS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let config = cache
-            .entry(lang.to_string())
-            .or_insert_with(|| config_for_lang(lang));
+        let config = cache.entry(lang.to_string()).or_insert_with(|| config_for_lang(lang));
         match config {
             Some(config) => highlight_source(config, text),
             None => Vec::new(),
@@ -597,9 +536,13 @@ impl FileHighlighter {
     /// reparsing — the scroll-only path (buffer unchanged, window moved).
     pub fn window_only(&mut self, window: std::ops::Range<usize>) -> Vec<HighlightSpan> {
         match &self.tree {
-            Some(tree) => {
-                spans_from_tree(&self.config.query, &self.captures, tree, &self.source, Some(window))
-            }
+            Some(tree) => spans_from_tree(
+                &self.config.query,
+                &self.captures,
+                tree,
+                &self.source,
+                Some(window),
+            ),
             None => Vec::new(),
         }
     }
@@ -615,9 +558,8 @@ fn synth_edit(old: &str, new: &str) -> tree_sitter::InputEdit {
         prefix -= 1;
     }
     let max_suffix = old.len().min(new.len()) - prefix;
-    let mut suffix = (0..max_suffix)
-        .take_while(|&i| ob[old.len() - 1 - i] == nb[new.len() - 1 - i])
-        .count();
+    let mut suffix =
+        (0..max_suffix).take_while(|&i| ob[old.len() - 1 - i] == nb[new.len() - 1 - i]).count();
     while !old.is_char_boundary(old.len() - suffix) {
         suffix -= 1;
     }
@@ -722,7 +664,46 @@ fn spans_from_tree(
             highlight: hl as usize,
         });
     }
+    split_diff_markers(&mut spans, source);
     spans
+}
+
+/// The leading `+`/`-` marker of a diff change line is an operator glyph,
+/// like the `@@` of a hunk header — but the grammar lexes the whole line
+/// as one token, so carve the marker (1 char, 3 for `+++`/`---` file
+/// headers) off the front of each change span into `diff.delta`.
+fn split_diff_markers(spans: &mut Vec<HighlightSpan>, source: &str) {
+    let is_change =
+        |hl: usize| matches!(HIGHLIGHT_NAMES.get(hl).copied(), Some("diff.plus" | "diff.minus"));
+    if !spans.iter().any(|s| is_change(s.highlight)) {
+        return;
+    }
+    let Some(delta) = HIGHLIGHT_NAMES.iter().position(|n| *n == "diff.delta") else { return };
+    let mut out = Vec::with_capacity(spans.len());
+    for &span in spans.iter() {
+        let markers = if is_change(span.highlight) {
+            source
+                .as_bytes()
+                .get(span.start..span.end)
+                .map(|b| b.iter().take(3).take_while(|c| matches!(c, b'+' | b'-')).count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if markers > 0 {
+            out.push(HighlightSpan {
+                start: span.start,
+                end: span.start + markers,
+                highlight: delta,
+            });
+            if span.start + markers < span.end {
+                out.push(HighlightSpan { start: span.start + markers, ..span });
+            }
+        } else {
+            out.push(span);
+        }
+    }
+    *spans = out;
 }
 
 /// Highlight the whole source. Returns byte-ranged spans (non-overlapping,
@@ -742,15 +723,12 @@ pub fn highlight_source(config: &HighlightConfiguration, source: &str) -> Vec<Hi
             }
             HighlightEvent::Source { start, end } => {
                 if let Some(&highlight) = stack.last() {
-                    spans.push(HighlightSpan {
-                        start,
-                        end,
-                        highlight,
-                    });
+                    spans.push(HighlightSpan { start, end, highlight });
                 }
             }
         }
     }
+    split_diff_markers(&mut spans, source);
     spans
 }
 
@@ -762,6 +740,39 @@ mod tests {
     /// The incremental highlighter's query-cursor extraction must agree
     /// with the tree-sitter-highlight event stream (the path markdown and
     /// diffs still use), or colors would shift after the first keystroke.
+    #[test]
+    fn diff_files_highlight_additions_and_deletions() {
+        assert_eq!(language_name(Path::new("fix.patch")), "diff");
+        assert_eq!(language_name(Path::new("changes.diff")), "diff");
+        let src = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n";
+        let mut inc = FileHighlighter::new(config_for_lang("patch").unwrap()).unwrap();
+        let spans = inc.highlight(src.to_string());
+        let name_at = |pos: usize| {
+            spans
+                .iter()
+                .find(|s| s.start <= pos && pos < s.end)
+                .and_then(|s| HIGHLIGHT_NAMES.get(s.highlight).copied())
+        };
+        let plus = src.find("+new").unwrap();
+        let minus = src.find("-old").unwrap();
+        let hunk = src.find("@@").unwrap();
+        // the +/- markers read as operators, like the @@ header…
+        assert_eq!(name_at(plus), Some("diff.delta"));
+        assert_eq!(name_at(minus), Some("diff.delta"));
+        assert_eq!(name_at(hunk), Some("diff.delta"));
+        // …while the line content keeps the add/remove colors
+        assert_eq!(name_at(plus + 1), Some("diff.plus"));
+        assert_eq!(name_at(minus + 1), Some("diff.minus"));
+        // the +++/--- file headers split their triple marker the same way
+        let header = src.find("+++").unwrap();
+        assert_eq!(name_at(header + 2), Some("diff.delta"));
+        assert_eq!(name_at(header + 4), Some("diff.plus"));
+        // no backgrounds anywhere in the diff styles
+        let idx = |name: &str| HIGHLIGHT_NAMES.iter().position(|n| *n == name).unwrap();
+        assert!(style_for(idx("diff.plus")).bg.is_none());
+        assert!(style_for(idx("diff.minus")).bg.is_none());
+    }
+
     #[test]
     fn incremental_matches_event_stream_extraction() {
         let src = include_str!("../spell.rs");
@@ -808,9 +819,7 @@ mod tests {
         let mut inc = FileHighlighter::new(config_for_lang("rust").unwrap()).unwrap();
         let full = inc.highlight(src.to_string());
         // a window on line boundaries somewhere in the middle of the file
-        let nth_line = |n: usize| {
-            src.split_inclusive('\n').take(n).map(str::len).sum::<usize>()
-        };
+        let nth_line = |n: usize| src.split_inclusive('\n').take(n).map(str::len).sum::<usize>();
         let (lo, hi) = (nth_line(40), nth_line(120));
         let windowed = inc.window_only(lo..hi);
         let clipped: Vec<HighlightSpan> = full
@@ -830,12 +839,8 @@ mod tests {
         let spans = highlight_source(&config, src);
         assert!(!spans.is_empty());
         let text_of = |span: &HighlightSpan| &src[span.start..span.end];
-        let named = |name: &str| {
-            spans
-                .iter()
-                .find(|s| HIGHLIGHT_NAMES[s.highlight] == name)
-                .map(text_of)
-        };
+        let named =
+            |name: &str| spans.iter().find(|s| HIGHLIGHT_NAMES[s.highlight] == name).map(text_of);
         assert_eq!(named("keyword"), Some("fn"));
         assert!(named("string").is_some());
     }
@@ -862,9 +867,9 @@ mod tests {
 
     #[test]
     fn all_languages_have_working_configs() {
-        for file in [
-            "a.rs", "a.json", "a.js", "a.ts", "a.py", "a.sh", "a.toml", "a.md", "a.yaml", "a.yml",
-        ] {
+        for file in
+            ["a.rs", "a.json", "a.js", "a.ts", "a.py", "a.sh", "a.toml", "a.md", "a.yaml", "a.yml"]
+        {
             let config = config_for(Path::new(file));
             assert!(config.is_some(), "config for {file}");
         }
@@ -918,7 +923,8 @@ mod tests {
 
     #[test]
     fn dockerfile_is_detected_by_filename_and_highlighted() {
-        for file in ["Dockerfile", "dockerfile", "Dockerfile.prod", "Containerfile", "x.dockerfile"] {
+        for file in ["Dockerfile", "dockerfile", "Dockerfile.prod", "Containerfile", "x.dockerfile"]
+        {
             assert!(config_for(Path::new(file)).is_some(), "config for {file}");
         }
         assert_eq!(language_name(Path::new("Dockerfile")), "dockerfile");
@@ -940,9 +946,7 @@ mod tests {
         let src = "<!DOCTYPE html>\n<div class=\"box\">hi</div>\n";
         let spans = highlight_source(&config, src);
         assert!(!spans.is_empty());
-        let named = |name: &str| {
-            spans.iter().any(|s| HIGHLIGHT_NAMES[s.highlight] == name)
-        };
+        let named = |name: &str| spans.iter().any(|s| HIGHLIGHT_NAMES[s.highlight] == name);
         assert!(named("tag"), "tags highlighted");
         assert!(named("attribute"), "attributes highlighted");
     }
@@ -1047,10 +1051,7 @@ mod tests {
         // @nospell isn't clobbered by the @spell rule
         assert_eq!(strip_pseudo_captures("(u) @string @nospell"), "(u) @string");
         // untouched when there's nothing to strip
-        assert!(matches!(
-            strip_pseudo_captures("(x) @keyword"),
-            std::borrow::Cow::Borrowed(_)
-        ));
+        assert!(matches!(strip_pseudo_captures("(x) @keyword"), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
@@ -1063,8 +1064,16 @@ mod tests {
         assert!(has("property"), "keys highlighted");
         assert!(has("comment"), "comments highlighted");
         // extensions and INI-format dotfiles all route to the ini grammar
-        for file in ["nginx.conf", "my.cnf", "app.service", "shortcut.desktop", ".gitconfig",
-            ".editorconfig", "tox.ini", "setup.cfg"] {
+        for file in [
+            "nginx.conf",
+            "my.cnf",
+            "app.service",
+            "shortcut.desktop",
+            ".gitconfig",
+            ".editorconfig",
+            "tox.ini",
+            "setup.cfg",
+        ] {
             assert_eq!(language_name(Path::new(file)), "ini", "{file}");
             assert!(config_for(Path::new(file)).is_some(), "config for {file}");
         }
@@ -1073,8 +1082,8 @@ mod tests {
     #[test]
     fn go_mod_is_highlighted_by_filename() {
         for file in ["go.mod", "go.work"] {
-            let config = config_for(Path::new(file))
-                .unwrap_or_else(|| panic!("no config for {file}"));
+            let config =
+                config_for(Path::new(file)).unwrap_or_else(|| panic!("no config for {file}"));
             let src = "module example.com/x\n\ngo 1.22\n\nrequire foo v1.2.3\n";
             let spans = highlight_source(&config, src);
             assert!(!spans.is_empty(), "spans for {file}");

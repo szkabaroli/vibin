@@ -158,7 +158,6 @@ fn parse_structure(data: &[u8]) -> Vec<HexNode> {
     crate::pattern::match_and_evaluate(data).unwrap_or_default()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

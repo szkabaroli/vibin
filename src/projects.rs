@@ -24,10 +24,7 @@ pub struct RecentProject {
 impl RecentProject {
     /// Compact "how long ago" label: 42s, 5m, 3h, 2d.
     pub fn age(&self, now: SystemTime) -> String {
-        let secs = now
-            .duration_since(self.last_active)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let secs = now.duration_since(self.last_active).map(|d| d.as_secs()).unwrap_or(0);
         match secs {
             0..=59 => format!("{secs}s"),
             60..=3599 => format!("{}m", secs / 60),
@@ -61,10 +58,8 @@ pub fn discover(projects_dir: Option<PathBuf>) -> Vec<RecentProject> {
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let modified = file
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let modified =
+                    file.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
                 transcripts.push((modified, path));
             }
         }
@@ -78,11 +73,7 @@ pub fn discover(projects_dir: Option<PathBuf>) -> Vec<RecentProject> {
         if !cwd.exists() {
             continue; // project was moved or deleted
         }
-        projects.push(RecentProject {
-            path: cwd,
-            last_active,
-            chat_count: transcripts.len(),
-        });
+        projects.push(RecentProject { path: cwd, last_active, chat_count: transcripts.len() });
     }
     projects.sort_by_key(|p| std::cmp::Reverse(p.last_active));
     projects.dedup_by(|a, b| a.path == b.path);

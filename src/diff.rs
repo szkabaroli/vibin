@@ -29,13 +29,7 @@ pub struct DiffLine {
 
 impl DiffLine {
     fn plain(kind: DiffLineKind, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            old_no: None,
-            new_no: None,
-            text: text.into(),
-            lang: None,
-        }
+        Self { kind, old_no: None, new_no: None, text: text.into(), lang: None }
     }
 }
 
@@ -62,11 +56,82 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
 
 /// "diff --git a/src/x.rs b/src/x.rs" → "src/x.rs" (the new side).
 fn parse_file_path(line: &str) -> String {
-    line.rsplit(" b/")
-        .next()
-        .unwrap_or(line)
-        .trim()
-        .to_string()
+    line.rsplit(" b/").next().unwrap_or(line).trim().to_string()
+}
+
+/// Per-line change markers for the editor gutter, VS Code style: which
+/// current-buffer lines are added or modified vs. HEAD, and the line
+/// indices where deletions happened (a marker between line i-1 and i;
+/// index == line count means lines were deleted at the end).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GutterDiff {
+    pub added: std::collections::HashSet<usize>,
+    pub modified: std::collections::HashSet<usize>,
+    pub deleted_at: std::collections::HashSet<usize>,
+    /// Raw hunks as (base line range, current line range) — for showing
+    /// the old content when a marker is hovered.
+    pub hunks: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+}
+
+impl GutterDiff {
+    /// The hunk whose gutter markers include `line` (current-buffer
+    /// indices; `total` = current line count, for EOF deletion markers).
+    pub fn hunk_at(
+        &self,
+        line: usize,
+        total: usize,
+    ) -> Option<&(std::ops::Range<usize>, std::ops::Range<usize>)> {
+        self.hunks.iter().find(|(b, a)| {
+            a.contains(&line)
+                || (a.is_empty() && (a.start == line || (a.start >= total && line + 1 >= total)))
+                || (!b.is_empty() && b.len() > a.len() && a.end == line)
+        })
+    }
+
+    /// The rows whose markers belong to that hunk — the fill range for
+    /// hover highlighting (deletion boundaries occupy one row).
+    pub fn hover_range(&self, line: usize, total: usize) -> Option<std::ops::Range<usize>> {
+        let (before, after) = self.hunk_at(line, total)?;
+        Some(if after.is_empty() {
+            let row = after.start.min(total.saturating_sub(1));
+            row..row + 1
+        } else if before.len() > after.len() {
+            after.start..(after.end + 1).min(total)
+        } else {
+            after.clone()
+        })
+    }
+}
+
+/// Line-diff `current` against `base` (imara-diff histogram, the same
+/// algorithm git uses) into gutter markers.
+pub fn gutter_diff(base: &str, current: &str) -> GutterDiff {
+    use imara_diff::intern::InternedInput;
+    use imara_diff::{Algorithm, diff};
+    let input = InternedInput::new(base, current);
+    let mut out = GutterDiff::default();
+    diff(
+        Algorithm::Histogram,
+        &input,
+        |before: std::ops::Range<u32>, after: std::ops::Range<u32>| {
+            out.hunks.push((
+                before.start as usize..before.end as usize,
+                after.start as usize..after.end as usize,
+            ));
+            if before.is_empty() {
+                out.added.extend(after.start as usize..after.end as usize);
+            } else if after.is_empty() {
+                out.deleted_at.insert(after.start as usize);
+            } else {
+                out.modified.extend(after.start as usize..after.end as usize);
+                // replacement that also shrank: some lines vanished here too
+                if before.len() > after.len() {
+                    out.deleted_at.insert(after.end as usize);
+                }
+            }
+        },
+    );
+    out
 }
 
 pub fn parse(text: &str) -> Vec<DiffLine> {
@@ -79,20 +144,20 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
     let mut in_hunk = false;
     let mut lang: Option<&'static str> = None;
 
-    let close_file = |out: &mut Vec<DiffLine>, stat_idx: &mut Option<usize>, adds: &mut u32, dels: &mut u32| {
-        if let Some(idx) = stat_idx.take() {
-            out[idx].text = stat_text(*adds, *dels);
-        }
-        *adds = 0;
-        *dels = 0;
-    };
+    let close_file =
+        |out: &mut Vec<DiffLine>, stat_idx: &mut Option<usize>, adds: &mut u32, dels: &mut u32| {
+            if let Some(idx) = stat_idx.take() {
+                out[idx].text = stat_text(*adds, *dels);
+            }
+            *adds = 0;
+            *dels = 0;
+        };
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             close_file(&mut out, &mut stat_idx, &mut adds, &mut dels);
             let path = parse_file_path(rest);
-            let name =
-                crate::editor::highlight::language_name(std::path::Path::new(&path));
+            let name = crate::editor::highlight::language_name(std::path::Path::new(&path));
             lang = (name != "text").then_some(name);
             out.push(DiffLine::plain(DiffLineKind::FileHeader, path));
             out.push(DiffLine::plain(DiffLineKind::FileStat, String::new()));
@@ -165,11 +230,7 @@ pub struct DiffView {
 
 impl DiffView {
     pub fn new(title: impl Into<String>, text: &str) -> Self {
-        Self {
-            title: title.into(),
-            lines: parse(text),
-            scroll: 0,
-        }
+        Self { title: title.into(), lines: parse(text), scroll: 0 }
     }
 
     pub fn scroll_down(&mut self, amount: usize, viewport_height: usize) {
@@ -184,6 +245,32 @@ impl DiffView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gutter_diff_classifies_changes() {
+        use super::gutter_diff;
+        let base = "one\ntwo\nthree\nfour\n";
+        // line 1 modified, a line inserted after it, "three" deleted
+        let cur = "one\nTWO!\nnew line\nfour\n";
+        let d = gutter_diff(base, cur);
+        assert!(d.modified.contains(&1), "{d:?}");
+        assert!(d.added.contains(&2) || d.modified.contains(&2), "{d:?}");
+        assert!(!d.added.contains(&0) && !d.modified.contains(&0), "{d:?}");
+        assert!(!d.added.contains(&3) && !d.modified.contains(&3), "{d:?}");
+
+        // pure deletion: marker at the boundary, no line marks
+        let d = gutter_diff("a\nb\nc\n", "a\nc\n");
+        assert_eq!(d.deleted_at.iter().copied().collect::<Vec<_>>(), vec![1], "{d:?}");
+        assert!(d.added.is_empty() && d.modified.is_empty());
+
+        // deletion at the end
+        let d = gutter_diff("a\nb\nc\n", "a\n");
+        assert!(d.deleted_at.contains(&1), "{d:?}");
+
+        // identical → clean
+        let d = gutter_diff("x\ny\n", "x\ny\n");
+        assert_eq!(d, super::GutterDiff::default());
+    }
+
     use super::*;
 
     const SAMPLE: &str = "diff --git a/a.txt b/a.txt\nindex 111..222 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -10,3 +10,3 @@ fn ctx()\n context one\n-removed line\n+added line\n context two\n";

@@ -12,6 +12,21 @@ pub struct TreeItem {
     pub depth: usize,
     pub is_dir: bool,
     pub expanded: bool,
+    /// The entry is a symlink (dir/file classification follows its target;
+    /// the tree renders a link badge next to the name).
+    pub is_symlink: bool,
+}
+
+/// Directory test that sees through symlinks: `DirEntry::file_type` is the
+/// link's own type, so a symlink to a directory would classify as a file
+/// (and opening it fails with "is a directory"). Stat the target instead;
+/// broken links fall back to "not a dir".
+pub fn entry_is_dir(entry: &fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(t) if t.is_symlink() => fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false),
+        Ok(t) => t.is_dir(),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug)]
@@ -61,7 +76,7 @@ impl FileTree {
         let Ok(read) = fs::read_dir(dir) else {
             return;
         };
-        let mut entries: Vec<(String, PathBuf, bool)> = read
+        let mut entries: Vec<(String, PathBuf, bool, bool)> = read
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -71,24 +86,18 @@ impl FileTree {
                 if !self.show_hidden && name.starts_with('.') {
                     return None;
                 }
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some((name, e.path(), is_dir))
+                let is_dir = entry_is_dir(&e);
+                let is_symlink = e.file_type().is_ok_and(|t| t.is_symlink());
+                Some((name, e.path(), is_dir, is_symlink))
             })
             .collect();
         // Directories first, then files, each alphabetically (case-insensitive).
         entries.sort_by(|a, b| {
-            b.2.cmp(&a.2)
-                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
-        for (name, path, is_dir) in entries {
+        for (name, path, is_dir, is_symlink) in entries {
             let expanded = is_dir && self.expanded.contains(&path);
-            out.push(TreeItem {
-                path: path.clone(),
-                name,
-                depth,
-                is_dir,
-                expanded,
-            });
+            out.push(TreeItem { path: path.clone(), name, depth, is_dir, expanded, is_symlink });
             if expanded {
                 self.walk(&path, depth + 1, out);
             }
@@ -137,9 +146,10 @@ impl FileTree {
             return;
         }
         if let Some(parent) = item.path.parent().map(Path::to_path_buf)
-            && let Some(idx) = self.items.iter().position(|i| i.path == parent) {
-                self.selected = idx;
-            }
+            && let Some(idx) = self.items.iter().position(|i| i.path == parent)
+        {
+            self.selected = idx;
+        }
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -170,6 +180,33 @@ mod tests {
 
     fn names(tree: &FileTree) -> Vec<String> {
         tree.items.iter().map(|i| i.name.clone()).collect()
+    }
+
+    #[test]
+    fn symlinked_directories_classify_by_target() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        create_dir_all(root.join("real")).unwrap();
+        write(root.join("real/inner.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("linkdir")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), root.join("broken")).unwrap();
+        let mut tree = FileTree::new(root);
+        let linkdir = tree.items.iter().find(|i| i.name == "linkdir").unwrap();
+        assert!(linkdir.is_dir, "symlink to a directory sorts and opens as one");
+        let broken = tree.items.iter().find(|i| i.name == "broken").unwrap();
+        assert!(!broken.is_dir, "broken symlink stays a file");
+        // both carry the link badge flag; real entries don't
+        assert!(
+            tree.items
+                .iter()
+                .filter(|i| i.name == "linkdir" || i.name == "broken")
+                .all(|i| i.is_symlink)
+        );
+        assert!(!tree.items.iter().find(|i| i.name == "real").unwrap().is_symlink);
+        // and it expands into the target's contents
+        tree.selected = tree.items.iter().position(|i| i.name == "linkdir").unwrap();
+        tree.toggle_selected();
+        assert!(names(&tree).contains(&"inner.txt".to_string()));
     }
 
     #[test]

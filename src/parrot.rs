@@ -25,8 +25,26 @@ pub struct Frame {
 /// Decoded, downscaled animation frames. Empty if the embedded GIF is
 /// somehow undecodable (the welcome screen then simply has no parrot).
 pub fn frames() -> &'static [Frame] {
-    static FRAMES: OnceLock<Vec<Frame>> = OnceLock::new();
-    FRAMES.get_or_init(|| decode().unwrap_or_default())
+    // one cache per theme: outline tinting (see `themed`) bakes the
+    // wash color into the spans, and it differs between light and dark
+    static DARK: OnceLock<Vec<Frame>> = OnceLock::new();
+    static LIGHT: OnceLock<Vec<Frame>> = OnceLock::new();
+    let slot = if crate::color::is_light() { &LIGHT } else { &DARK };
+    slot.get_or_init(|| decode().unwrap_or_default())
+}
+
+/// The artwork's outline strokes are near-black ink; on a terminal they
+/// should read like the UI's own lines. Retint dark pixels toward the
+/// theme's grey wash — soft on parchment, subtle on dark — leaving the
+/// plumage untouched. Without OSC answers, the original color stands.
+fn themed(c: (u8, u8, u8)) -> Color {
+    let lum = (c.0 as u32 * 299 + c.1 as u32 * 587 + c.2 as u32 * 114) / 1000;
+    if lum < 80
+        && let Some((r, g, b)) = crate::color::wash(150)
+    {
+        return Color::Rgb(r, g, b);
+    }
+    Color::Rgb(c.0, c.1, c.2)
 }
 
 type Rgba = Option<(u8, u8, u8)>;
@@ -100,9 +118,8 @@ fn decode() -> Option<Vec<Frame>> {
     let frames = composited
         .iter()
         .map(|canvas| {
-            let cropped: Vec<Rgba> = (y0..y1)
-                .flat_map(|y| (x0..x1).map(move |x| canvas[y * gw + x]))
-                .collect();
+            let cropped: Vec<Rgba> =
+                (y0..y1).flat_map(|y| (x0..x1).map(move |x| canvas[y * gw + x])).collect();
             downscale(&cropped, bw, bh)
         })
         .collect();
@@ -111,9 +128,8 @@ fn decode() -> Option<Vec<Frame>> {
 
 /// Quadrant glyph for a 2x2 pixel mask (bit 8 = top-left, 4 = top-right,
 /// 2 = bottom-left, 1 = bottom-right).
-const QUADRANTS: [char; 16] = [
-    ' ', '▗', '▖', '▄', '▝', '▐', '▞', '▟', '▘', '▚', '▌', '▙', '▀', '▜', '▛', '█',
-];
+const QUADRANTS: [char; 16] =
+    [' ', '▗', '▖', '▄', '▝', '▐', '▞', '▟', '▘', '▚', '▌', '▙', '▀', '▜', '▛', '█'];
 
 /// Downscale to a pixel grid, then pack 2x2 pixel groups into quadrant
 /// cells (two colors per cell). Compared to plain half-blocks this doubles
@@ -147,10 +163,7 @@ fn downscale(canvas: &[Rgba], gw: usize, gh: usize) -> Frame {
             .collect();
         lines.push(Line::from(spans));
     }
-    Frame {
-        lines,
-        width: cols as u16,
-    }
+    Frame { lines, width: cols as u16 }
 }
 
 /// Render a 2x2 pixel group as one quadrant cell. Opaque pixels split into
@@ -162,7 +175,7 @@ fn quad_span(quad: [Rgba; 4]) -> Span<'static> {
     if opaque.is_empty() {
         return Span::raw(" ");
     }
-    let rgb = |c: (u8, u8, u8)| Color::Rgb(c.0, c.1, c.2);
+    let rgb = themed;
     let bit = |i: usize| 8 >> i;
     let dist = |a: (u8, u8, u8), b: (u8, u8, u8)| {
         let d = |x: u8, y: u8| (x as i32 - y as i32).pow(2);
@@ -221,9 +234,7 @@ fn quad_span(quad: [Rgba; 4]) -> Span<'static> {
     let avg = |s: (u32, u32, u32), n: u32| ((s.0 / n) as u8, (s.1 / n) as u8, (s.2 / n) as u8);
     Span::styled(
         QUADRANTS[mask].to_string(),
-        Style::default()
-            .fg(rgb(avg(fg_sum, fg_n)))
-            .bg(rgb(avg(bg_sum, bg_n))),
+        Style::default().fg(rgb(avg(fg_sum, fg_n))).bg(rgb(avg(bg_sum, bg_n))),
     )
 }
 
@@ -300,7 +311,15 @@ fn fill_interior_holes(grid: &mut [Rgba], pw: usize, ph: usize) {
 /// Most common color in the source box for target pixel (x, y); transparent
 /// wins only when it covers at least half the box. Ties prefer darker colors
 /// so outlines survive.
-fn dominant(canvas: &[Rgba], gw: usize, gh: usize, x: usize, y: usize, pw: usize, ph: usize) -> Rgba {
+fn dominant(
+    canvas: &[Rgba],
+    gw: usize,
+    gh: usize,
+    x: usize,
+    y: usize,
+    pw: usize,
+    ph: usize,
+) -> Rgba {
     let (x0, x1) = (x * gw / pw, ((x + 1) * gw / pw).max(x * gw / pw + 1).min(gw));
     let (y0, y1) = (y * gh / ph, ((y + 1) * gh / ph).max(y * gh / ph + 1).min(gh));
     // quantized color key → (count, channel sums)
@@ -319,9 +338,9 @@ fn dominant(canvas: &[Rgba], gw: usize, gh: usize, x: usize, y: usize, pw: usize
                     let key = (r & 0xF0, g & 0xF0, b & 0xF0);
                     let entry = buckets.entry(key).or_insert((0, (0, 0, 0)));
                     entry.0 += 1;
-                    entry.1 .0 += r as u32;
-                    entry.1 .1 += g as u32;
-                    entry.1 .2 += b as u32;
+                    entry.1.0 += r as u32;
+                    entry.1.1 += g as u32;
+                    entry.1.2 += b as u32;
                 }
             }
         }
@@ -337,7 +356,6 @@ fn dominant(canvas: &[Rgba], gw: usize, gh: usize, x: usize, y: usize, pw: usize
         })
         .map(|(_, (count, (r, g, b)))| ((r / count) as u8, (g / count) as u8, (b / count) as u8))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -378,17 +396,10 @@ mod tests {
         // If disposal were ignored, each frame would be the union of all
         // previous ones and opaque coverage would grow monotonically.
         let opaque = |f: &Frame| {
-            f.lines
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .filter(|s| s.content != " ")
-                .count()
+            f.lines.iter().flat_map(|l| l.spans.iter()).filter(|s| s.content != " ").count()
         };
         let counts: Vec<usize> = frames().iter().map(opaque).collect();
-        let (min, max) = (
-            *counts.iter().min().unwrap(),
-            *counts.iter().max().unwrap(),
-        );
+        let (min, max) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
         // poses legitimately vary in size (48..71 cells); ghosting would
         // push later frames toward the union of all silhouettes (~2x min)
         assert!(

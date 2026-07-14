@@ -40,6 +40,8 @@ pub enum EditorEvent {
     GotoDefinition,
     /// Ctrl+O — jump back to where we came from.
     JumpBack,
+    /// `:fmt` — ask the language server to format the buffer.
+    Format,
     /// Esc with nothing to cancel — hand focus back to the app.
     FocusOut,
     /// The buffer was written (`:w` / `:wq`) — notify the language server.
@@ -111,13 +113,50 @@ pub struct Editor {
     /// Underline non-ASCII characters (toggled with `:unicode`) — surfaces
     /// accidental Unicode, confusables, and smart quotes in source.
     pub mark_unicode: bool,
+    /// Detected at open: the file uses CRLF line endings.
+    pub crlf: bool,
+    /// Indentation detected at open ("tabs", "4 spaces"), if the file
+    /// has any indented lines.
+    pub indent_label: Option<String>,
+}
+
+/// Guess a file's indentation from its leading whitespace (first ~1000
+/// lines): tabs if tab-indented lines dominate, otherwise the gcd of the
+/// leading-space widths (4,8,12 → "4 spaces").
+fn detect_indent(text: &str) -> Option<String> {
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let (mut tab_lines, mut space_lines, mut unit) = (0usize, 0usize, 0usize);
+    for line in text.lines().take(1000) {
+        if line.starts_with('\t') {
+            tab_lines += 1;
+        } else {
+            let spaces = line.chars().take_while(|&c| c == ' ').count();
+            if spaces > 0 && line.len() > spaces {
+                space_lines += 1;
+                unit = gcd(unit, spaces);
+            }
+        }
+    }
+    if tab_lines > space_lines {
+        Some("tabs".into())
+    } else if unit > 0 {
+        Some(format!("{unit} spaces"))
+    } else {
+        None
+    }
 }
 
 impl Editor {
     pub fn open(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let crlf = text.contains("\r\n");
+        let indent_label = detect_indent(&text);
         Ok(Self {
+            crlf,
+            indent_label,
             highlighter: highlight::config_for(&path).and_then(highlight::FileHighlighter::new),
             path,
             text: Rope::from_str(&text),
@@ -156,11 +195,7 @@ impl Editor {
     pub fn save(&mut self) -> Result<()> {
         std::fs::write(&self.path, self.text.to_string())?;
         self.dirty = false;
-        self.status = Some(format!(
-            "wrote {} ({} lines)",
-            self.file_name(),
-            self.text.len_lines()
-        ));
+        self.status = Some(format!("wrote {} ({} lines)", self.file_name(), self.text.len_lines()));
         Ok(())
     }
 
@@ -199,6 +234,16 @@ impl Editor {
         (lo, (hi + 1).min(self.text.len_chars().max(1)))
     }
 
+    /// Chars in the user-made selection — 0 for the implicit 1-char
+    /// cursor selection of Normal mode.
+    pub fn selected_chars(&self) -> usize {
+        if self.anchor == self.head {
+            return 0;
+        }
+        let (lo, hi) = self.selection();
+        hi - lo
+    }
+
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let line = self.text.char_to_line(self.head.min(self.text.len_chars()));
         let col = self.head - self.text.line_to_char(line);
@@ -228,9 +273,13 @@ impl Editor {
         self.scroll = self.scroll.min(max_scroll);
     }
 
-    pub fn scroll_by(&mut self, delta: isize) {
+    /// Wheel scrolling, detaching the viewport from the cursor. `viewport`
+    /// is the visible line count: scrolling stops with the last line
+    /// resting at the bottom edge instead of overscrolling into blank
+    /// space.
+    pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
         self.follow_cursor = false;
-        let max_scroll = self.text.len_lines().saturating_sub(1);
+        let max_scroll = self.text.len_lines().saturating_sub(viewport.max(1));
         self.scroll = if delta < 0 {
             self.scroll.saturating_sub(delta.unsigned_abs())
         } else {
@@ -484,6 +533,7 @@ impl Editor {
                 let state = if self.mark_unicode { "on" } else { "off" };
                 self.status = Some(format!("non-ASCII underline {state}"));
             }
+            "fmt" | "format" => return EditorEvent::Format,
             "q!" => return EditorEvent::Close,
             "wq" | "x" => {
                 return match self.save() {
@@ -717,7 +767,12 @@ impl Editor {
         let mut i = self.head;
         let class = class_of(self.text.char(i.min(n - 1)));
         // skip the rest of the current run, then whitespace
-        while i < n && matches!((class_of(self.text.char(i)), &class), (CharClass::Word, CharClass::Word) | (CharClass::Punct, CharClass::Punct)) {
+        while i < n
+            && matches!(
+                (class_of(self.text.char(i)), &class),
+                (CharClass::Word, CharClass::Word) | (CharClass::Punct, CharClass::Punct)
+            )
+        {
             i += 1;
         }
         while i < n && self.text.char(i).is_whitespace() {
@@ -798,12 +853,37 @@ impl Editor {
 
     // ----- editing --------------------------------------------------------
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            text: self.text.clone(),
-            anchor: self.anchor,
-            head: self.head,
+    /// Apply char-ranged replacements (LSP formatting edits, already
+    /// converted from UTF-16 positions) as one undo step. Edits must be
+    /// non-overlapping; they're applied back-to-front so earlier ranges
+    /// stay valid. Returns whether anything changed.
+    pub fn apply_edits(&mut self, edits: &[(usize, usize, String)]) -> bool {
+        if edits.is_empty() {
+            return false;
         }
+        self.push_undo();
+        let mut sorted: Vec<&(usize, usize, String)> = edits.iter().collect();
+        sorted.sort_by(|a, b| b.0.cmp(&a.0));
+        for (start, end, text) in sorted {
+            let len = self.text.len_chars();
+            let (start, end) = ((*start).min(len), (*end).min(len));
+            if start > end {
+                continue;
+            }
+            self.text.remove(start..end);
+            if !text.is_empty() {
+                self.text.insert(start, text);
+            }
+        }
+        let len = self.text.len_chars().saturating_sub(1);
+        self.head = self.head.min(len);
+        self.anchor = self.head;
+        self.mark_edited();
+        true
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot { text: self.text.clone(), anchor: self.anchor, head: self.head }
     }
 
     fn push_undo(&mut self) {
@@ -1025,29 +1105,18 @@ impl Editor {
         self.push_undo();
         self.insert_undo_open = true;
         let (line, _) = self.cursor_line_col();
-        let indent: String = self
-            .text
-            .line(line)
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
+        let indent: String =
+            self.text.line(line).chars().take_while(|c| *c == ' ' || *c == '\t').collect();
         let pos = if below {
             self.text.line_to_char(line) + self.line_content_len(line)
         } else {
             self.text.line_to_char(line)
         };
-        let inserted = if below {
-            format!("\n{indent}")
-        } else {
-            format!("{indent}\n")
-        };
+        let inserted = if below { format!("\n{indent}") } else { format!("{indent}\n") };
         self.text.insert(pos, &inserted);
         self.mode = Mode::Insert;
-        self.head = if below {
-            pos + inserted.chars().count()
-        } else {
-            pos + indent.chars().count()
-        };
+        self.head =
+            if below { pos + inserted.chars().count() } else { pos + indent.chars().count() };
         self.anchor = self.head;
         self.mark_edited();
     }
@@ -1074,12 +1143,7 @@ impl Editor {
 
     fn first_nonblank(&self, line: usize) -> usize {
         let start = self.text.line_to_char(line);
-        let blank = self
-            .text
-            .line(line)
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .count();
+        let blank = self.text.line(line).chars().take_while(|c| *c == ' ' || *c == '\t').count();
         start + blank
     }
 
@@ -1179,7 +1243,10 @@ mod tests {
         // Ctrl+Shift+Z also redoes
         ctrl(&mut ed, KeyCode::Char('z'));
         assert_eq!(ed.text.to_string(), "abc\n");
-        ed.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        ed.handle_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(ed.text.to_string(), "XYabc\n");
     }
 
@@ -1224,6 +1291,63 @@ mod tests {
         assert_eq!(ed.mode, Mode::Normal);
         assert_eq!(ed.text.to_string(), "hello world\n");
         assert!(ed.dirty);
+    }
+
+    #[test]
+    fn apply_edits_replaces_ranges_as_one_undo_step() {
+        let (_d, mut ed) = editor_with("fn  main() {}\n");
+        // two edits, given out of order — applied back-to-front so the
+        // earlier range stays valid
+        let changed = ed.apply_edits(&[
+            (10, 10, " x".to_string()), // pure insertion after the parens
+            (2, 4, " ".to_string()),    // collapse the double space
+        ]);
+        assert!(changed);
+        assert_eq!(ed.text.to_string(), "fn main() x {}\n");
+        assert!(ed.dirty);
+        // one undo restores the pre-format buffer
+        press(&mut ed, KeyCode::Char('u'));
+        assert_eq!(ed.text.to_string(), "fn  main() {}\n");
+        // empty edit list: no-op, no undo entry
+        assert!(!ed.apply_edits(&[]));
+    }
+
+    #[test]
+    fn fmt_command_emits_format_event() {
+        let (_d, mut ed) = editor_with("x\n");
+        press(&mut ed, KeyCode::Char(':'));
+        type_str(&mut ed, "fmt");
+        assert_eq!(press(&mut ed, KeyCode::Enter), EditorEvent::Format);
+    }
+
+    #[test]
+    fn detects_line_endings_and_indent() {
+        let (_d, ed) = editor_with("fn a() {\r\n    body\r\n}\r\n");
+        assert!(ed.crlf);
+        assert_eq!(ed.indent_label.as_deref(), Some("4 spaces"));
+
+        let (_d, ed) = editor_with("a\n  b\n    c\n");
+        assert!(!ed.crlf);
+        assert_eq!(ed.indent_label.as_deref(), Some("2 spaces"));
+
+        let (_d, ed) = editor_with("a\n\tb\n");
+        assert_eq!(ed.indent_label.as_deref(), Some("tabs"));
+
+        let (_d, ed) = editor_with("flat\nfile\n");
+        assert_eq!(ed.indent_label, None);
+    }
+
+    #[test]
+    fn selected_chars_counts_real_selections_only() {
+        let (_d, mut ed) = editor_with("hello\n");
+        assert_eq!(ed.selected_chars(), 0, "normal-mode implicit selection");
+        press(&mut ed, KeyCode::Char('v'));
+        press(&mut ed, KeyCode::Right);
+        press(&mut ed, KeyCode::Right);
+        assert_eq!(ed.selected_chars(), 3);
+        press(&mut ed, KeyCode::Esc);
+        press(&mut ed, KeyCode::Esc);
+        assert_eq!(ed.selected_chars(), 0, "esc collapses");
     }
 
     #[test]
@@ -1429,9 +1553,12 @@ mod tests {
         assert_eq!(ed.cursor_line_col(), (2, 3));
         ed.click(1, 10, false); // col clamped to line content
         assert_eq!(ed.cursor_line_col(), (1, 1));
-        ed.scroll_by(100);
-        assert_eq!(ed.scroll, 3); // 3 lines + ropey's phantom line after trailing \n
-        ed.scroll_by(-100);
+        ed.scroll_by(100, 2);
+        assert_eq!(ed.scroll, 2); // last lines rest at the bottom of the 2-row view
+        ed.scroll_by(-100, 2);
+        assert_eq!(ed.scroll, 0);
+        // viewport taller than the file: no scrolling at all
+        ed.scroll_by(100, 10);
         assert_eq!(ed.scroll, 0);
     }
 
@@ -1571,7 +1698,7 @@ mod tests {
         let content: String = (0..100).map(|i| format!("line{i}\n")).collect();
         let (_d, mut ed) = editor_with(&content);
         // wheel away from the cursor: viewport must stay put
-        ed.scroll_by(50);
+        ed.scroll_by(50, 20);
         assert!(!ed.follow_cursor);
         assert_eq!(ed.scroll, 50);
         // a key press re-attaches and ensure_visible may snap back
