@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# one recording at a time — two runs racing to push heroes reject each other
+concurrency:
+  group: demo-shots
+  cancel-in-progress: false
+
 jobs:
   record:
     runs-on: ubuntu-latest
@@ -29,7 +34,7 @@ jobs:
       # installed directly instead of via vhs-action: the action pulls
       # ffmpeg from BtbN's GitHub releases (fails intermittently) and
       # ignores a system ffmpeg entirely. apt is boring and works.
-      # fonts-jetbrains-mono = vhs's default font.
+      # fonts-firacode = the FontFamily the tapes set.
       - name: Install vhs
         run: |
           sudo mkdir -p /etc/apt/keyrings
@@ -38,7 +43,7 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
             | sudo tee /etc/apt/sources.list.d/charm.list
           sudo apt-get update
-          sudo apt-get install -y vhs ffmpeg fonts-jetbrains-mono
+          sudo apt-get install -y vhs ffmpeg fonts-firacode
           sudo curl -fsSL -o /usr/local/bin/ttyd \
             https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64
           sudo chmod +x /usr/local/bin/ttyd
@@ -64,5 +69,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add assets/hero-light.png assets/hero-dark.png
           git diff --cached --quiet && echo "no changes" && exit 0
-          git commit -m "Regenerate demo shots [skip ci]"
+          git commit -m "chore: regenerate demo shots [skip ci]"
+          # main may have moved while we recorded
+          git pull --rebase origin main
           git push
