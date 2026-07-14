@@ -3719,6 +3719,9 @@ mod tests {
                 message: "mismatched types expected i32 found String".into(),
                 source: "rust-analyzer".into(),
                 code: "E0308".into(),
+                start_u16: 0,
+                end_u16: 3,
+                end_line: 0,
             }],
         }));
         let buf = render(&mut app);

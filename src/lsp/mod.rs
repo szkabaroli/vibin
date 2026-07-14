@@ -27,6 +27,27 @@ pub struct Diagnostic {
     pub source: String,
     /// Diagnostic code, e.g. "E0308" ("" when absent).
     pub code: String,
+    /// Raw LSP range (UTF-16 columns + end line), kept so char columns can
+    /// be re-derived when the document text arrives after the diagnostic
+    /// did (servers push/pull diagnostics for files not opened yet).
+    pub start_u16: usize,
+    pub end_u16: usize,
+    pub end_line: usize,
+}
+
+impl Diagnostic {
+    /// (Re)derive char columns from the raw UTF-16 range against `doc`.
+    /// With an empty doc this degrades to line-only (columns 0..1).
+    fn convert_columns(&mut self, doc: &str) {
+        let line_text = doc.lines().nth(self.line).unwrap_or("");
+        self.col_start = utf16_to_char_col(line_text, self.start_u16);
+        // multi-line diagnostics: underline to end of the first line
+        self.col_end = if self.end_line == self.line {
+            utf16_to_char_col(line_text, self.end_u16).max(self.col_start + 1)
+        } else {
+            line_text.chars().count().max(self.col_start + 1)
+        };
+    }
 }
 
 #[derive(Default)]
@@ -277,9 +298,23 @@ impl LspClient {
     }
 
     pub fn did_open(&self, path: &Path, text: &str) {
-        if let Ok(mut shared) = self.shared.lock() {
+        let refresh = if let Ok(mut shared) = self.shared.lock() {
             shared.open_docs.insert(path.to_path_buf(), text.to_string());
-        }
+            // diagnostics that arrived before we had this file's text
+            // (startup pushes, workspace pulls) carry line-only columns —
+            // re-derive them from the raw UTF-16 ranges now
+            if let Some(diags) = shared.diagnostics.get_mut(path) {
+                for d in diags {
+                    d.convert_columns(text);
+                }
+                shared.generation += 1;
+            }
+            // and let the next workspace pull re-report it fresh
+            shared.workspace_result_ids.remove(path).is_some()
+                && shared.supports_workspace_diag
+        } else {
+            false
+        };
         self.notify(json!({
             "jsonrpc": "2.0", "method": "textDocument/didOpen",
             "params": { "textDocument": {
@@ -289,6 +324,9 @@ impl LspClient {
                 "text": text,
             }}
         }));
+        if refresh {
+            send_workspace_diagnostic(&self.writer, &self.shared, &self.next_id);
+        }
     }
 
     pub fn did_change(&self, path: &Path, text: &str, version: i64) {
@@ -853,22 +891,13 @@ pub fn char_to_utf16_col(line: &str, char_col: usize) -> usize {
 
 fn parse_diagnostic(value: &Value, doc: &str) -> Option<Diagnostic> {
     let range = value.get("range")?;
-    let line = range.pointer("/start/line")?.as_u64()? as usize;
-    let end_line = range.pointer("/end/line")?.as_u64()? as usize;
-    let start_u16 = range.pointer("/start/character")?.as_u64()? as usize;
-    let end_u16 = range.pointer("/end/character")?.as_u64()? as usize;
-    let line_text = doc.lines().nth(line).unwrap_or("");
-    let col_start = utf16_to_char_col(line_text, start_u16);
-    // multi-line diagnostics: underline to end of the first line
-    let col_end = if end_line == line {
-        utf16_to_char_col(line_text, end_u16).max(col_start + 1)
-    } else {
-        line_text.chars().count().max(col_start + 1)
-    };
-    Some(Diagnostic {
-        line,
-        col_start,
-        col_end,
+    let mut diagnostic = Diagnostic {
+        line: range.pointer("/start/line")?.as_u64()? as usize,
+        end_line: range.pointer("/end/line")?.as_u64()? as usize,
+        start_u16: range.pointer("/start/character")?.as_u64()? as usize,
+        end_u16: range.pointer("/end/character")?.as_u64()? as usize,
+        col_start: 0,
+        col_end: 0,
         severity: value.get("severity").and_then(Value::as_u64).unwrap_or(1) as u8,
         message: value.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
         source: value.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -877,7 +906,9 @@ fn parse_diagnostic(value: &Value, doc: &str) -> Option<Diagnostic> {
             Some(Value::Number(n)) => n.to_string(),
             _ => String::new(),
         },
-    })
+    };
+    diagnostic.convert_columns(doc);
+    Some(diagnostic)
 }
 
 /// Parse a documentLink reply: DocumentLink[], keeping links that carry a
@@ -1038,6 +1069,22 @@ done
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn late_document_text_restores_diagnostic_columns() {
+        // diagnostics can arrive before the file is opened (startup cargo
+        // check, workspace pulls) — parsed without text they carry
+        // line-only columns, and must recover once the text is known
+        let value = json!({
+            "range": { "start": { "line": 0, "character": 16 },
+                        "end": { "line": 0, "character": 21 } },
+            "severity": 1, "message": "no method named `puush`"
+        });
+        let mut d = parse_diagnostic(&value, "").unwrap();
+        assert_eq!((d.col_start, d.col_end), (0, 1), "no text: line-only");
+        d.convert_columns("        batcher.puush(readme);");
+        assert_eq!((d.col_start, d.col_end), (16, 21), "columns recovered");
+    }
 
     #[test]
     fn parses_formatting_edits() {

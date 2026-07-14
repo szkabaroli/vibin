@@ -51,7 +51,9 @@ keys() { # AppleScript body against our process
 type_text() { keys "keystroke \"$1\""; }
 
 # same choreography as the vhs tape: files pane, wait out rust-analyzer
-# indexing, palette → main.rs, jump to the error line, select the typo
+# indexing, palette → main.rs, jump to the error line, select the typo,
+# hover the diagnostic (generous waits: the file's diagnostics need a
+# few seconds after didOpen before hover has anything to show)
 keys 'keystroke "a" using control down'
 sleep 0.3
 type_text "f"
@@ -61,12 +63,16 @@ sleep 0.5
 type_text "main"
 sleep 0.5
 keys 'key code 36' # Enter
-sleep 2
+sleep 5
 type_text ":51"
 keys 'key code 36'
-sleep 0.8
+sleep 2
 type_text "wwwe"
-sleep 1.5
+sleep 1
+keys 'keystroke " "'
+sleep 0.25
+type_text "k"
+sleep 2.5
 
 # window frame via Accessibility, then a region capture (retina = 2x px)
 FRAME=$(osascript -e "tell application \"System Events\" to tell (first process whose unix id is $PID)
