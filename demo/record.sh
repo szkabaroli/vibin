@@ -9,5 +9,6 @@ render() { # theme suffix
   sed -e "s/%THEME%/$1/" -e "s/%SUFFIX%/$2/" demo/demo.tape.tmpl > /tmp/vibin-demo-$2.tape
   vhs /tmp/vibin-demo-$2.tape
 }
-render "Belafonte Night" dark
-render "Belafonte Day" light
+# GitHub's own palettes, so the README heroes match the page around them
+render "GitHub Dark" dark
+render "Github" light
