@@ -6,7 +6,7 @@
 </h1>
 
 <p align="center">
-  a terminal editor with Claude Code sessions living next to your code.<br>
+  a terminal code editor<br>
   a fun project, built for vibing — i don't recommend using it.
 </p>
 
