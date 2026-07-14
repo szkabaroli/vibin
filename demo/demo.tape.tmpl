@@ -6,6 +6,10 @@
 
 Output assets/demo-%SUFFIX%.gif
 
+# ttyd doesn't export COLORTERM, so vibin would assume a plain terminal:
+# 256-color quantization and no slant glyphs. vhs renders truecolor fine.
+Env VIBIN_TRUECOLOR "1"
+
 Set Theme "%THEME%"
 Set FontFamily "Fira Code"
 Set FontSize 26
