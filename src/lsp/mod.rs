@@ -97,6 +97,9 @@ struct Shared {
     /// `window/showMessageRequest`s awaiting a user decision — each must
     /// be answered (see [`Client::respond_message_request`]).
     message_requests: Vec<MessageRequest>,
+    /// In-flight `shutdown` request; the teardown thread polls for its ack.
+    shutdown_pending: Option<u64>,
+    shutdown_acked: bool,
 }
 
 /// A server-initiated `window/showMessageRequest`: a message plus action
@@ -206,7 +209,8 @@ pub struct DocumentLink {
 
 pub struct LspClient {
     pub language: String,
-    child: Child,
+    /// Taken by Drop, which hands it to the detached shutdown thread.
+    child: Option<Child>,
     writer: Arc<Mutex<ChildStdin>>,
     shared: Arc<Mutex<Shared>>,
     next_id: Arc<AtomicU64>,
@@ -233,7 +237,7 @@ impl LspClient {
 
         let client = Self {
             language: language.to_string(),
-            child,
+            child: Some(child),
             writer: Arc::clone(&writer),
             shared: Arc::clone(&shared),
             next_id: Arc::clone(&next_id),
@@ -585,8 +589,39 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // spec-shaped teardown: shutdown request -> (brief) ack -> exit
+        // notification -> grace period -> the axe. Servers persist caches
+        // on a clean exit; the kill stays as the stuck-server fallback.
+        // Detached so replacing a client never stalls the UI. On app quit
+        // the thread may die early - stdin EOF ends the server then.
+        let Some(mut child) = self.child.take() else { return };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut s) = self.shared.lock() {
+            s.shutdown_pending = Some(id);
+        }
+        let (writer, shared) = (Arc::clone(&self.writer), Arc::clone(&self.shared));
+        std::thread::spawn(move || {
+            use std::time::{Duration, Instant};
+            // straight to the wire: the handshake queue no longer matters
+            write_message(&writer, &json!({ "jsonrpc": "2.0", "id": id, "method": "shutdown" }));
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if shared.lock().is_ok_and(|s| s.shutdown_acked || s.dead) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            write_message(&writer, &json!({ "jsonrpc": "2.0", "method": "exit" }));
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 
@@ -663,6 +698,12 @@ fn reader_loop(
             }
             // response to one of our requests
             (Some(id), None) => {
+                if let Ok(mut s) = shared.lock()
+                    && s.shutdown_pending == Some(id)
+                {
+                    s.shutdown_acked = true;
+                    continue;
+                }
                 if id == 1 {
                     // initialize done → initialized + flush the queue
                     let supports_ws = message
@@ -1142,6 +1183,11 @@ while true; do
     *'"method":"textDocument/codeLens"'*)
       id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
       send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"command\":{\"title\":\"run\",\"command\":\"fake.run\"}},{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"command\":{\"title\":\"3 references\",\"command\":\"fake.refs\"}},{\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":2,\"character\":1}},\"data\":{\"unresolved\":true}}]}" ;;
+    *'"method":"shutdown"'*)
+      id=$(echo "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+      touch shutdown-received
+      send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+    *'"method":"exit"'*) exit 0 ;;
   esac
 done
 "##,
@@ -1156,6 +1202,23 @@ done
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn drop_shuts_the_server_down_politely() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cmd = fake_server_script(dir.path());
+        let client = LspClient::start("rust", dir.path(), &cmd).unwrap();
+        // let the handshake finish so shutdown races nothing
+        assert!(wait_until(5000, || client.generation() > 0), "initialize handshake");
+        drop(client);
+        // the detached teardown thread sends shutdown (the fake server
+        // marks it) and then exit (the fake server obeys)
+        let marker = dir.path().join("shutdown-received");
+        assert!(
+            wait_until(5000, || marker.exists()),
+            "server received a shutdown request before dying"
+        );
+    }
 
     #[test]
     fn diff_change_computes_minimal_utf16_ranges() {
