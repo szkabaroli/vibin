@@ -1,0 +1,248 @@
+name: release
+
+# Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
+# This builds native binaries on each host arch (no cross-compiling — the
+# vendored crossterm patch and the cc-built grammars just work on the real
+# target), tars them up with checksums + man page + shell completions, signs
+# them with build provenance, and attaches them to a GitHub Release whose
+# notes are generated from the conventional-commit log. The install.sh script
+# and cargo-binstall read those assets; the homebrew job bumps the tap.
+on:
+  push:
+    tags: ["v*"]
+  # lets you re-run the packaging against an existing tag from the UI
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+  id-token: write # provenance attestation
+  attestations: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          # 22.04 = an older glibc, so the gnu binaries run on more distros
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          # fully-static musl builds — run on any Linux, including Alpine
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+            musl: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-gcc drives both the cc-built grammars and cmake's vendored
+      # libgit2 for the static targets. CC persists to later steps in this job.
+      - name: musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "ref=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.ref }}"
+          dir="vibin-${tag}-${{ matrix.target }}"
+          bin="target/${{ matrix.target }}/release/vibin"
+
+          strip "$bin" || true
+          mkdir "$dir" "$dir/completions"
+          cp "$bin" "$dir/"
+          cp LICENSE README.md THIRD-PARTY-NOTICES.md "$dir/"
+          cp packaging/man/vibin.1 "$dir/"
+          cp packaging/completions/vibin.bash packaging/completions/_vibin \
+             packaging/completions/vibin.fish "$dir/completions/"
+
+          tarball="${dir}.tar.gz"
+          tar czf "$tarball" "$dir"
+
+          # sha256 in the `<hash>  <file>` shape that `shasum -c` expects
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$tarball" > "${tarball}.sha256"
+          else
+            shasum -a 256 "$tarball" > "${tarball}.sha256"
+          fi
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      # verifiable provenance: `gh attestation verify <tarball> -R szkabaroli/vibin`
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.pkg.outputs.tarball }}
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.ref }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
+
+  # Fill the release body with notes generated from the conventional-commit
+  # log since the previous tag.
+  changelog:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags for the diff since last release
+
+      - name: Resolve tag
+        id: tag
+        run: echo "ref=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --current --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Update release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ steps.tag.outputs.ref }}" --repo "${{ github.repository }}" --notes-file RELEASE_NOTES.md
+
+  # Bump the Homebrew formula in szkabaroli/homebrew-tap to point at the
+  # freshly published tarballs. Skipped automatically when the tap token
+  # secret isn't set, so forks don't fail here.
+  homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for tap token
+        id: gate
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else
+            echo "HOMEBREW_TAP_TOKEN not set — skipping formula bump"; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Resolve tag
+        if: steps.gate.outputs.ok == 'true'
+        id: tag
+        run: echo "ref=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch checksums
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.ref }}"
+          gh release download "$tag" --repo "${{ github.repository }}" --pattern '*.sha256' --dir sums
+          # each *.sha256 is `<hash>  <tarball>`; index them by target
+          for f in sums/*.sha256; do
+            read -r hash name < "$f"
+            case "$name" in
+              *aarch64-apple-darwin*)       echo "SHA_ARM_MAC=$hash" >> "$GITHUB_ENV" ;;
+              *x86_64-apple-darwin*)        echo "SHA_X86_MAC=$hash" >> "$GITHUB_ENV" ;;
+              *aarch64-unknown-linux-gnu*)  echo "SHA_ARM_LINUX=$hash" >> "$GITHUB_ENV" ;;
+              *x86_64-unknown-linux-gnu*)   echo "SHA_X86_LINUX=$hash" >> "$GITHUB_ENV" ;;
+            esac
+          done
+
+      - name: Render + push formula
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.ref }}"
+          version="${tag#v}"
+          repo="https://github.com/${{ github.repository }}"
+          base="${repo}/releases/download/${tag}"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/szkabaroli/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/vibin.rb <<EOF
+          # generated by szkabaroli/vibin release workflow — do not edit by hand
+          class Vibin < Formula
+            desc "Terminal code editor with Claude Code sessions living next to your code"
+            homepage "${repo}"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${base}/vibin-${tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_ARM_MAC}"
+              end
+              on_intel do
+                url "${base}/vibin-${tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_MAC}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/vibin-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_ARM_LINUX}"
+              end
+              on_intel do
+                url "${base}/vibin-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_X86_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "vibin"
+              man1.install "vibin.1"
+              bash_completion.install "completions/vibin.bash" => "vibin"
+              zsh_completion.install "completions/_vibin"
+              fish_completion.install "completions/vibin.fish"
+            end
+
+            test do
+              assert_match "vibin #{version}", shell_output("#{bin}/vibin +version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/vibin.rb
+          git diff --cached --quiet && echo "formula already current" && exit 0
+          git commit -m "vibin ${version}"
+          git push
