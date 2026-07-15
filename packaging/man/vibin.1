@@ -1,0 +1,75 @@
+.TH VIBIN 1 "July 15, 2026" "vibin" "User Commands"
+.SH NAME
+vibin \- a terminal code editor with Claude Code sessions
+.SH SYNOPSIS
+.B vibin
+.RI [ dir ]
+.RI [ "\-\- command args..." ]
+.br
+.B vibin
+.RI + subcommand
+.SH DESCRIPTION
+.B vibin
+is a terminal editor with Claude Code sessions living next to your code:
+one TUI, three shells \(em F3 code (file tree + modal editor), F2 git (stage,
+diff, commit), F1 agents (Claude terminals + resumable chats). The editor has
+tree-sitter highlighting for ~30 languages, LSP diagnostics/hover/goto, spell
+check that understands snake_case, and a hex viewer. Colors come from the
+terminal's own theme, queried over OSC, and follow it when it flips between
+light and dark.
+.PP
+With
+.I dir
+the workspace opens directly; without one, a welcome screen offers the current
+directory and recent projects. Everything after
+.B \-\-
+is the command each agent session runs (default:
+.BR claude ).
+.SH SUBCOMMANDS
+The
+.RB + subcommands
+run and exit without opening the TUI.
+.TP
+.B +version
+Print the version and exit.
+.TP
+.B +update
+Download and install the latest release. Only self-updates installs made by
+the install script; Homebrew, Nix, and cargo installs are directed to their
+package manager.
+.TP
+.B +list-keybinds
+Print the resolved keybindings.
+.TP
+.B +list-actions
+Print every bindable action.
+.TP
+.B +show-config
+Print the fully resolved configuration for the current directory as TOML.
+.SH KEYS
+.TP
+.B Ctrl+A
+Leader \(em press it and a menu shows everything.
+.TP
+.B Ctrl+K
+Palette (files, and \fB>\fR commands).
+.TP
+.B F1 / F2 / F3
+Switch between the agents, git, and code shells.
+.SH FILES
+.TP
+.I ~/.config/vibin/config.toml
+User configuration, overridden by
+.I .vibin/config.toml
+in a repository.
+.SH ENVIRONMENT
+.TP
+.B VIBIN_CMD
+Overrides the command agent sessions run.
+.TP
+.B VIBIN_LSP_CMD
+Overrides every language server (used by the test suite).
+.SH HOMEPAGE
+https://github.com/szkabaroli/vibin
+.SH LICENSE
+MIT.
