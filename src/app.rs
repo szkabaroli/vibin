@@ -6,24 +6,112 @@ use ratatui::widgets::ListState;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::chats::ChatStore;
+use crate::acp::{AcpClient, AcpManager};
 use crate::diff::DiffView;
 use crate::editor::{Editor, EditorEvent};
 use crate::filetree::FileTree;
 use crate::git::GitState;
-use crate::input::key_to_bytes;
 use crate::lsp::LspClient;
 use crate::palette::{CommandEntry, Palette, PaletteAction};
-use crate::projects::{self, RecentProject};
-use crate::session::{SessionManager, SessionStatus};
+use std::collections::{HashMap, HashSet};
+
+/// The LSP autocomplete popup: the full item list from the server, the
+/// subset matching the identifier being typed, the selection, and the char
+/// index where that identifier starts (what an accepted item replaces).
+pub struct Completion {
+    pub items: Vec<crate::lsp::CompletionItem>,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+    pub anchor: usize,
+}
+
+/// One row of the agents-sidebar tree: an agent connection, or a session
+/// nested under it. Built by [`App::acp_rows`], shared by nav and render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpRow {
+    /// An agent connection (index into the manager).
+    Agent(usize),
+    /// A session under a connection: (connection index, session id).
+    Session(usize, String),
+}
+
+/// Per-session UI draft state (composer text + transcript scroll) that
+/// outlives switching away and back. Keyed by session id.
+#[derive(Default)]
+pub struct SessionUi {
+    /// The prompt composer — a text field with a cursor and selection.
+    pub input: crate::textinput::TextInput,
+    /// Transcript scroll: lines above the tail (0 = follow the tail).
+    pub scroll: usize,
+}
+
+/// The agents-sidebar navigation state: a file-tree-style cursor over the
+/// agent→session tree, which connections are collapsed, and which session
+/// is open in the main pane.
+#[derive(Default)]
+pub struct AgentView {
+    /// Cursor row in the flattened tree (see [`App::acp_rows`]).
+    pub cursor: usize,
+    /// Collapsed connections, by index.
+    pub collapsed: HashSet<usize>,
+    /// The session shown in the main pane: (connection index, session id).
+    pub open: Option<(usize, String)>,
+    /// Per-session composer + scroll.
+    pub ui: HashMap<String, SessionUi>,
+    /// A just-started connection whose live session should auto-open once
+    /// the handshake creates it.
+    pub focus_conn: Option<usize>,
+    /// OpenRouter-generated titles by session id: `Some` = a title, `None`
+    /// = we tried and won't retry. Only for sessions the agent didn't title.
+    pub titles: HashMap<String, Option<String>>,
+    /// Sessions with a title request in flight.
+    pub title_pending: HashSet<String>,
+    /// Sessions seen working / with a pending permission last check, to
+    /// detect the edges that ring the bell.
+    working: HashSet<String>,
+    perms: HashSet<String>,
+    /// List-scroll state for the sidebar tree (see [`AcpRow`]).
+    pub list: ListState,
+    /// When the composer's mode dropdown is open, the highlighted mode index
+    /// into the open session's `modes`. `None` = closed.
+    pub mode_menu: Option<usize>,
+    /// The mouse is resting on the composer's mode chip (hover highlight).
+    pub mode_hover: bool,
+    /// The `@`-mention file picker, open while the cursor sits in an
+    /// `@token` in the composer. `None` = closed.
+    pub mention: Option<MentionState>,
+}
+
+/// The composer's `@`-mention picker: a fuzzy file search anchored to the
+/// `@` the user is typing.
+pub struct MentionState {
+    /// Char index of the `@` in the composer text.
+    pub at: usize,
+    /// Cached workspace file list (workdir-relative), filtered per keystroke.
+    pub files: Vec<String>,
+    /// Current matches shown in the popup.
+    pub results: Vec<String>,
+    /// Highlighted row into `results`.
+    pub selected: usize,
+}
+
+/// Rows shown in the @-mention popup.
+const MENTION_MAX: usize = 8;
 
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TREE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Frame interval for the welcome-screen gradient animation.
 const ANIM_INTERVAL: Duration = Duration::from_millis(90);
 
-/// How long a toast notification stays on screen.
-const TOAST_TTL: Duration = Duration::from_secs(4);
+/// How long a toast stays on screen, by severity (VS Code's timings);
+/// toasts with buttons never expire on their own.
+fn toast_ttl(level: ToastLevel) -> Duration {
+    match level {
+        ToastLevel::Info => Duration::from_secs(15),
+        ToastLevel::Warn => Duration::from_secs(18),
+        ToastLevel::Error => Duration::from_secs(20),
+    }
+}
 /// Most toasts shown at once; older ones are dropped first.
 const TOAST_CAP: usize = 5;
 
@@ -63,6 +151,107 @@ impl Shell {
     }
 }
 
+/// UI/interaction state for the Git shell — the repository model itself is
+/// [`App::git`]. (Mirrors how [`AgentView`] pairs with [`App::acp`].)
+pub struct GitView {
+    /// Scroll of the main diff pane.
+    pub diff_scroll: usize,
+    /// Viewport height of that pane, set by the UI each draw.
+    pub diff_viewport: usize,
+    /// The scroll offset actually on screen — mouse math uses this, not
+    /// `diff_scroll`, since queued momentum-scroll events can advance the
+    /// live value past what the user is looking at.
+    pub diff_scroll_rendered: usize,
+    /// The diff pane's display model (diff::fold_unchanged), rebuilt in the
+    /// update phase when its inputs change; draw only reads it.
+    pub pane: crate::diff::PaneModel,
+    /// Inputs signature of the cached model plus its build time — files
+    /// change under running agents, so a stale model re-polls after 500ms.
+    pub pane_stamp: Option<(String, crate::git::DiffMode, bool, u64, Instant)>,
+    /// Fold-band row under the mouse (hover highlight).
+    pub gap_hover: Option<usize>,
+    /// Changes-list scroll state, so clicks map rows to entries.
+    pub list: ListState,
+    /// When the git status was last polled.
+    pub last_refresh: Instant,
+}
+
+impl GitView {
+    fn new() -> Self {
+        Self {
+            diff_scroll: 0,
+            diff_viewport: 20,
+            diff_scroll_rendered: 0,
+            pane: crate::diff::PaneModel::default(),
+            pane_stamp: None,
+            gap_hover: None,
+            list: ListState::default(),
+            last_refresh: Instant::now(),
+        }
+    }
+}
+
+/// UI/interaction state for the Code shell — the open buffer and file tree
+/// are [`App::editor`] / [`App::tree`]; this holds the surrounding state.
+pub struct CodeView {
+    /// Selected row of the empty-state action list.
+    pub home_selected: usize,
+    /// Editor line whose gutter the mouse is over (markers render filled).
+    pub gutter_hover: Option<usize>,
+    /// HEAD content of the open file (gutter change-marker baseline).
+    pub editor_head: Option<String>,
+    /// Gutter diff cache, keyed on the editor revision it was computed at.
+    pub editor_diff: Option<(u64, crate::diff::GutterDiff)>,
+    /// File-tree scroll state, so clicks map rows to items.
+    pub tree_list: ListState,
+    /// Buffer revision an in-flight `:fmt` was made against — stale replies
+    /// (buffer edited meanwhile) are dropped.
+    pub fmt_pending: Option<u64>,
+    /// Where goto-definition jumped FROM: (file, char index). Ctrl+O pops.
+    pub jump_stack: Vec<(PathBuf, usize)>,
+    /// Last editor click, for double-click word selection.
+    pub last_editor_click: Option<(Instant, Position)>,
+    /// Shift was held on the last mouse press (click extends selection).
+    pub click_extends: bool,
+    /// Ctrl was held on the last mouse press (click = goto definition).
+    pub click_goto: bool,
+    /// Where the mouse currently rests and since when (dwell hover).
+    pub mouse_rest: Option<(Position, Instant)>,
+    /// Cell we already sent a dwell-hover request for.
+    pub hover_sent_for: Option<Position>,
+    /// The pending hover was requested via space-k (report "no info").
+    pub hover_via_key: bool,
+    /// Screen cell the hover popup should anchor to.
+    pub hover_anchor: Option<Position>,
+    /// Document position (line, char col) the pending hover was asked for.
+    pub hover_doc_pos: Option<(usize, usize)>,
+    /// When the file tree was last refreshed.
+    pub last_tree_refresh: Instant,
+}
+
+impl CodeView {
+    fn new() -> Self {
+        Self {
+            home_selected: 0,
+            gutter_hover: None,
+            editor_head: None,
+            editor_diff: None,
+            tree_list: ListState::default(),
+            fmt_pending: None,
+            jump_stack: Vec::new(),
+            last_editor_click: None,
+            click_extends: false,
+            click_goto: false,
+            mouse_rest: None,
+            hover_sent_for: None,
+            hover_via_key: false,
+            hover_anchor: None,
+            hover_doc_pos: None,
+            last_tree_refresh: Instant::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     /// Launcher: logo + recent projects. Shown when no dir arg was given.
@@ -70,10 +259,10 @@ pub enum Screen {
     Workspace,
 }
 
-/// State of the welcome screen: index 0 is always "open current directory",
-/// followed by recent projects discovered from Claude's transcripts.
+/// State of the welcome screen. Now just "open the current directory" —
+/// recent-project discovery read Claude's transcripts, which vibin no
+/// longer touches.
 pub struct Welcome {
-    pub projects: Vec<RecentProject>,
     pub selected: usize,
     pub list: ListState,
     /// Gradient animation phase in 0..1, advanced by tick().
@@ -83,9 +272,9 @@ pub struct Welcome {
 }
 
 impl Welcome {
-    /// Total selectable rows (current dir + recent projects).
+    /// Total selectable rows (just the current dir for now).
     pub fn len(&self) -> usize {
-        self.projects.len() + 1
+        1
     }
 }
 
@@ -144,9 +333,9 @@ pub const MENU_BAR: &[(&str, &[(&str, crate::keybind::Action)])] = {
         (
             "File",
             &[
-                ("New Session", Action::NewSession),
-                ("Rename Session", Action::RenameSession),
-                ("Close Session", Action::CloseSession),
+                ("Start Agent", Action::StartAgent),
+                ("Next Agent", Action::NextAgent),
+                ("Close Agent", Action::CloseAgent),
                 ("Quit", Action::Quit),
             ],
         ),
@@ -189,10 +378,14 @@ pub const MENU_BAR: &[(&str, &[(&str, crate::keybind::Action)])] = {
 pub struct LayoutMap {
     /// Inner area of the sidebar list (inside the borders).
     pub sidebar_list: Rect,
-    /// The session tab bar row.
-    pub session_tabs: Rect,
-    /// The terminal pane (including borders).
+    /// The agent conversation pane (including borders).
     pub terminal_pane: Rect,
+    /// The composer's mode chip ("Ask ▾") — click opens the dropdown.
+    pub agent_mode_chip: Rect,
+    /// The open mode dropdown box (including its border).
+    pub agent_mode_menu: Rect,
+    /// The open @-mention picker box (including its border).
+    pub agent_mention_menu: Rect,
     /// The project list on the welcome screen.
     pub welcome_list: Rect,
     /// The editor's text area (inside borders, right of the gutter).
@@ -213,8 +406,16 @@ pub struct LayoutMap {
     pub menu_items: [Rect; MENU_BAR.len()],
     /// The open menu-bar dropdown (whole box, including its border).
     pub menu_dropdown: Rect,
+    /// The menu bar's bell chip (toggles the notification pane).
+    pub menu_bell: Rect,
+    /// The notification pane (bell toggle), when open.
+    pub notifications: Rect,
+    /// The pane's "clear all" control.
+    pub notifications_clear: Rect,
     /// The editor gutter (markers + line numbers + change rule).
     pub editor_gutter: Rect,
+    /// The editor's cursor cell this frame — the completion popup anchor.
+    pub editor_cursor: Option<Position>,
 }
 
 /// Scrollable hover-documentation state: LSP hover markdown plus any
@@ -231,8 +432,6 @@ pub enum Overlay {
     Help,
     /// Commit-message prompt with the text typed so far.
     CommitPrompt(String),
-    /// Rename prompt for the active session.
-    RenamePrompt(String),
     /// LSP hover documentation (markdown), scrollable when tall.
     Hover(HoverDoc),
     /// Command palette: fuzzy file search, commands with a `>` prefix.
@@ -241,11 +440,12 @@ pub enum Overlay {
 
 pub struct App {
     pub workdir: PathBuf,
-    pub claude_cmd: Vec<String>,
     pub screen: Screen,
     pub welcome: Welcome,
     pub shell: Shell,
     pub editor: Option<Editor>,
+    /// The LSP autocomplete popup, when open (Code shell, insert mode).
+    pub completion: Option<Completion>,
     /// Read-only hex viewer for binary files; takes over the Code shell's
     /// main pane while open (the editor keeps its buffer underneath).
     pub hex: Option<crate::hex::HexView>,
@@ -258,12 +458,9 @@ pub struct App {
     /// The terminal answered the kitty animation-frame probe: GIFs play
     /// terminal-side through the animation protocol.
     pub kitty_anim: bool,
-    /// Selected row of the Code shell's empty-state action list.
-    pub code_home_selected: usize,
-    /// Scroll of the Git shell's main diff pane.
-    pub git_diff_scroll: usize,
-    /// Viewport height of that pane, set by the UI each draw.
-    pub git_diff_viewport: usize,
+    /// Per-view UI state, grouped by shell (models stay top-level).
+    pub code_view: CodeView,
+    pub git_view: GitView,
     /// One language server per (language, workspace), started lazily.
     pub lsp: Option<LspClient>,
     lsp_generation: u64,
@@ -273,32 +470,31 @@ pub struct App {
     lsp_unavailable: std::collections::HashSet<String>,
     /// Tests disable this to avoid spawning real language servers.
     pub lsp_enabled: bool,
-    /// Shift was held on the last mouse press (click extends selection).
-    click_extends: bool,
-    /// Ctrl was held on the last mouse press (click = goto definition).
-    click_goto: bool,
-    /// Last editor click, for double-click word selection.
-    last_editor_click: Option<(Instant, Position)>,
-    /// Where the mouse currently rests and since when (dwell hover).
-    mouse_rest: Option<(Position, Instant)>,
-    /// Cell we already sent a dwell-hover request for.
-    hover_sent_for: Option<Position>,
-    /// The pending hover was requested via space-k (report "no info").
-    hover_via_key: bool,
-    /// Screen cell the hover popup should anchor to.
-    pub hover_anchor: Option<Position>,
-    /// Document position (line, char col) the pending hover was asked for.
-    pub hover_doc_pos: Option<(usize, usize)>,
-    /// Where goto-definition jumped FROM: (file, char index). Ctrl+O pops.
-    jump_stack: Vec<(std::path::PathBuf, usize)>,
     /// Hyperlinks visible this frame (emitted as OSC 8 after drawing).
     /// Diagnostic squiggles visible this frame (emitted as undercurl).
-    pub sessions: SessionManager,
+    /// The running ACP agent connections — one per agent program, each
+    /// hosting many sessions. Empty until one is launched (from config on
+    /// open, or Tools → Start Agent).
+    pub acp: AcpManager,
+    /// Sidebar-tree navigation over the agent→session tree, and which
+    /// session is open in the main pane.
+    pub agent_view: AgentView,
+    /// Open editor buffers, shared with every agent so `fs/read_text_file`
+    /// serves unsaved content. Kept in sync with the editor in `tick`.
+    acp_fs: crate::acp::FsOverlay,
+    /// The (path, revision) last mirrored into `acp_fs`.
+    acp_fs_synced: Option<(PathBuf, u64)>,
+    /// Set when an agent event should ring the terminal bell; drained by
+    /// the main loop (see [`take_bell`](Self::take_bell)).
+    pending_bell: bool,
+    /// Generated session titles arriving from background OpenRouter calls,
+    /// as (session id, title-or-empty-on-failure).
+    title_rx: std::sync::mpsc::Receiver<(String, Option<String>)>,
+    title_tx: std::sync::mpsc::Sender<(String, Option<String>)>,
     /// Merged settings (defaults ← global XDG ← repo `.vibin`).
     pub config: crate::config::Config,
     pub tree: FileTree,
     pub git: GitState,
-    pub chats: ChatStore,
     pub focus: Focus,
     pub overlay: Option<Overlay>,
     pub leader_pending: bool,
@@ -315,6 +511,14 @@ pub struct App {
     pub context_menu: Option<ContextMenu>,
     /// Live toast notifications, oldest first (see [`App::notify`]).
     pub toasts: Vec<Toast>,
+    /// Every notification ever raised this session, oldest first — the
+    /// bell pane's backing store (toasts are the transient view).
+    pub notifications: Vec<(ToastLevel, String, Instant)>,
+    /// The notification pane next to the main pane is open (bell toggle).
+    pub notifications_open: bool,
+    /// How many notifications had been raised when the pane was last
+    /// open — everything past this count is "unread" (the bell badge).
+    pub notifications_seen: usize,
     /// Toast hitboxes of the current frame: (rect, toast index, button
     /// index — None for the card body). Rebuilt on every draw.
     pub toast_hits: Vec<(ratatui::layout::Rect, usize, Option<usize>)>,
@@ -328,87 +532,54 @@ pub struct App {
     pub menu_row: usize,
     /// The live keybinding table (defaults + config overrides).
     pub keybinds: crate::keybind::Keybinds,
-    /// Buffer revision an in-flight `:fmt` request was made against —
-    /// stale replies (buffer edited meanwhile) are dropped.
-    fmt_pending: Option<u64>,
-    /// HEAD content of the open file (gutter change markers baseline).
-    pub editor_head: Option<String>,
-    /// Gutter diff cache, keyed on the editor revision it was computed at.
-    editor_diff: Option<(u64, crate::diff::GutterDiff)>,
-    /// Editor line whose gutter the mouse is over (markers render filled).
-    pub gutter_hover: Option<usize>,
     /// A mouse button is held (drag-selection in progress): hover popups
     /// stay suppressed until release.
     mouse_held: bool,
-    /// Size for newly spawned session PTYs; updated by the UI on every draw.
-    pub term_size: (u16, u16),
     /// Height of the diff overlay viewport, updated by the UI for scrolling.
     pub diff_viewport: usize,
-    /// Last status snapshot, so tick() can report when a dashboard redraw
-    /// is needed (working→idle transitions happen without any event).
-    pub statuses: Vec<SessionStatus>,
     /// Regions recorded by the UI on every draw, for mouse hit-testing.
     pub layout: LayoutMap,
-    /// Clickable x-ranges of the session tabs: (start, end, session index).
-    pub session_tab_hits: Vec<(u16, u16, usize)>,
-    /// Persistent list scroll state so clicks can map rows to items.
-    pub tree_list: ListState,
-    pub git_list: ListState,
-    pub chats_list: ListState,
-    last_git_refresh: Instant,
-    last_tree_refresh: Instant,
     last_anim: Instant,
 }
 
 impl App {
-    pub fn new(workdir: PathBuf, claude_cmd: Vec<String>) -> Self {
+    pub fn new(workdir: PathBuf) -> Self {
         let config = crate::config::Config::load(&workdir);
         let (keybinds, keybind_errors) = crate::keybind::Keybinds::from_config(&config.keybinds);
         let mut tree = FileTree::new(&workdir);
         tree.show_hidden = config.show_hidden;
         let git = GitState::open(&workdir);
-        let chats = ChatStore::new(&workdir);
+        let (title_tx, title_rx) = std::sync::mpsc::channel();
         Self {
             config,
             workdir,
-            claude_cmd,
             screen: Screen::Workspace,
-            welcome: Welcome {
-                projects: Vec::new(),
-                selected: 0,
-                list: ListState::default(),
-                phase: 0.0,
-                frame: 0,
-            },
+            welcome: Welcome { selected: 0, list: ListState::default(), phase: 0.0, frame: 0 },
             // workspaces open on the code shell (file tree + editor)
             shell: Shell::Code,
             editor: None,
+            completion: None,
             hex: None,
             image: None,
             picker: ratatui_image::picker::Picker::halfblocks(),
             kitty_anim: false,
-            code_home_selected: 0,
-            git_diff_scroll: 0,
-            git_diff_viewport: 20,
+            code_view: CodeView::new(),
+            git_view: GitView::new(),
             lsp: None,
             lsp_generation: 0,
             lsp_synced_revision: 0,
             lsp_doc_version: 0,
             lsp_unavailable: std::collections::HashSet::new(),
             lsp_enabled: true,
-            click_extends: false,
-            click_goto: false,
-            last_editor_click: None,
-            mouse_rest: None,
-            hover_sent_for: None,
-            hover_via_key: false,
-            hover_anchor: None,
-            hover_doc_pos: None,
-            jump_stack: Vec::new(),
-            sessions: SessionManager::new(),
+            acp: AcpManager::default(),
+            agent_view: AgentView::default(),
+            acp_fs: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            acp_fs_synced: None,
+            pending_bell: false,
+            title_rx,
+            title_tx,
             tree,
             git,
-            chats,
             focus: Focus::Terminal,
             overlay: None,
             leader_pending: false,
@@ -418,43 +589,29 @@ impl App {
             hovered_link: None,
             context_menu: None,
             toasts: Vec::new(),
+            notifications: Vec::new(),
+            notifications_open: false,
+            notifications_seen: 0,
             toast_hits: Vec::new(),
             toast_hover: None,
             toast_pointer_over: false,
             menu_open: None,
             menu_row: 0,
             keybinds,
-            fmt_pending: None,
-            editor_head: None,
-            editor_diff: None,
-            gutter_hover: None,
             mouse_held: false,
-            term_size: (24, 80),
             diff_viewport: 20,
-            statuses: Vec::new(),
             layout: LayoutMap::default(),
-            session_tab_hits: Vec::new(),
-            tree_list: ListState::default(),
-            git_list: ListState::default(),
-            chats_list: ListState::default(),
-            last_git_refresh: Instant::now(),
-            last_tree_refresh: Instant::now(),
             last_anim: Instant::now(),
         }
     }
 
-    /// Switch to the welcome/launcher screen and discover recent projects.
+    /// Switch to the welcome/launcher screen.
     pub fn enter_welcome(&mut self) {
         self.screen = Screen::Welcome;
-        let cwd = self.workdir.clone();
-        self.welcome.projects = projects::discover(crate::chats::default_projects_dir())
-            .into_iter()
-            .filter(|p| p.path != cwd)
-            .collect();
         self.welcome.selected = 0;
     }
 
-    /// Open a workspace from the welcome screen and start the first session.
+    /// Open a workspace from the welcome screen and launch its agent.
     pub fn open_project(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
         self.workdir = path;
@@ -463,32 +620,24 @@ impl App {
         self.tree = FileTree::new(&self.workdir);
         self.tree.show_hidden = self.config.show_hidden;
         self.git = GitState::open(&self.workdir);
-        self.chats = ChatStore::new(&self.workdir);
         self.screen = Screen::Workspace;
-        self.spawn_session();
+        self.start_configured_agent();
         self.activate_workspace_lsp();
         // entering a workspace starts in the file tree
         self.focus = Focus::Sidebar;
     }
 
     fn open_selected_project(&mut self) {
-        let path = if self.welcome.selected == 0 {
-            self.workdir.clone()
-        } else {
-            match self.welcome.projects.get(self.welcome.selected - 1) {
-                Some(p) => p.path.clone(),
-                None => return,
-            }
-        };
-        self.open_project(path);
+        // only "open the current directory" remains on the welcome screen
+        self.open_project(self.workdir.clone());
     }
 
     /// Open a file: text goes to the modal editor, binary data to
     /// the read-only hex viewer.
     pub fn open_file(&mut self, path: &std::path::Path) {
         // baseline for gutter change markers: the file as of HEAD
-        self.editor_head = self.git.head_text(path);
-        self.editor_diff = None;
+        self.code_view.editor_head = self.git.head_text(path);
+        self.code_view.editor_diff = None;
         // reuse the open image view, hex view or editor if it's the same file
         if self.image.as_ref().is_some_and(|i| i.path == path)
             || self.hex.as_ref().is_some_and(|h| h.path == path)
@@ -653,7 +802,7 @@ impl App {
                 Some((line.parse::<usize>().ok()?, col.parse::<usize>().ok()?))
             });
             if let Some(editor) = &self.editor {
-                self.jump_stack.push((editor.path.clone(), editor.head));
+                self.code_view.jump_stack.push((editor.path.clone(), editor.head));
             }
             match pos {
                 Some((line, col)) => {
@@ -680,10 +829,7 @@ impl App {
     fn run_code_home_item(&mut self, index: usize) {
         match index {
             0 => self.open_palette(),
-            1 => {
-                self.spawn_session();
-                self.shell = Shell::Agents;
-            }
+            1 => self.start_configured_agent_or_warn(),
             2 => self.switch_shell(Shell::Agents),
             3 => self.switch_shell(Shell::Git),
             _ => self.overlay = Some(Overlay::Help),
@@ -733,12 +879,12 @@ impl App {
         let len = Self::code_home_items().len();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.code_home_selected = (self.code_home_selected + 1).min(len - 1);
+                self.code_view.home_selected = (self.code_view.home_selected + 1).min(len - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.code_home_selected = self.code_home_selected.saturating_sub(1);
+                self.code_view.home_selected = self.code_view.home_selected.saturating_sub(1);
             }
-            KeyCode::Enter => self.run_code_home_item(self.code_home_selected),
+            KeyCode::Enter => self.run_code_home_item(self.code_view.home_selected),
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Sidebar,
             _ => {}
         }
@@ -770,12 +916,170 @@ impl App {
             self.handle_hex_key(key);
             return;
         }
-        let Some(editor) = &mut self.editor else {
+        if self.editor.is_none() {
             self.handle_code_home_key(key);
             return;
-        };
-        let event = editor.handle_key(key);
+        }
+        // the completion popup grabs navigation / accept / dismiss keys
+        if self.completion.is_some() && self.handle_completion_key(key) {
+            return;
+        }
+        // manual trigger (Ctrl+n) while inserting
+        if key.code == KeyCode::Char('n')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.editor.as_ref().is_some_and(|e| e.mode == crate::editor::Mode::Insert)
+        {
+            self.request_completion();
+            return;
+        }
+        let event = self.editor.as_mut().unwrap().handle_key(key);
         self.handle_editor_event(event);
+        self.update_completion_after_key(key);
+    }
+
+    /// Handle a key while the completion popup is open. Returns true if the
+    /// key was consumed (navigation / accept / dismiss); false to let the
+    /// editor process it (and the popup then re-filter).
+    fn handle_completion_key(&mut self, key: KeyEvent) -> bool {
+        let Some(completion) = &mut self.completion else { return false };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let len = completion.filtered.len();
+        match key.code {
+            KeyCode::Down => {
+                completion.selected = (completion.selected + 1) % len.max(1);
+                true
+            }
+            KeyCode::Up => {
+                completion.selected = (completion.selected + len.saturating_sub(1)) % len.max(1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                completion.selected = (completion.selected + 1) % len.max(1);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                completion.selected = (completion.selected + len.saturating_sub(1)) % len.max(1);
+                true
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                self.accept_completion();
+                true
+            }
+            KeyCode::Esc => {
+                self.completion = None;
+                true
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.completion = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Insert the selected completion, replacing the typed prefix.
+    fn accept_completion(&mut self) {
+        let Some(completion) = self.completion.take() else { return };
+        let Some(&idx) = completion.filtered.get(completion.selected) else { return };
+        let Some(item) = completion.items.get(idx) else { return };
+        if let Some(editor) = &mut self.editor {
+            editor.apply_completion(completion.anchor, &item.insert_text);
+        }
+    }
+
+    /// Fire a completion request at the cursor (Code shell, insert mode).
+    fn request_completion(&mut self) {
+        let (Some(editor), Some(client)) = (&self.editor, &self.lsp) else { return };
+        if editor.mode != crate::editor::Mode::Insert {
+            return;
+        }
+        let (line, col) = editor.cursor_line_col();
+        let line_text = editor.text.line(line).to_string();
+        let character = crate::lsp::char_to_utf16_col(&line_text, col);
+        client.request_completion(&editor.path, line, character);
+    }
+
+    /// After the editor processed an insert-mode key, open/refilter/close
+    /// the completion popup.
+    fn update_completion_after_key(&mut self, key: KeyEvent) {
+        let Some(editor) = &self.editor else { return };
+        if editor.mode != crate::editor::Mode::Insert {
+            self.completion = None;
+            return;
+        }
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let triggers =
+                    self.lsp.as_ref().map(|c| c.completion_triggers()).unwrap_or_default();
+                if triggers.iter().any(|t| t == &c.to_string()) {
+                    self.request_completion();
+                } else if c.is_alphanumeric() || c == '_' {
+                    if self.completion.is_some() {
+                        self.refilter_completion();
+                    } else if editor.word_prefix().1.chars().count() == 1 {
+                        // start of a fresh identifier → open the popup
+                        self.request_completion();
+                    }
+                } else {
+                    self.completion = None;
+                }
+            }
+            KeyCode::Backspace => {
+                if self.completion.is_some() {
+                    self.refilter_completion();
+                }
+            }
+            _ => self.completion = None,
+        }
+    }
+
+    /// Build the completion popup from a server reply, filtered by the
+    /// identifier under the cursor. Dropped unless we're still typing in the
+    /// editor and something matches.
+    fn open_completion(&mut self, items: Vec<crate::lsp::CompletionItem>) {
+        let still_typing = self.shell == Shell::Code
+            && self.focus == Focus::Terminal
+            && self.editor.as_ref().is_some_and(|e| e.mode == crate::editor::Mode::Insert);
+        if !still_typing || items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let editor = self.editor.as_ref().unwrap();
+        let (anchor, prefix) = editor.word_prefix();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        let filtered = if prefix.is_empty() {
+            (0..labels.len()).collect()
+        } else {
+            crate::palette::fuzzy_indices(&prefix, &labels)
+        };
+        if filtered.is_empty() {
+            self.completion = None;
+        } else {
+            self.completion = Some(Completion { items, filtered, selected: 0, anchor });
+        }
+    }
+
+    /// Re-filter the open popup against the identifier now under the cursor,
+    /// closing it when nothing matches or the cursor left the identifier.
+    fn refilter_completion(&mut self) {
+        let Some(editor) = &self.editor else {
+            self.completion = None;
+            return;
+        };
+        let (anchor, prefix) = editor.word_prefix();
+        let Some(completion) = &mut self.completion else { return };
+        completion.anchor = anchor;
+        let labels: Vec<&str> = completion.items.iter().map(|i| i.label.as_str()).collect();
+        completion.filtered = if prefix.is_empty() {
+            (0..labels.len()).collect()
+        } else {
+            crate::palette::fuzzy_indices(&prefix, &labels)
+        };
+        if completion.filtered.is_empty() {
+            self.completion = None;
+        } else {
+            completion.selected = completion.selected.min(completion.filtered.len() - 1);
+        }
     }
 
     fn handle_editor_event(&mut self, event: EditorEvent) {
@@ -792,17 +1096,18 @@ impl App {
                 if let (Some(client), Some(editor)) = (&self.lsp, &self.editor) {
                     let (line, character) = editor.cursor_lsp_position();
                     client.request_hover(&editor.path, line, character);
-                    self.hover_via_key = true;
-                    self.hover_doc_pos = Some(editor.cursor_line_col());
+                    self.code_view.hover_via_key = true;
+                    self.code_view.hover_doc_pos = Some(editor.cursor_line_col());
                     let (cursor_line, cursor_col) = editor.cursor_line_col();
                     let text_area = self.layout.editor_text;
-                    self.hover_anchor = cursor_line.checked_sub(editor.scroll).map(|row| {
-                        Position::new(
-                            text_area.x
-                                + (cursor_col as u16).min(text_area.width.saturating_sub(1)),
-                            text_area.y + (row as u16).min(text_area.height.saturating_sub(1)),
-                        )
-                    });
+                    self.code_view.hover_anchor =
+                        cursor_line.checked_sub(editor.scroll).map(|row| {
+                            Position::new(
+                                text_area.x
+                                    + (cursor_col as u16).min(text_area.width.saturating_sub(1)),
+                                text_area.y + (row as u16).min(text_area.height.saturating_sub(1)),
+                            )
+                        });
                     self.status_msg = Some("hover…".into());
                 } else {
                     self.status_msg = Some("no language server for this file".into());
@@ -833,7 +1138,7 @@ impl App {
                     client.request_formatting(&editor.path, tab_size, spaces);
                     // edits are only valid against the buffer they were
                     // computed from — remember which revision that is
-                    self.fmt_pending = Some(editor.revision);
+                    self.code_view.fmt_pending = Some(editor.revision);
                     self.status_msg = Some("formatting…".into());
                 } else {
                     self.status_msg = Some("no language server for this file".into());
@@ -843,7 +1148,7 @@ impl App {
                 self.focus = Focus::Sidebar;
             }
             EditorEvent::JumpBack => {
-                if let Some((path, pos)) = self.jump_stack.pop() {
+                if let Some((path, pos)) = self.code_view.jump_stack.pop() {
                     self.navigate_to_char(&path, pos);
                 } else {
                     self.status_msg = Some("jump list empty".into());
@@ -875,44 +1180,18 @@ impl App {
     /// Open the command palette (Ctrl+K): files by default, `>` commands.
     pub fn open_palette(&mut self) {
         let mut commands = vec![
-            CommandEntry { label: "agent: new".into(), action: PaletteAction::NewAgent },
-            CommandEntry {
-                label: "agent: rename current".into(),
-                action: PaletteAction::RenameAgent,
-            },
-            CommandEntry {
-                label: "agent: respawn current".into(),
-                action: PaletteAction::RespawnAgent,
-            },
-            CommandEntry {
-                label: "agent: close current".into(),
-                action: PaletteAction::CloseAgent,
-            },
-        ];
-        for (i, session) in self.sessions.sessions.iter().enumerate() {
-            commands.push(CommandEntry {
-                label: format!("agent: switch to {}", session.title),
-                action: PaletteAction::SelectAgent(i),
-            });
-        }
-        commands.extend([
+            CommandEntry { label: "agent: start".into(), action: PaletteAction::StartAgent },
             CommandEntry { label: "git: commit…".into(), action: PaletteAction::GitCommit },
             CommandEntry { label: "git: stage all".into(), action: PaletteAction::GitStageAll },
             CommandEntry { label: "git: diff all changes".into(), action: PaletteAction::DiffAll },
             CommandEntry { label: "view: files sidebar".into(), action: PaletteAction::ShowFiles },
             CommandEntry { label: "view: git changes".into(), action: PaletteAction::ShowGit },
-            CommandEntry { label: "view: chat history".into(), action: PaletteAction::ShowChats },
-        ]);
+            CommandEntry { label: "view: agent".into(), action: PaletteAction::ShowAgent },
+        ];
         if self.editor.is_some() {
             commands.push(CommandEntry {
                 label: "view: editor".into(),
                 action: PaletteAction::FocusEditor,
-            });
-        }
-        for chat in self.chats.chats.iter().take(8) {
-            commands.push(CommandEntry {
-                label: format!("chat: resume {}", chat.summary),
-                action: PaletteAction::ResumeChat(chat.session_id.clone()),
             });
         }
         commands.extend([
@@ -935,25 +1214,7 @@ impl App {
         self.overlay = None;
         match action {
             PaletteAction::OpenFile(path) => self.open_file(&path),
-            PaletteAction::NewAgent => {
-                self.spawn_session();
-                self.shell = Shell::Agents;
-            }
-            PaletteAction::SelectAgent(i) => {
-                self.sessions.select(i);
-                self.shell = Shell::Agents;
-                self.focus = Focus::Terminal;
-            }
-            PaletteAction::RenameAgent => {
-                if let Some(session) = self.sessions.active_session() {
-                    self.overlay = Some(Overlay::RenamePrompt(session.title.clone()));
-                }
-            }
-            PaletteAction::RespawnAgent => match self.sessions.respawn_active() {
-                Ok(()) => self.status_msg = Some("session respawned".into()),
-                Err(e) => self.status_msg = Some(format!("respawn failed: {e}")),
-            },
-            PaletteAction::CloseAgent => self.sessions.close_active(),
+            PaletteAction::StartAgent => self.start_configured_agent_or_warn(),
             PaletteAction::GitCommit => {
                 if self.git.is_repo() {
                     self.overlay = Some(Overlay::CommitPrompt(String::new()));
@@ -980,29 +1241,11 @@ impl App {
             }
             PaletteAction::ShowFiles => self.switch_shell(Shell::Code),
             PaletteAction::ShowGit => self.switch_shell(Shell::Git),
-            PaletteAction::ShowChats => {
-                self.switch_shell(Shell::Agents);
-                self.focus = Focus::Sidebar;
-            }
+            PaletteAction::ShowAgent => self.switch_shell(Shell::Agents),
             PaletteAction::FocusEditor => {
                 if self.editor.is_some() {
                     self.shell = Shell::Code;
                     self.focus = Focus::Terminal;
-                }
-            }
-            PaletteAction::ResumeChat(id) => {
-                let mut cmd = self.claude_cmd.clone();
-                cmd.push("--resume".into());
-                cmd.push(id.clone());
-                let (rows, cols) = self.term_size;
-                match self.sessions.spawn(&cmd, &self.workdir, rows, cols) {
-                    Ok(()) => {
-                        self.focus = Focus::Terminal;
-                        self.shell = Shell::Agents;
-                        let short: String = id.chars().take(8).collect();
-                        self.status_msg = Some(format!("resuming chat {short}"));
-                    }
-                    Err(e) => self.status_msg = Some(format!("resume failed: {e}")),
                 }
             }
             PaletteAction::ToggleHidden => {
@@ -1029,13 +1272,13 @@ impl App {
     /// file / no repo).
     pub fn editor_gutter_diff(&mut self) -> Option<crate::diff::GutterDiff> {
         let editor = self.editor.as_ref()?;
-        let base = self.editor_head.as_ref()?;
+        let base = self.code_view.editor_head.as_ref()?;
         let rev = editor.revision;
-        if self.editor_diff.as_ref().map(|(r, _)| *r) != Some(rev) {
+        if self.code_view.editor_diff.as_ref().map(|(r, _)| *r) != Some(rev) {
             let current = editor.text.to_string();
-            self.editor_diff = Some((rev, crate::diff::gutter_diff(base, &current)));
+            self.code_view.editor_diff = Some((rev, crate::diff::gutter_diff(base, &current)));
         }
-        self.editor_diff.as_ref().map(|(_, d)| d.clone())
+        self.code_view.editor_diff.as_ref().map(|(_, d)| d.clone())
     }
 
     /// The hover text for a gutter change marker at `line`: the hunk as a
@@ -1045,7 +1288,7 @@ impl App {
         let editor = self.editor.as_ref()?;
         let total = editor.text.len_lines();
         let (before, after) = marks.hunk_at(line, total)?.clone();
-        let base = self.editor_head.as_ref()?;
+        let base = self.code_view.editor_head.as_ref()?;
         let base_lines: Vec<&str> = base.lines().collect();
         let mut out = String::from(
             "```diff
@@ -1095,8 +1338,13 @@ impl App {
             show_hidden: self.tree.show_hidden,
             spell_check: editor.map_or(self.config.spell_check, |e| e.spell_check),
             mark_unicode: editor.map_or(self.config.mark_unicode, |e| e.mark_unicode),
+            icons: self.config.icons,
+            check_for_updates: self.config.check_for_updates,
+            bell: self.config.bell,
             mouse_scroll_multiplier: self.config.mouse_scroll_multiplier,
             keybinds: self.config.keybinds.clone(),
+            agent: self.config.agent.clone(),
+            title_model: self.config.title_model.clone(),
             lsp: self.config.lsp.clone(),
         };
         match cfg.save_global() {
@@ -1108,15 +1356,583 @@ impl App {
         }
     }
 
-    pub fn spawn_session(&mut self) {
-        let cmd = self.claude_cmd.clone();
-        let (rows, cols) = self.term_size;
-        match self.sessions.spawn(&cmd, &self.workdir, rows, cols) {
-            Ok(()) => {
-                self.focus = Focus::Terminal;
+    /// Start an ACP agent connection. Its live session auto-opens once the
+    /// handshake creates it (see [`acp_autofocus`](Self::acp_autofocus)).
+    /// Returns false (with a status message) if the binary couldn't launch.
+    pub fn start_acp(&mut self, command: &[String]) -> bool {
+        match AcpClient::start(command, &self.workdir, std::sync::Arc::clone(&self.acp_fs)) {
+            Some(client) => {
+                let idx = self.acp.add(client, agent_label(command));
+                self.agent_view.focus_conn = Some(idx);
+                self.shell = Shell::Agents;
+                self.focus = Focus::Sidebar;
                 self.status_msg = None;
+                true
             }
-            Err(e) => self.status_msg = Some(format!("spawn failed: {e}")),
+            None => {
+                self.status_msg = Some(format!("couldn't launch agent: {}", command.join(" ")));
+                false
+            }
+        }
+    }
+
+    /// The flattened agent→session tree: each connection, then its sessions
+    /// unless it's collapsed. Both nav and render walk this.
+    pub fn acp_rows(&self) -> Vec<AcpRow> {
+        let mut rows = Vec::new();
+        for (ci, conn) in self.acp.conns().iter().enumerate() {
+            rows.push(AcpRow::Agent(ci));
+            if !self.agent_view.collapsed.contains(&ci) {
+                for sess in conn.sessions() {
+                    rows.push(AcpRow::Session(ci, sess.id));
+                }
+            }
+        }
+        rows
+    }
+
+    /// Open a session in the main pane, loading its history if needed.
+    fn open_acp_session(&mut self, conn: usize, id: String) {
+        if let Some(client) = self.acp.conn(conn) {
+            client.open_session(&id);
+        }
+        self.agent_view.ui.entry(id.clone()).or_default();
+        self.agent_view.open = Some((conn, id));
+        self.agent_view.mode_menu = None;
+        self.agent_view.mention = None;
+        self.shell = Shell::Agents;
+        self.focus = Focus::Terminal;
+    }
+
+    /// Files handed to the agent as prompt context for a submitted `text`:
+    /// every `@path` mention that resolves to a real file, then the open
+    /// editor buffer. Deduped by path. The agent reads each back through our
+    /// `fs`, so unsaved edits are included.
+    fn acp_prompt_context(&self, text: &str) -> Vec<crate::acp::ContextFile> {
+        let mut ctx: Vec<crate::acp::ContextFile> = Vec::new();
+        // @-mentions in the message
+        for token in text.split_whitespace() {
+            if let Some(rel) = token.strip_prefix('@').filter(|r| !r.is_empty()) {
+                let path = self.workdir.join(rel);
+                if path.is_file() {
+                    ctx.push(crate::acp::ContextFile { path, name: rel.to_string() });
+                }
+            }
+        }
+        // the active editor file
+        if let Some(editor) = &self.editor {
+            let name = editor
+                .path
+                .strip_prefix(&self.workdir)
+                .unwrap_or(&editor.path)
+                .to_string_lossy()
+                .into_owned();
+            ctx.push(crate::acp::ContextFile { path: editor.path.clone(), name });
+        }
+        // dedupe by path, keeping the first mention
+        let mut seen = HashSet::new();
+        ctx.retain(|c| seen.insert(c.path.clone()));
+        ctx
+    }
+
+    /// Re-derive the @-mention picker from the composer's text and cursor: if
+    /// the cursor sits in an `@token`, (re)open the picker filtered by that
+    /// token; otherwise close it. Called after every composer edit.
+    fn sync_mention(&mut self) {
+        let Some((_, id)) = self.agent_view.open.clone() else {
+            self.agent_view.mention = None;
+            return;
+        };
+        let Some(ui) = self.agent_view.ui.get(&id) else {
+            self.agent_view.mention = None;
+            return;
+        };
+        let chars: Vec<char> = ui.input.text().chars().collect();
+        let cursor = ui.input.cursor();
+        let Some(at) = mention_start(&chars, cursor) else {
+            self.agent_view.mention = None;
+            return;
+        };
+        let query: String = chars[at + 1..cursor].iter().collect();
+        // keep the cached file list across keystrokes; build it on open
+        let files = match self.agent_view.mention.take() {
+            Some(m) => m.files,
+            None => crate::palette::workspace_files(&self.workdir),
+        };
+        let results = crate::palette::fuzzy_filter(&query, &files, MENTION_MAX);
+        self.agent_view.mention = Some(MentionState { at, files, results, selected: 0 });
+    }
+
+    /// Accept the highlighted @-mention: replace the `@token` under the cursor
+    /// with `@<path> ` and close the picker.
+    fn accept_mention(&mut self) {
+        let Some(m) = self.agent_view.mention.take() else { return };
+        let Some(rel) = m.results.get(m.selected).cloned() else { return };
+        let Some((_, id)) = self.agent_view.open.clone() else { return };
+        let ui = self.agent_view.ui.entry(id).or_default();
+        let chars: Vec<char> = ui.input.text().chars().collect();
+        // the token runs from the @ to the next whitespace
+        let mut end = m.at;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        let before: String = chars[..m.at].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        let replacement = format!("@{rel} ");
+        let cursor = before.chars().count() + replacement.chars().count();
+        ui.input.set_text(&format!("{before}{replacement}{after}"), cursor);
+    }
+
+    /// The modes offered by the currently open session (empty when none).
+    fn open_session_modes(&self) -> Vec<crate::acp::SessionMode> {
+        let Some((conn, id)) = &self.agent_view.open else { return Vec::new() };
+        self.acp.conn(*conn).map(|c| c.modes(id)).unwrap_or_default()
+    }
+
+    /// Open the composer's mode dropdown, highlighting the active mode. A
+    /// no-op when the open session has no modes.
+    pub fn open_mode_menu(&mut self) {
+        let Some((conn, id)) = self.agent_view.open.clone() else { return };
+        let modes = self.acp.conn(conn).map(|c| c.modes(&id)).unwrap_or_default();
+        if modes.is_empty() {
+            return;
+        }
+        let cur = self.acp.conn(conn).and_then(|c| c.current_mode(&id));
+        let start = cur.and_then(|m| modes.iter().position(|x| x.id == m)).unwrap_or(0);
+        self.agent_view.mode_menu = Some(start);
+    }
+
+    /// Apply the mode at `idx` in the open session's list, then close the menu.
+    fn apply_mode_choice(&mut self, idx: usize) {
+        if let Some((conn, id)) = self.agent_view.open.clone() {
+            let modes = self.acp.conn(conn).map(|c| c.modes(&id)).unwrap_or_default();
+            if let (Some(mode), Some(client)) = (modes.get(idx), self.acp.conn(conn)) {
+                client.set_mode(&id, &mode.id);
+            }
+        }
+        self.agent_view.mode_menu = None;
+    }
+
+    /// Auto-open a freshly started connection's live session once it lands,
+    /// and drop a stale `open` whose session or connection is gone.
+    fn acp_autofocus(&mut self) {
+        if let Some(conn) = self.agent_view.focus_conn
+            && let Some(client) = self.acp.conn(conn)
+            && let Some(live) = client.sessions().into_iter().find(|s| s.loaded)
+        {
+            self.agent_view.focus_conn = None;
+            let id = live.id;
+            self.open_acp_session(conn, id.clone());
+            // park the cursor on the opened session's row
+            if let Some(row) = self
+                .acp_rows()
+                .iter()
+                .position(|r| matches!(r, AcpRow::Session(c, s) if *c == conn && *s == id))
+            {
+                self.agent_view.cursor = row;
+            }
+        }
+        // drop an open session that no longer exists
+        if let Some((conn, id)) = self.agent_view.open.clone()
+            && self.acp.conn(conn).is_none_or(|c| !c.has_session(&id))
+        {
+            self.agent_view.open = None;
+        }
+    }
+
+    /// The display name for a session: the agent's own title, else an
+    /// OpenRouter-generated one, else the first user message, else a
+    /// placeholder — the fallback chain for the tree and status bar.
+    pub fn acp_session_label(&self, conn: usize, id: &str) -> String {
+        let client = self.acp.conn(conn);
+        client
+            .and_then(|c| c.title(id))
+            .or_else(|| self.agent_view.titles.get(id).cloned().flatten())
+            .or_else(|| client.and_then(|c| c.session_label(id)))
+            .unwrap_or_else(|| "new session".into())
+    }
+
+    /// Whether the main loop should ring the terminal bell this frame.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.pending_bell)
+    }
+
+    /// Detect the agent edges that warrant an audible nudge: a session
+    /// finishing its turn (working → idle), or a new permission request.
+    /// Returns true if the bell should ring. No-op when `bell` is off.
+    fn detect_agent_bells(&mut self) -> bool {
+        if !self.config.bell {
+            return false;
+        }
+        let mut all = HashSet::new();
+        let mut working = HashSet::new();
+        let mut perms = HashSet::new();
+        for ci in 0..self.acp.len() {
+            let Some(client) = self.acp.conn(ci) else { continue };
+            for s in client.sessions() {
+                all.insert(s.id.clone());
+                if s.working {
+                    working.insert(s.id.clone());
+                }
+                if s.needs_permission {
+                    perms.insert(s.id.clone());
+                }
+            }
+        }
+        // a session that was working and is still here but now idle → ready
+        let became_ready =
+            self.agent_view.working.iter().any(|id| all.contains(id) && !working.contains(id));
+        // a permission that wasn't pending before → needs you
+        let new_perm = perms.iter().any(|id| !self.agent_view.perms.contains(id));
+        self.agent_view.working = working;
+        self.agent_view.perms = perms;
+        became_ready || new_perm
+    }
+
+    /// Kick off OpenRouter title generation for freshly-finished sessions
+    /// the agent didn't title. No-op without `OPENROUTER_API_KEY`.
+    fn maybe_generate_titles(&mut self) {
+        let Some(key) = crate::openrouter::api_key() else { return };
+        let model = self
+            .config
+            .title_model
+            .clone()
+            .unwrap_or_else(|| crate::openrouter::DEFAULT_MODEL.into());
+
+        // collect candidates first (immutable borrow of the manager)
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        for ci in 0..self.acp.len() {
+            let Some(client) = self.acp.conn(ci) else { continue };
+            for sess in client.sessions() {
+                let id = &sess.id;
+                if sess.title.is_some()
+                    || client.turn_active(id)
+                    || self.agent_view.titles.contains_key(id)
+                    || self.agent_view.title_pending.contains(id)
+                {
+                    continue;
+                }
+                let entries = client.entries(id);
+                if let Some(transcript) = title_transcript(&entries) {
+                    jobs.push((id.clone(), transcript));
+                }
+            }
+        }
+        for (id, transcript) in jobs {
+            self.agent_view.title_pending.insert(id.clone());
+            let (key, model, tx) = (key.clone(), model.clone(), self.title_tx.clone());
+            std::thread::spawn(move || {
+                let title = crate::openrouter::generate_title(&key, &model, &transcript);
+                let _ = tx.send((id, title));
+            });
+        }
+    }
+
+    /// Mirror the open editor buffer into the fs overlay (only when it
+    /// changed) so agents reading through `fs/read_text_file` see unsaved
+    /// edits. vibin has one editor, so the overlay holds at most one file.
+    fn sync_acp_fs(&mut self) {
+        let now = self.editor.as_ref().map(|e| (e.path.clone(), e.revision));
+        if now == self.acp_fs_synced {
+            return;
+        }
+        self.acp_fs_synced = now;
+        if let Ok(mut overlay) = self.acp_fs.lock() {
+            overlay.clear();
+            if let Some(editor) = &self.editor {
+                overlay.insert(editor.path.clone(), editor.text.to_string());
+            }
+        }
+    }
+
+    /// Reflect files agents wrote through `fs/write_text_file`: refresh the
+    /// tree and git status, and reload a clean open buffer (warn on an
+    /// unsaved conflict). Returns true if anything changed.
+    fn drain_acp_writes(&mut self) -> bool {
+        let mut written: Vec<PathBuf> = Vec::new();
+        for i in 0..self.acp.len() {
+            if let Some(conn) = self.acp.conn(i) {
+                written.extend(conn.take_fs_writes());
+            }
+        }
+        if written.is_empty() {
+            return false;
+        }
+        for path in &written {
+            // the agent's path may not be canonicalized the way the editor
+            // path is (macOS /var vs /private/var) — reconcile before comparing
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let open_here = self.editor.as_ref().is_some_and(|e| e.path == canon);
+            if !open_here {
+                continue;
+            }
+            if self.editor.as_ref().is_some_and(|e| e.dirty) {
+                let name =
+                    canon.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.notify(
+                    ToastLevel::Warn,
+                    format!("agent wrote {name} — you have unsaved changes"),
+                );
+            } else {
+                self.reload_editor_in_place(&canon);
+            }
+        }
+        self.git.refresh();
+        self.tree.refresh();
+        true
+    }
+
+    /// Re-read the open file from disk (an agent wrote it) without moving
+    /// shells or focus, keeping the cursor where it was.
+    fn reload_editor_in_place(&mut self, path: &std::path::Path) {
+        let cursor = self.editor.as_ref().map(|e| e.head);
+        let Ok(mut editor) = Editor::open(path) else { return };
+        editor.spell_check = self.config.spell_check && crate::spell::available();
+        editor.mark_unicode = self.config.mark_unicode;
+        if let Some(pos) = cursor {
+            editor.jump_to_char(pos.min(editor.text.len_chars()));
+        }
+        self.code_view.editor_head = self.git.head_text(path);
+        self.code_view.editor_diff = None;
+        if let Some(client) = &self.lsp {
+            client.did_change(path, &editor.text.to_string(), self.lsp_doc_version + 1);
+            self.lsp_doc_version += 1;
+        }
+        self.editor = Some(editor);
+    }
+
+    /// Launch the workspace's configured agent, if one is set. Silent when
+    /// none is configured — the agents shell shows its own empty state.
+    pub fn start_configured_agent(&mut self) {
+        if let Some(cmd) = self.config.agent_command() {
+            self.start_acp(&cmd);
+        }
+    }
+
+    /// Like [`start_configured_agent`], but says so when nothing is set —
+    /// for the explicit "start agent" action/palette entry.
+    fn start_configured_agent_or_warn(&mut self) {
+        match self.config.agent_command() {
+            Some(cmd) => {
+                self.start_acp(&cmd);
+            }
+            None => {
+                self.status_msg =
+                    Some("no agent configured — set `agent` in .vibin/config.toml".into());
+            }
+        }
+    }
+
+    /// Keys for the open ACP conversation (agents shell, terminal focus).
+    /// A pending permission grabs input first: digits pick an option, Esc
+    /// rejects. Otherwise it's a single-line composer — Enter submits, Esc
+    /// cancels the turn, and all state is keyed by the open session id.
+    fn handle_acp_key(&mut self, key: KeyEvent) {
+        let Some((conn, id)) = self.agent_view.open.clone() else { return };
+        // permission prompt open: digits select, Esc rejects
+        if let Some(perm) = self.acp.conn(conn).and_then(|c| c.pending_permission(&id)) {
+            match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = c as usize - '1' as usize;
+                    if let Some(opt) = perm.options.get(idx)
+                        && let Some(client) = self.acp.conn(conn)
+                    {
+                        client.respond_permission(&id, Some(&opt.id));
+                    }
+                }
+                KeyCode::Esc => {
+                    if let Some(client) = self.acp.conn(conn) {
+                        client.respond_permission(&id, None);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        // mode dropdown open: arrows move the highlight, Enter applies, Esc/Tab close
+        if let Some(sel) = self.agent_view.mode_menu {
+            let modes = self.acp.conn(conn).map(|c| c.modes(&id)).unwrap_or_default();
+            let n = modes.len().max(1);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.agent_view.mode_menu = Some((sel + n - 1) % n);
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::BackTab => {
+                    self.agent_view.mode_menu = Some((sel + 1) % n);
+                }
+                KeyCode::Enter => self.apply_mode_choice(sel),
+                KeyCode::Esc | KeyCode::Tab => self.agent_view.mode_menu = None,
+                _ => {}
+            }
+            return;
+        }
+        // @-mention picker open: arrows/Tab move, Enter/Tab accept, Esc closes;
+        // any other key edits the composer, then re-syncs the picker below
+        if let Some(m) = &self.agent_view.mention {
+            let n = m.results.len();
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    if n > 0
+                        && let Some(m) = &mut self.agent_view.mention
+                    {
+                        m.selected = (m.selected + n - 1) % n;
+                    }
+                    return;
+                }
+                KeyCode::Down => {
+                    if n > 0
+                        && let Some(m) = &mut self.agent_view.mention
+                    {
+                        m.selected = (m.selected + 1) % n;
+                    }
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if n > 0 {
+                        self.accept_mention();
+                    } else {
+                        self.agent_view.mention = None;
+                    }
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.agent_view.mention = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let page = self.layout.terminal_pane.height.saturating_sub(3).max(1) as isize;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let word = ctrl || key.modifiers.contains(KeyModifiers::ALT);
+
+        // app-level keys first (they need &mut self, so they can't hold the
+        // composer borrow): transcript scroll, leave, cancel, submit
+        match key.code {
+            KeyCode::Up => return self.scroll_terminal(1),
+            KeyCode::Down => return self.scroll_terminal(-1),
+            KeyCode::PageUp => return self.scroll_terminal(page),
+            KeyCode::PageDown => return self.scroll_terminal(-page),
+            KeyCode::Esc => {
+                self.focus = Focus::Sidebar;
+                return;
+            }
+            // Ctrl+C with no selection cancels the turn (with a selection it
+            // copies, handled below)
+            KeyCode::Char('c')
+                if ctrl
+                    && self
+                        .agent_view
+                        .ui
+                        .get(&id)
+                        .is_none_or(|u| u.input.selection().is_none()) =>
+            {
+                if let Some(client) = self.acp.conn(conn) {
+                    client.cancel(&id);
+                }
+                return;
+            }
+            KeyCode::Enter => {
+                let text = {
+                    let ui = self.agent_view.ui.entry(id.clone()).or_default();
+                    let text = ui.input.text().trim().to_string();
+                    if text.is_empty() {
+                        return;
+                    }
+                    ui.input.clear();
+                    ui.scroll = 0; // snap to the tail on send
+                    text
+                };
+                // hand the agent the @-mentioned files and the open buffer,
+                // so a prompt like "fix this" resolves against real files
+                let context = self.acp_prompt_context(&text);
+                if let Some(client) = self.acp.conn(conn) {
+                    client.prompt_with_context(&id, &text, &context);
+                }
+                return;
+            }
+            // Shift+Tab opens the mode dropdown, highlighting the active mode
+            KeyCode::BackTab => return self.open_mode_menu(),
+            _ => {}
+        }
+
+        // the rest edit the composer, like a small editor text field
+        let input = &mut self.agent_view.ui.entry(id).or_default().input;
+        match key.code {
+            KeyCode::Left if word => input.word_left(shift),
+            KeyCode::Right if word => input.word_right(shift),
+            KeyCode::Left => input.left(shift),
+            KeyCode::Right => input.right(shift),
+            KeyCode::Home => input.home(shift),
+            KeyCode::End => input.end(shift),
+            KeyCode::Backspace if word => input.delete_word_back(),
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Char('v') if ctrl => {
+                if let Some(text) = crate::clipboard::get() {
+                    input.insert_str(&text);
+                }
+            }
+            KeyCode::Char('x') if ctrl => {
+                if let Some(sel) = input.selected_text() {
+                    crate::clipboard::set(&sel);
+                    input.backspace();
+                }
+            }
+            KeyCode::Char('c') if ctrl => {
+                if let Some(sel) = input.selected_text() {
+                    crate::clipboard::set(&sel);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => input.insert_char(c),
+            _ => {}
+        }
+        // an edit may have opened, moved, or closed an @-mention token
+        self.sync_mention();
+    }
+
+    /// Keys for the agents sidebar tree (file-tree idiom): j/k move, h
+    /// collapses a connection or jumps a session to its agent, l/Space
+    /// toggles a connection or opens a session, Enter opens.
+    fn handle_acp_sidebar_key(&mut self, key: KeyEvent) {
+        let rows = self.acp_rows();
+        if rows.is_empty() {
+            return;
+        }
+        self.agent_view.cursor = self.agent_view.cursor.min(rows.len() - 1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.agent_view.cursor = (self.agent_view.cursor + 1).min(rows.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.agent_view.cursor = self.agent_view.cursor.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') | KeyCode::Right => {
+                match rows[self.agent_view.cursor].clone() {
+                    AcpRow::Agent(ci) => {
+                        if !self.agent_view.collapsed.remove(&ci) {
+                            self.agent_view.collapsed.insert(ci);
+                        }
+                    }
+                    AcpRow::Session(ci, id) => self.open_acp_session(ci, id),
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => match &rows[self.agent_view.cursor] {
+                // collapse the connection, or hop a session up to its agent
+                AcpRow::Agent(ci) => {
+                    self.agent_view.collapsed.insert(*ci);
+                }
+                AcpRow::Session(ci, _) => {
+                    if let Some(row) =
+                        rows.iter().position(|r| matches!(r, AcpRow::Agent(c) if c == ci))
+                    {
+                        self.agent_view.cursor = row;
+                    }
+                }
+            },
+            KeyCode::Char('c') => self.start_configured_agent_or_warn(),
+            _ => {}
         }
     }
 
@@ -1136,7 +1952,7 @@ impl App {
             self.focus = Focus::Terminal;
         } else {
             // open_file refused (dirty buffer) — drop the failed jump
-            self.jump_stack.pop();
+            self.code_view.jump_stack.pop();
         }
     }
 
@@ -1171,15 +1987,15 @@ impl App {
         {
             return false;
         }
-        let Some((pos, since)) = self.mouse_rest else {
+        let Some((pos, since)) = self.code_view.mouse_rest else {
             return false;
         };
-        if since.elapsed() < DWELL || self.hover_sent_for == Some(pos) {
+        if since.elapsed() < DWELL || self.code_view.hover_sent_for == Some(pos) {
             return false;
         }
         // gutter change markers: hovering one shows the hunk as a mini diff
         if self.layout.editor_gutter.contains(pos) {
-            self.hover_sent_for = Some(pos);
+            self.code_view.hover_sent_for = Some(pos);
             let line = self
                 .editor
                 .as_ref()
@@ -1187,7 +2003,7 @@ impl App {
             if let Some(line) = line
                 && let Some(text) = self.gutter_hover_text(line)
             {
-                self.hover_anchor = Some(pos);
+                self.code_view.hover_anchor = Some(pos);
                 self.overlay =
                     Some(Overlay::Hover(HoverDoc { text, scroll: 0, diagnostics: Vec::new() }));
                 return true;
@@ -1214,8 +2030,8 @@ impl App {
         if let Some(desc) = line_text.chars().nth(col).and_then(crate::confusable::describe) {
             self.overlay =
                 Some(Overlay::Hover(HoverDoc { text: desc, scroll: 0, diagnostics: Vec::new() }));
-            self.hover_sent_for = Some(pos);
-            self.hover_anchor = Some(pos);
+            self.code_view.hover_sent_for = Some(pos);
+            self.code_view.hover_anchor = Some(pos);
             return true;
         }
         self.sync_lsp_document();
@@ -1224,24 +2040,31 @@ impl App {
         };
         let character = crate::lsp::char_to_utf16_col(&line_text, col);
         client.request_hover(&editor.path, line, character);
-        self.hover_sent_for = Some(pos);
-        self.hover_anchor = Some(pos);
-        self.hover_doc_pos = Some((line, col));
+        self.code_view.hover_sent_for = Some(pos);
+        self.code_view.hover_anchor = Some(pos);
+        self.code_view.hover_doc_pos = Some((line, col));
         false // the popup appears when the LSP response lands
     }
 
     /// Terminal cursor shape for the current state: a bar while inserting
     /// or typing a command in the editor, block otherwise.
     pub fn wants_bar_cursor(&self) -> bool {
-        self.screen == Screen::Workspace
-            && self.shell == Shell::Code
-            && self.focus == Focus::Terminal
-            && self.hex.is_none()
-            && self.image.is_none()
-            && self
-                .editor
-                .as_ref()
-                .is_some_and(|e| e.mode == crate::editor::Mode::Insert || e.command.is_some())
+        if self.screen != Screen::Workspace || self.focus != Focus::Terminal {
+            return false;
+        }
+        match self.shell {
+            // the editor: only while inserting or in a command line
+            Shell::Code => {
+                self.hex.is_none()
+                    && self.image.is_none()
+                    && self.editor.as_ref().is_some_and(|e| {
+                        e.mode == crate::editor::Mode::Insert || e.command.is_some()
+                    })
+            }
+            // the agent composer is always an insert field, when one is open
+            Shell::Agents => self.agent_view.open.is_some(),
+            Shell::Git => false,
+        }
     }
 
     /// Periodic housekeeping: refresh git status and the file tree.
@@ -1261,7 +2084,18 @@ impl App {
         buttons: Vec<String>,
         reply: Option<ToastReply>,
     ) {
-        self.toasts.push(Toast { level, text: text.into(), born: Instant::now(), buttons, reply });
+        let text = text.into();
+        self.notifications.push((level, text.clone(), Instant::now()));
+        if self.notifications.len() > 200 {
+            self.notifications.remove(0);
+        }
+        // an open pane swallows plain toasts, like VS Code's notification
+        // center — buttoned questions still pop (the pane can't answer them)
+        if self.notifications_open && buttons.is_empty() {
+            self.notifications_seen = self.notifications.len();
+            return;
+        }
+        self.toasts.push(Toast { level, text, born: Instant::now(), buttons, reply });
         if self.toasts.len() > TOAST_CAP
             && let Some(i) = self.toasts.iter().position(|t| t.buttons.is_empty())
         {
@@ -1287,8 +2121,93 @@ impl App {
         }
     }
 
+    /// Rebuild the git pane's display model when its inputs changed —
+    /// or when it's gone stale (500ms: running agents edit files under
+    /// us, and `git diff` per redraw is what this cache replaces).
+    /// Update-phase only; draw just reads `git_pane`.
+    pub fn refresh_git_pane(&mut self, force: bool) {
+        if self.shell != Shell::Git || self.screen != Screen::Workspace {
+            return;
+        }
+        let path = self.git.selected_entry().map(|e| e.path.clone()).unwrap_or_default();
+        // the box picks the diff: staged shows HEAD→index, changes shows
+        // index→worktree
+        let mode = self.git.selected_mode();
+        let sig = (path.clone(), mode, self.git.fold_all, self.git.fold_version);
+        if !force
+            && let Some((p, m, f, v, built)) = &self.git_view.pane_stamp
+            && (p, m, f, v) == (&sig.0, &sig.1, &sig.2, &sig.3)
+            && built.elapsed() < Duration::from_millis(500)
+        {
+            return;
+        }
+        let text = if path.is_empty() {
+            String::new()
+        } else {
+            self.git.diff(Some(&path), mode).unwrap_or_default()
+        };
+        let file_text = std::fs::read_to_string(self.workdir.join(&path)).ok();
+        let lang = {
+            let name = crate::editor::highlight::language_name(std::path::Path::new(&path));
+            (name != "text").then_some(name)
+        };
+        self.git_view.pane = crate::diff::fold_unchanged(
+            crate::diff::parse(&text),
+            self.git.fold_all,
+            &self.git.fold_overrides,
+            file_text.as_deref(),
+            lang,
+        );
+        self.git_view.pane_stamp = Some((sig.0, sig.1, sig.2, sig.3, Instant::now()));
+    }
+
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
+        self.refresh_git_pane(false);
+        // any agent advanced (streamed text, tool call, permission, a new
+        // session) — redraw, and auto-open a freshly started agent's session
+        if self.acp.poll_generation() {
+            self.acp_autofocus();
+            self.maybe_generate_titles();
+            if self.detect_agent_bells() {
+                self.pending_bell = true;
+            }
+            changed = true;
+        }
+        // collect finished OpenRouter title generations
+        while let Ok((id, title)) = self.title_rx.try_recv() {
+            self.agent_view.title_pending.remove(&id);
+            self.agent_view.titles.insert(id, title);
+            changed = true;
+        }
+        // keep the fs overlay in step with the open editor buffer, so an
+        // agent reading through us sees unsaved edits; and reflect files
+        // agents wrote back into the views
+        if !self.acp.is_empty() {
+            self.sync_acp_fs();
+            if self.drain_acp_writes() {
+                changed = true;
+            }
+        }
+        // finished push/pull/fetch: toast the summary line, re-read status
+        if let Some((label, result)) = self.git.poll_op() {
+            if self.status_msg.as_deref() == Some(&format!("{label}…")) {
+                self.status_msg = None;
+            }
+            match result {
+                Ok(out) if out.is_empty() => self.notify(ToastLevel::Info, format!("{label} ✓")),
+                Ok(out) => self.notify(ToastLevel::Info, format!("{label}: {out}")),
+                Err(e) => self.notify(ToastLevel::Error, format!("{label} failed: {e}")),
+            }
+            self.git.refresh();
+            changed = true;
+        }
+        // background highlighter landed: swap the skeleton for real colors
+        if let Some(editor) = &mut self.editor
+            && editor.poll_highlighter()
+        {
+            changed = true;
+        }
         // expire old toasts — ones with buttons wait for an answer, and a
         // hovered stack is being read: keep it fresh instead of pruning
         if self.toast_pointer_over {
@@ -1297,7 +2216,7 @@ impl App {
             }
         } else {
             let live_toasts = self.toasts.len();
-            self.toasts.retain(|t| !t.buttons.is_empty() || t.born.elapsed() < TOAST_TTL);
+            self.toasts.retain(|t| !t.buttons.is_empty() || t.born.elapsed() < toast_ttl(t.level));
             if self.toasts.len() != live_toasts {
                 changed = true;
             }
@@ -1334,29 +2253,10 @@ impl App {
             self.last_anim = Instant::now();
             changed = true;
         }
-        let statuses = self.sessions.statuses();
-        if statuses != self.statuses {
-            // toast when a live session dies (its tab may be off-screen)
-            for (i, status) in statuses.iter().enumerate() {
-                if let crate::session::SessionStatus::Exited(code) = status
-                    && matches!(
-                        self.statuses.get(i),
-                        Some(s) if !matches!(s, crate::session::SessionStatus::Exited(_))
-                    )
-                {
-                    let title =
-                        self.sessions.sessions.get(i).map(|s| s.title.clone()).unwrap_or_default();
-                    let code = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
-                    self.notify(ToastLevel::Warn, format!("session {title} exited ({code})"));
-                }
-            }
-            self.statuses = statuses;
-            changed = true;
-        }
         // formatting reply: apply if it still matches the buffer it was
         // computed from (path and revision), otherwise drop it silently
         if let Some((path, edits)) = self.lsp.as_ref().and_then(|c| c.take_formatting()) {
-            let pending = self.fmt_pending.take();
+            let pending = self.code_view.fmt_pending.take();
             if let Some(editor) = &mut self.editor
                 && editor.path == path
                 && pending == Some(editor.revision)
@@ -1428,7 +2328,7 @@ impl App {
                 // diagnostics under the hovered position show
                 // in the same popup, above the docs
                 let diagnostics: Vec<crate::lsp::Diagnostic> =
-                    match (self.hover_doc_pos, &self.editor) {
+                    match (self.code_view.hover_doc_pos, &self.editor) {
                         (Some((line, col)), Some(editor)) => client
                             .diagnostics(&editor.path)
                             .into_iter()
@@ -1442,14 +2342,14 @@ impl App {
                     };
                 if hover.is_empty() && diagnostics.is_empty() {
                     // only keyboard-initiated hovers report emptiness
-                    if self.hover_via_key {
+                    if self.code_view.hover_via_key {
                         self.status_msg = Some("no hover info".into());
                     }
                 } else {
                     self.overlay =
                         Some(Overlay::Hover(HoverDoc { text: hover, scroll: 0, diagnostics }));
                 }
-                self.hover_via_key = false;
+                self.code_view.hover_via_key = false;
                 changed = true;
             }
         }
@@ -1462,7 +2362,7 @@ impl App {
                 None => self.status_msg = Some("no definition found".into()),
                 Some(loc) => {
                     if let Some(editor) = &self.editor {
-                        self.jump_stack.push((editor.path.clone(), editor.head));
+                        self.code_view.jump_stack.push((editor.path.clone(), editor.head));
                     }
                     let (path, line, character) = (loc.path.clone(), loc.line, loc.character);
                     self.navigate_to(&path, line, character);
@@ -1470,28 +2370,32 @@ impl App {
             }
             changed = true;
         }
-        changed |= self.maybe_dwell_hover();
-        if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
-            changed |= self.git.refresh();
-            self.last_git_refresh = Instant::now();
+        // completion replies: open the popup, filtered by the current prefix
+        if let Some(items) = self.lsp.as_ref().and_then(|c| c.take_completion()) {
+            self.open_completion(items);
+            changed = true;
         }
-        if self.last_tree_refresh.elapsed() >= TREE_REFRESH_INTERVAL {
+        changed |= self.maybe_dwell_hover();
+        if self.git_view.last_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
+            changed |= self.git.refresh();
+            self.git_view.last_refresh = Instant::now();
+        }
+        if self.code_view.last_tree_refresh.elapsed() >= TREE_REFRESH_INTERVAL {
             changed |= self.tree.refresh();
-            self.last_tree_refresh = Instant::now();
+            self.code_view.last_tree_refresh = Instant::now();
         }
         changed
     }
 
     pub fn handle_paste(&mut self, text: &str) {
         if self.overlay.is_some() {
-            if let Some(Overlay::CommitPrompt(buf) | Overlay::RenamePrompt(buf)) = &mut self.overlay
-            {
+            if let Some(Overlay::CommitPrompt(buf)) = &mut self.overlay {
                 buf.push_str(text);
             }
             return;
         }
         // bracketed paste (macOS Cmd+V, terminal middle-click) → the editor
-        // when it's focused, else the active Claude terminal session
+        // when it's focused, else the agent prompt composer
         if self.focus == Focus::Terminal
             && self.shell == Shell::Code
             && self.hex.is_none()
@@ -1502,17 +2406,48 @@ impl App {
             return;
         }
         if self.focus == Focus::Terminal
-            && let Some(session) = self.sessions.active_session()
-            && session.write_input(text.as_bytes()).is_err()
+            && self.shell == Shell::Agents
+            && let Some((_, id)) = self.agent_view.open.clone()
         {
-            self.status_msg = Some("session is not accepting input".into());
+            self.agent_view.ui.entry(id).or_default().input.insert_str(text);
         }
     }
 
     /// Handle a mouse event; returns true when the UI changed.
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
+        let mut redraw = self.handle_mouse_inner(ev);
+        // one link registry, one preview: whatever registered link sits under
+        // the pointer shows its real target in the corner chip — uniform
+        // across the editor's document links, the agent transcript, the hover
+        // popup, notifications, and toasts.
+        if matches!(ev.kind, MouseEventKind::Moved) {
+            let pos = Position::new(ev.column, ev.row);
+            // reverse: links are pushed back-to-front, so the topmost wins
+            let link =
+                self.link_hits.iter().rev().find(|(r, _)| r.contains(pos)).map(|(_, u)| u.clone());
+            if link != self.hovered_link {
+                self.hovered_link = link;
+                redraw = true;
+            }
+        }
+        redraw
+    }
+
+    fn handle_mouse_inner(&mut self, ev: MouseEvent) -> bool {
         if self.screen == Screen::Welcome {
             return self.handle_welcome_mouse(ev);
+        }
+        // git diff: fold-band hover highlight
+        if ev.kind == MouseEventKind::Moved && self.shell == Shell::Git {
+            let pos = Position::new(ev.column, ev.row);
+            let inner_y = self.layout.terminal_pane.y + 1;
+            let hover = (self.layout.terminal_pane.contains(pos) && pos.y >= inner_y)
+                .then(|| self.git_view.diff_scroll_rendered + (pos.y - inner_y) as usize)
+                .filter(|idx| self.git_view.pane.folds.iter().any(|f| f.row == *idx && f.band));
+            if hover != self.git_view.gap_hover {
+                self.git_view.gap_hover = hover;
+                return true;
+            }
         }
         // toasts float above everything: hovering highlights their buttons,
         // clicking a button answers, clicking the card body dismisses
@@ -1607,6 +2542,140 @@ impl App {
                 }
                 _ => false,
             };
+        }
+        // the composer's mode dropdown, when open, owns the mouse: hovering a
+        // row highlights it, a click picks it, a click-away or scroll closes
+        if self.agent_view.mode_menu.is_some() {
+            let pos = Position::new(ev.column, ev.row);
+            let rect = self.layout.agent_mode_menu;
+            let top = rect.y + 1; // first row inside the border
+            let n = self.open_session_modes().len();
+            return match ev.kind {
+                MouseEventKind::Moved if rect.contains(pos) && pos.y >= top => {
+                    let row = (pos.y - top) as usize;
+                    if row < n && self.agent_view.mode_menu != Some(row) {
+                        self.agent_view.mode_menu = Some(row);
+                        return true;
+                    }
+                    false
+                }
+                MouseEventKind::Down(MouseButton::Left) if rect.contains(pos) && pos.y >= top => {
+                    let row = (pos.y - top) as usize;
+                    if row < n {
+                        self.apply_mode_choice(row);
+                    } else {
+                        self.agent_view.mode_menu = None;
+                    }
+                    true
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.agent_view.mode_menu = None;
+                    true
+                }
+                _ => false,
+            };
+        }
+        // the @-mention picker owns the mouse the same way: hover a row, click
+        // to accept it, click-away or scroll closes
+        if self.agent_view.mention.is_some() {
+            let pos = Position::new(ev.column, ev.row);
+            let rect = self.layout.agent_mention_menu;
+            let top = rect.y + 1;
+            let n = self.agent_view.mention.as_ref().map(|m| m.results.len()).unwrap_or(0);
+            return match ev.kind {
+                MouseEventKind::Moved if rect.contains(pos) && pos.y >= top => {
+                    let row = (pos.y - top) as usize;
+                    if row < n
+                        && let Some(m) = &mut self.agent_view.mention
+                        && m.selected != row
+                    {
+                        m.selected = row;
+                        return true;
+                    }
+                    false
+                }
+                MouseEventKind::Down(MouseButton::Left) if rect.contains(pos) && pos.y >= top => {
+                    let row = (pos.y - top) as usize;
+                    if row < n {
+                        if let Some(m) = &mut self.agent_view.mention {
+                            m.selected = row;
+                        }
+                        self.accept_mention();
+                    } else {
+                        self.agent_view.mention = None;
+                    }
+                    true
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.agent_view.mention = None;
+                    true
+                }
+                _ => false,
+            };
+        }
+        // the composer's mode chip: hover highlights it, a click opens the
+        // dropdown — a small button like the menu-bar labels
+        if self.shell == Shell::Agents
+            && self.agent_view.open.is_some()
+            && self.overlay.is_none()
+            && !self.leader_pending
+        {
+            let pos = Position::new(ev.column, ev.row);
+            let over =
+                self.layout.agent_mode_chip.area() > 0 && self.layout.agent_mode_chip.contains(pos);
+            match ev.kind {
+                MouseEventKind::Moved => {
+                    if over != self.agent_view.mode_hover {
+                        self.agent_view.mode_hover = over;
+                        return true;
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if over => {
+                    self.open_mode_menu();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // links inside the notification pane: hover previews, click opens
+        if self.notifications_open {
+            let pos = Position::new(ev.column, ev.row);
+            if self.layout.notifications.contains(pos) {
+                if ev.kind == MouseEventKind::Down(MouseButton::Left)
+                    && self.layout.notifications_clear.contains(pos)
+                {
+                    self.notifications.clear();
+                    self.notifications_seen = 0;
+                    return true;
+                }
+                let url =
+                    self.link_hits.iter().find(|(r, _)| r.contains(pos)).map(|(_, u)| u.clone());
+                match ev.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(url) = url {
+                            self.open_url(&url);
+                            return true;
+                        }
+                    }
+                    MouseEventKind::Moved if url != self.hovered_link => {
+                        self.hovered_link = url;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // the bell chip toggles the notification pane
+        if ev.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.overlay.is_none()
+            && !self.leader_pending
+            && self.layout.menu_bell.contains(Position::new(ev.column, ev.row))
+        {
+            self.notifications_open = !self.notifications_open;
+            if self.notifications_open {
+                self.notifications_seen = self.notifications.len();
+            }
+            return true;
         }
         // hovering a menu-bar label opens its dropdown
         if matches!(ev.kind, MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left))
@@ -1729,6 +2798,7 @@ impl App {
                     let r = self.layout.hover_rect;
                     self.layout.hover_rect.contains(pos)
                         || self
+                            .code_view
                             .hover_anchor
                             .is_some_and(|a| pos.y == a.y && pos.x >= r.x && pos.x < r.right())
                 };
@@ -1742,7 +2812,7 @@ impl App {
                             self.open_url(&url);
                         } else {
                             self.overlay = None;
-                            self.mouse_rest = Some((pos, Instant::now()));
+                            self.code_view.mouse_rest = Some((pos, Instant::now()));
                         }
                         true
                     }
@@ -1773,9 +2843,9 @@ impl App {
                     MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
                         self.overlay = None;
                         self.hovered_link = None;
-                        self.mouse_rest = Some((pos, Instant::now()));
+                        self.code_view.mouse_rest = Some((pos, Instant::now()));
                         // re-arm: resting on the same spot again re-hovers
-                        self.hover_sent_for = None;
+                        self.code_view.hover_sent_for = None;
                         self.handle_mouse(ev);
                         true
                     }
@@ -1783,13 +2853,13 @@ impl App {
                     MouseEventKind::Moved => {
                         self.overlay = None;
                         self.hovered_link = None;
-                        self.mouse_rest = Some((pos, Instant::now()));
-                        self.hover_sent_for = None;
+                        self.code_view.mouse_rest = Some((pos, Instant::now()));
+                        self.code_view.hover_sent_for = None;
                         true
                     }
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         self.overlay = None;
-                        self.mouse_rest = None;
+                        self.code_view.mouse_rest = None;
                         self.handle_mouse(ev);
                         true
                     }
@@ -1826,11 +2896,11 @@ impl App {
         let pos = Position::new(ev.column, ev.row);
         // any movement re-arms the dwell timer
         if matches!(ev.kind, MouseEventKind::Moved) {
-            match self.mouse_rest {
+            match self.code_view.mouse_rest {
                 Some((old, _)) if old == pos => {}
                 _ => {
-                    self.mouse_rest = Some((pos, Instant::now()));
-                    self.hover_sent_for = None;
+                    self.code_view.mouse_rest = Some((pos, Instant::now()));
+                    self.code_view.hover_sent_for = None;
                 }
             }
             // hovering the gutter fills that line's change marker
@@ -1841,44 +2911,27 @@ impl App {
                         .map(|e| e.scroll + (pos.y - self.layout.editor_gutter.y) as usize)
                 })
                 .flatten();
-            if hover != self.gutter_hover {
-                self.gutter_hover = hover;
+            if hover != self.code_view.gutter_hover {
+                self.code_view.gutter_hover = hover;
                 return true;
             }
-            // hovering a document link shows the target as a preview chip
-            if self.overlay.is_none()
-                && self.shell == Shell::Code
-                && self.hex.is_none()
-                && self.image.is_none()
-            {
-                let url = (self.layout.editor_text.contains(pos))
-                    .then(|| {
-                        let editor = self.editor.as_ref()?;
-                        let line = editor.scroll + (pos.y - self.layout.editor_text.y) as usize;
-                        let col = editor.hscroll + (pos.x - self.layout.editor_text.x) as usize;
-                        self.link_at(line, col).map(|l| l.target)
-                    })
-                    .flatten();
-                if url != self.hovered_link {
-                    self.hovered_link = url;
-                    return true;
-                }
-            }
+            // document links preview via the shared link_hits pass below, like
+            // every other link
             return false;
         }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_held = true;
-                self.click_extends = ev.modifiers.contains(KeyModifiers::SHIFT);
-                self.click_goto = ev.modifiers.contains(KeyModifiers::CONTROL);
+                self.code_view.click_extends = ev.modifiers.contains(KeyModifiers::SHIFT);
+                self.code_view.click_goto = ev.modifiers.contains(KeyModifiers::CONTROL);
                 self.handle_click(pos)
             }
             MouseEventKind::Up(_) => {
                 self.mouse_held = false;
                 // start the dwell clock fresh — no instant popup where the
                 // selection ended
-                self.mouse_rest = Some((pos, Instant::now()));
-                self.hover_sent_for = None;
+                self.code_view.mouse_rest = Some((pos, Instant::now()));
+                self.code_view.hover_sent_for = None;
                 false
             }
             // dragging sweeps a selection in the editor
@@ -1934,18 +2987,18 @@ impl App {
                                 editor.scroll_by(-delta, viewport);
                             } else {
                                 let len = Self::code_home_items().len();
-                                self.code_home_selected = if delta > 0 {
-                                    self.code_home_selected.saturating_sub(1)
+                                self.code_view.home_selected = if delta > 0 {
+                                    self.code_view.home_selected.saturating_sub(1)
                                 } else {
-                                    (self.code_home_selected + 1).min(len - 1)
+                                    (self.code_view.home_selected + 1).min(len - 1)
                                 };
                             }
                         }
                         Shell::Git => {
-                            self.git_diff_scroll = if delta < 0 {
-                                self.git_diff_scroll + delta.unsigned_abs()
+                            self.git_view.diff_scroll = if delta < 0 {
+                                self.git_view.diff_scroll + delta.unsigned_abs()
                             } else {
-                                self.git_diff_scroll.saturating_sub(delta as usize)
+                                self.git_view.diff_scroll.saturating_sub(delta as usize)
                             };
                         }
                         Shell::Agents => self.scroll_terminal(delta),
@@ -1959,12 +3012,11 @@ impl App {
                             (Shell::Code, false) => self.tree.select_next(),
                             (Shell::Git, true) => self.git.select_prev(),
                             (Shell::Git, false) => self.git.select_next(),
-                            (Shell::Agents, true) => self.chats.select_prev(),
-                            (Shell::Agents, false) => self.chats.select_next(),
+                            (Shell::Agents, _) => {}
                         }
                     }
                     if self.shell == Shell::Git {
-                        self.git_diff_scroll = 0;
+                        self.git_view.diff_scroll = 0;
                     }
                     return true;
                 }
@@ -2002,20 +3054,34 @@ impl App {
     }
 
     fn handle_click(&mut self, pos: Position) -> bool {
-        if self.shell == Shell::Agents && self.layout.session_tabs.contains(pos) {
-            let hit = self
-                .session_tab_hits
-                .iter()
-                .find(|(start, end, _)| pos.x >= *start && pos.x < *end)
-                .map(|(_, _, idx)| *idx);
-            if let Some(idx) = hit {
-                self.sessions.select(idx);
-            }
-            self.focus = Focus::Terminal;
-            return true;
-        }
         if self.layout.terminal_pane.contains(pos) {
             self.focus = Focus::Terminal;
+            // a click on a transcript markdown link opens it (terminals with
+            // OSC 8 open it themselves; this covers the rest)
+            if self.shell == Shell::Agents
+                && let Some((_, url)) = self.link_hits.iter().find(|(r, _)| r.contains(pos))
+            {
+                let url = url.clone();
+                self.open_url(&url);
+                return true;
+            }
+            // git diff: a band click expands its region; a click on an
+            // expanded region's context lines folds it back
+            if self.shell == Shell::Git && !self.git_view.pane.folds.is_empty() {
+                let inner_y = self.layout.terminal_pane.y + 1;
+                if pos.y >= inner_y {
+                    let idx = self.git_view.diff_scroll_rendered + (pos.y - inner_y) as usize;
+                    if let Some(fold) = self.git_view.pane.folds.iter().find(|f| f.row == idx) {
+                        let key = fold.key;
+                        if !self.git.fold_overrides.remove(&key) {
+                            self.git.fold_overrides.insert(key);
+                        }
+                        self.git.fold_version += 1;
+                        self.refresh_git_pane(false);
+                        return true;
+                    }
+                }
+            }
             if self.shell == Shell::Code
                 && let Some(hex) = &mut self.hex
             {
@@ -2036,10 +3102,10 @@ impl App {
             {
                 let idx = (pos.y - self.layout.home_list.y) as usize;
                 if idx < Self::code_home_items().len() {
-                    if self.code_home_selected == idx {
+                    if self.code_view.home_selected == idx {
                         self.run_code_home_item(idx);
                     } else {
-                        self.code_home_selected = idx;
+                        self.code_view.home_selected = idx;
                     }
                 }
                 return true;
@@ -2053,10 +3119,11 @@ impl App {
                 let row = (pos.y - self.layout.editor_text.y) as usize;
                 let col = (pos.x - self.layout.editor_text.x) as usize;
                 let double = self
+                    .code_view
                     .last_editor_click
                     .is_some_and(|(at, p)| p == pos && at.elapsed() < Duration::from_millis(400));
-                editor.click(row, col, self.click_extends);
-                if self.click_goto {
+                editor.click(row, col, self.code_view.click_extends);
+                if self.code_view.click_goto {
                     // ctrl+click on a document link opens it; anywhere
                     // else it's goto definition at the clicked spot
                     let (line, col) = editor.cursor_line_col();
@@ -2065,12 +3132,12 @@ impl App {
                     } else {
                         self.handle_editor_event(EditorEvent::GotoDefinition);
                     }
-                    self.last_editor_click = None;
+                    self.code_view.last_editor_click = None;
                 } else if double {
                     editor.select_word();
-                    self.last_editor_click = None;
+                    self.code_view.last_editor_click = None;
                 } else {
-                    self.last_editor_click = Some((Instant::now(), pos));
+                    self.code_view.last_editor_click = Some((Instant::now(), pos));
                 }
             }
             return true;
@@ -2080,7 +3147,7 @@ impl App {
             let row = (pos.y - self.layout.sidebar_list.y) as usize;
             match self.shell {
                 Shell::Code => {
-                    let idx = self.tree_list.offset() + row;
+                    let idx = self.code_view.tree_list.offset() + row;
                     if idx < self.tree.items.len() {
                         if self.tree.selected == idx {
                             // second click: toggle a directory / open a file
@@ -2097,33 +3164,46 @@ impl App {
                     }
                 }
                 Shell::Git => {
-                    let idx = self.git_list.offset() + row;
-                    // in tree view, rows include directory labels: map the
-                    // clicked row back to its file entry (dirs are inert)
-                    let entry_idx = match self.git.view {
-                        crate::git::GitView::List => (idx < self.git.entries.len()).then_some(idx),
-                        crate::git::GitView::Tree => {
-                            self.git.tree_rows().get(idx).and_then(|r| r.entry)
+                    // display rows are the unified row list plus one inert
+                    // separator row at the staged/unstaged boundary
+                    let rows = self.git.rows();
+                    let split = rows.iter().filter(|r| r.staged).count();
+                    let sep = split > 0 && split < rows.len();
+                    let display = self.git_view.list.offset() + row;
+                    if sep && display == split {
+                        return true; // the separator itself
+                    }
+                    let idx = display - (sep && display > split) as usize;
+                    match rows.get(idx) {
+                        // clicking a directory folds it, like the file tree
+                        Some(r) if r.entry.is_none() => {
+                            self.git.set_cursor(idx);
+                            self.git.toggle_at_cursor();
                         }
-                    };
-                    if let Some(entry_idx) = entry_idx {
-                        if self.git.selected == entry_idx {
+                        Some(_) if self.git.cursor == idx => {
                             // clicking the selection again focuses the diff
                             self.focus = Focus::Terminal;
-                        } else {
-                            self.git.selected = entry_idx;
-                            self.git_diff_scroll = 0;
                         }
+                        Some(_) => {
+                            self.git.set_cursor(idx);
+                            self.git_view.diff_scroll = 0;
+                        }
+                        None => {}
                     }
                 }
+                // the agents sidebar is a tree: click an agent to collapse
+                // it, a session to open it
                 Shell::Agents => {
-                    let idx = self.chats_list.offset() + row;
-                    if idx < self.chats.chats.len() {
-                        if self.chats.selected == idx {
-                            // clicking the selection again resumes it
-                            self.resume_selected_chat();
-                        } else {
-                            self.chats.selected = idx;
+                    let rows = self.acp_rows();
+                    if let Some(hit) = rows.get(row).cloned() {
+                        self.agent_view.cursor = row;
+                        match hit {
+                            AcpRow::Agent(ci) => {
+                                if !self.agent_view.collapsed.remove(&ci) {
+                                    self.agent_view.collapsed.insert(ci);
+                                }
+                            }
+                            AcpRow::Session(ci, id) => self.open_acp_session(ci, id),
                         }
                     }
                 }
@@ -2198,15 +3278,21 @@ impl App {
         }
 
         if is_leader(&key) {
-            // in the editor, Ctrl+A means select-all (the palette carries
+            // in a text field, Ctrl+A means select-all (the palette carries
             // the commands there); everywhere else it is the leader
-            if self.overlay.is_none()
-                && self.focus == Focus::Terminal
-                && self.shell == Shell::Code
-                && let Some(editor) = &mut self.editor
-            {
-                editor.select_all();
-                return;
+            if self.overlay.is_none() && self.focus == Focus::Terminal {
+                if self.shell == Shell::Code
+                    && let Some(editor) = &mut self.editor
+                {
+                    editor.select_all();
+                    return;
+                }
+                if self.shell == Shell::Agents
+                    && let Some((_, id)) = self.agent_view.open.clone()
+                {
+                    self.agent_view.ui.entry(id).or_default().input.select_all();
+                    return;
+                }
             }
             self.leader_pending = true;
             return;
@@ -2226,13 +3312,50 @@ impl App {
             return;
         }
 
+        // agents shell: a connection awaiting authentication grabs the
+        // number keys wherever focus is, so 1–9 signs in
+        if self.shell == Shell::Agents
+            && self.agent_view.open.is_none()
+            && matches!(key.code, KeyCode::Char('1'..='9'))
+            && let Some(conn) = self.acp_auth_target()
+        {
+            self.authenticate_choice(conn, key.code);
+            return;
+        }
+
         match self.focus {
             Focus::Terminal => match self.shell {
-                Shell::Agents => self.forward_to_terminal(key),
+                // the open agent conversation; nothing to type at otherwise
+                Shell::Agents if self.agent_view.open.is_some() => self.handle_acp_key(key),
+                Shell::Agents => {}
                 Shell::Code => self.forward_to_editor(key),
                 Shell::Git => self.handle_git_main_key(key),
             },
             Focus::Sidebar => self.handle_sidebar_key(key),
+        }
+    }
+
+    /// A connection waiting on authentication (the just-started one first,
+    /// else the first that needs it).
+    pub fn acp_auth_target(&self) -> Option<usize> {
+        let needs = |i: usize| {
+            self.acp.conn(i).is_some_and(|c| c.state() == crate::acp::ConnState::NeedsAuth)
+        };
+        self.agent_view
+            .focus_conn
+            .filter(|&c| needs(c))
+            .or_else(|| (0..self.acp.len()).find(|&i| needs(i)))
+    }
+
+    /// Sign in with the Nth advertised auth method of a connection.
+    fn authenticate_choice(&mut self, conn: usize, code: KeyCode) {
+        if let KeyCode::Char(c @ '1'..='9') = code
+            && let Some(client) = self.acp.conn(conn)
+        {
+            let idx = c as usize - '1' as usize;
+            if let Some(method) = client.auth_methods().get(idx) {
+                client.authenticate(&method.id);
+            }
         }
     }
 
@@ -2243,12 +3366,11 @@ impl App {
         match shell {
             Shell::Agents => {
                 self.focus = Focus::Terminal;
-                self.chats.refresh();
             }
             Shell::Git => {
                 self.focus = Focus::Sidebar;
                 self.git.refresh();
-                self.git_diff_scroll = 0;
+                self.git_view.diff_scroll = 0;
             }
             Shell::Code => {
                 self.focus = Focus::Sidebar;
@@ -2259,17 +3381,23 @@ impl App {
     /// Keys for the Git shell's main diff pane.
     fn handle_git_main_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.git_diff_scroll += 1,
+            KeyCode::Char('j') | KeyCode::Down => self.git_view.diff_scroll += 1,
             KeyCode::Char('k') | KeyCode::Up => {
-                self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1)
+                self.git_view.diff_scroll = self.git_view.diff_scroll.saturating_sub(1)
             }
             KeyCode::PageDown | KeyCode::Char('f') => {
-                self.git_diff_scroll += self.git_diff_viewport
+                self.git_view.diff_scroll += self.git_view.diff_viewport
             }
             KeyCode::PageUp | KeyCode::Char('b') => {
-                self.git_diff_scroll = self.git_diff_scroll.saturating_sub(self.git_diff_viewport)
+                self.git_view.diff_scroll =
+                    self.git_view.diff_scroll.saturating_sub(self.git_view.diff_viewport)
             }
-            KeyCode::Char('g') => self.git_diff_scroll = 0,
+            KeyCode::Char('g') => self.git_view.diff_scroll = 0,
+            KeyCode::Char('z') => {
+                self.git.fold_all = !self.git.fold_all;
+                self.git.fold_overrides.clear();
+                self.git_view.diff_scroll = 0;
+            }
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Sidebar,
             _ => {}
         }
@@ -2297,31 +3425,27 @@ impl App {
         use crate::keybind::Action;
         let chord = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         match action {
-            Action::LeaderLiteral => self.forward_to_terminal(chord('a')),
-            Action::NewSession => {
-                self.spawn_session();
-                self.shell = Shell::Agents;
-            }
-            Action::CloseSession => {
-                self.sessions.close_active();
-                if self.sessions.is_empty() {
-                    self.status_msg = Some("no sessions — Ctrl+A c to start one".into());
+            Action::StartAgent => self.start_configured_agent_or_warn(),
+            Action::NextAgent => self.cycle_acp_session(1),
+            Action::PrevAgent => self.cycle_acp_session(-1),
+            Action::GotoAgent(n) => {
+                // open the nth connection's first session
+                if let Some(id) =
+                    self.acp.conn(n).and_then(|c| c.sessions().into_iter().next()).map(|s| s.id)
+                {
+                    self.open_acp_session(n, id);
                 }
             }
-            Action::NextSession => {
-                self.sessions.next();
-                self.shell = Shell::Agents;
-                self.focus = Focus::Terminal;
-            }
-            Action::PrevSession => {
-                self.sessions.prev();
-                self.shell = Shell::Agents;
-                self.focus = Focus::Terminal;
-            }
-            Action::GotoSession(n) => {
-                self.sessions.select(n);
-                self.shell = Shell::Agents;
-                self.focus = Focus::Terminal;
+            Action::CloseAgent => {
+                if let Some((conn, _)) = self.agent_view.open {
+                    self.acp.remove(conn);
+                    self.agent_view.open = None;
+                    self.agent_view.collapsed.clear();
+                    self.acp_autofocus();
+                    if self.acp.is_empty() {
+                        self.status_msg = Some("no agents — Ctrl+A c to start one".into());
+                    }
+                }
             }
             Action::GotoShell(shell) => self.switch_shell(shell),
             Action::FocusEditor => {
@@ -2332,28 +3456,15 @@ impl App {
                     self.status_msg = Some("no file open — Enter on a file in the tree".into());
                 }
             }
-            Action::FocusChats => {
-                self.switch_shell(Shell::Agents);
-                self.focus = Focus::Sidebar;
-            }
+            Action::FocusAgent => self.switch_shell(Shell::Agents),
             Action::DiffAll => self.open_diff(None),
             Action::Refresh => {
                 self.tree.refresh();
                 self.git.refresh();
-                self.chats.refresh();
                 self.status_msg = Some("refreshed".into());
             }
             Action::ScrollUp => self.scroll_terminal(10),
             Action::ScrollDown => self.scroll_terminal(-10),
-            Action::RenameSession => {
-                if let Some(session) = self.sessions.active_session() {
-                    self.overlay = Some(Overlay::RenamePrompt(session.title.clone()));
-                }
-            }
-            Action::RespawnSession => match self.sessions.respawn_active() {
-                Ok(()) => self.status_msg = Some("session respawned".into()),
-                Err(e) => self.status_msg = Some(format!("respawn failed: {e}")),
-            },
             Action::TogglePalette => {
                 if matches!(self.overlay, Some(Overlay::Palette(_))) {
                     self.overlay = None;
@@ -2382,21 +3493,39 @@ impl App {
         }
     }
 
+    /// Scroll the open agent's transcript (lines above the tail; +up).
     fn scroll_terminal(&mut self, delta: isize) {
-        if let Some(session) = self.sessions.active_session() {
-            session.scroll_by(delta);
+        if let Some((_, id)) = self.agent_view.open.clone() {
+            let ui = self.agent_view.ui.entry(id).or_default();
+            ui.scroll = ui.scroll.saturating_add_signed(delta).min(100_000);
         }
     }
 
-    fn forward_to_terminal(&mut self, key: KeyEvent) {
-        let Some(session) = self.sessions.active_session() else {
+    /// Open the session `delta` steps from the currently open one in tree
+    /// order (wrapping), skipping agent header rows.
+    fn cycle_acp_session(&mut self, delta: isize) {
+        let sessions: Vec<(usize, String)> = self
+            .acp_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                AcpRow::Session(ci, id) => Some((ci, id)),
+                AcpRow::Agent(_) => None,
+            })
+            .collect();
+        if sessions.is_empty() {
             return;
-        };
-        if let Some(bytes) = key_to_bytes(&key)
-            && session.write_input(&bytes).is_err()
-        {
-            self.status_msg = Some("session is not accepting input".into());
         }
+        let here = self
+            .agent_view
+            .open
+            .as_ref()
+            .and_then(|(c, id)| sessions.iter().position(|(sc, sid)| sc == c && sid == id));
+        let next = match here {
+            Some(i) => (i as isize + delta).rem_euclid(sessions.len() as isize) as usize,
+            None => 0,
+        };
+        let (conn, id) = sessions[next].clone();
+        self.open_acp_session(conn, id);
     }
 
     fn handle_sidebar_key(&mut self, key: KeyEvent) {
@@ -2412,7 +3541,7 @@ impl App {
             _ => match self.shell {
                 Shell::Code => self.handle_files_key(key),
                 Shell::Git => self.handle_git_key(key),
-                Shell::Agents => self.handle_chats_key(key),
+                Shell::Agents => self.handle_acp_sidebar_key(key),
             },
         }
     }
@@ -2455,19 +3584,29 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.git.select_next();
-                self.git_diff_scroll = 0;
+                self.git_view.diff_scroll = 0;
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.git.select_prev();
-                self.git_diff_scroll = 0;
+                self.git_view.diff_scroll = 0;
             }
             KeyCode::Char('r') => {
                 self.git.refresh();
             }
             KeyCode::Char('t') => self.git.toggle_view(),
+            KeyCode::Char('z') => {
+                self.git.fold_all = !self.git.fold_all;
+                self.git.fold_overrides.clear();
+                self.git_view.diff_scroll = 0;
+            }
             KeyCode::Char('s') => {
                 if let Err(e) = self.git.stage_selected() {
                     self.status_msg = Some(format!("stage failed: {e}"));
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Err(e) = self.git.unstage_selected() {
+                    self.status_msg = Some(format!("unstage failed: {e}"));
                 }
             }
             KeyCode::Char('a') => {
@@ -2475,6 +3614,11 @@ impl App {
                     self.status_msg = Some(format!("stage all failed: {e}"));
                 }
             }
+            // pull stays fast-forward-only: a surprise merge (or worse, a
+            // conflict) has no UI here
+            KeyCode::Char('p') => self.start_git_op("pull", &["pull", "--ff-only"]),
+            KeyCode::Char('P') => self.start_git_op("push", &["push"]),
+            KeyCode::Char('f') => self.start_git_op("fetch", &["fetch", "--prune"]),
             KeyCode::Char('c') => {
                 if self.git.is_repo() {
                     self.overlay = Some(Overlay::CommitPrompt(String::new()));
@@ -2482,53 +3626,26 @@ impl App {
                     self.status_msg = Some("not a git repository".into());
                 }
             }
-            // the diff already fills the main pane: Enter/l moves into it
-            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char('l') | KeyCode::Right => {
+            // Enter folds the directory under the cursor (tree view, like
+            // the file tree); on files the diff already fills the main
+            // pane, so Enter/l moves into it
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !self.git.toggle_at_cursor() {
+                    self.focus = Focus::Terminal;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('l') | KeyCode::Right => {
                 self.focus = Focus::Terminal
             }
             _ => {}
         }
     }
 
-    fn handle_chats_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.chats.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.chats.select_prev(),
-            KeyCode::Char('r') => {
-                self.chats.refresh();
-            }
-            KeyCode::Enter => self.resume_selected_chat(),
-            // move right into the terminal pane
-            KeyCode::Char('l') | KeyCode::Right if !self.sessions.is_empty() => {
-                self.focus = Focus::Terminal;
-            }
-            _ => {}
-        }
-    }
-
-    /// Open the selected past conversation in a new session pane by
-    /// spawning `claude --resume <session-id>`.
-    fn resume_selected_chat(&mut self) {
-        let Some(entry) = self.chats.selected_entry() else {
-            return;
-        };
-        let session_id = entry.session_id.clone();
-        let title = chat_title(&entry.summary);
-        let mut cmd = self.claude_cmd.clone();
-        cmd.push("--resume".into());
-        cmd.push(session_id.clone());
-        let (rows, cols) = self.term_size;
-        match self.sessions.spawn(&cmd, &self.workdir, rows, cols) {
-            Ok(()) => {
-                // name the tab after the chat it resumes, not a funny word
-                if !title.is_empty() {
-                    self.sessions.rename_active(title);
-                }
-                self.focus = Focus::Terminal;
-                let short: String = session_id.chars().take(8).collect();
-                self.status_msg = Some(format!("resuming chat {short}"));
-            }
-            Err(e) => self.status_msg = Some(format!("resume failed: {e}")),
+    /// Kick off a background git network op; completion lands in tick.
+    fn start_git_op(&mut self, label: &'static str, args: &[&str]) {
+        match self.git.spawn_op(label, args) {
+            Ok(()) => self.status_msg = Some(format!("{label}…")),
+            Err(e) => self.notify(ToastLevel::Error, format!("{label}: {e}")),
         }
     }
 
@@ -2576,23 +3693,6 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Overlay::RenamePrompt(buf)) => match key.code {
-                KeyCode::Esc => self.overlay = None,
-                KeyCode::Enter => {
-                    let title = buf.trim().to_string();
-                    self.overlay = None;
-                    if !title.is_empty() {
-                        self.sessions.rename_active(title);
-                    }
-                }
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    buf.push(c);
-                }
-                _ => {}
-            },
             Some(Overlay::CommitPrompt(buf)) => match key.code {
                 KeyCode::Esc => self.overlay = None,
                 KeyCode::Enter => {
@@ -2632,7 +3732,8 @@ impl App {
             self.status_msg = Some("not a git repository".into());
             return;
         }
-        match self.git.diff(path.as_deref()) {
+        // the overlay always shows the full HEAD→worktree story
+        match self.git.diff(path.as_deref(), crate::git::DiffMode::Combined) {
             Ok(text) if text.trim().is_empty() => {
                 self.status_msg = Some("no changes".into());
             }
@@ -2652,18 +3753,71 @@ fn is_leader(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// A tab-friendly agent name from a chat summary: trimmed, and truncated at
-/// a word boundary with an ellipsis when it's too long for the tab bar.
-fn chat_title(summary: &str) -> String {
-    const MAX: usize = 28;
-    let s = summary.trim();
-    if s.chars().count() <= MAX {
-        return s.to_string();
+/// The char index of the `@` beginning the mention token the cursor sits in,
+/// if any: the current non-whitespace run must start with `@` (so `email@x`
+/// doesn't trigger, but `@x` and `see @x` do).
+fn mention_start(chars: &[char], cursor: usize) -> Option<usize> {
+    let mut i = cursor;
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
     }
-    let truncated: String = s.chars().take(MAX - 1).collect();
-    // prefer cutting at the last space, unless that loses too much
-    let cut = truncated.rfind(' ').filter(|&i| i > MAX / 2).unwrap_or(truncated.len());
-    format!("{}…", truncated[..cut].trim_end())
+    (chars.get(i) == Some(&'@')).then_some(i)
+}
+
+/// A compact transcript for title generation: the session's user/agent
+/// turns, capped for tokens. None until there's a complete exchange (at
+/// least one user message and one agent reply) — nothing to title before.
+fn title_transcript(entries: &[crate::acp::Entry]) -> Option<String> {
+    use crate::acp::Entry;
+    let has_user = entries.iter().any(|e| matches!(e, Entry::User(_)));
+    let has_agent = entries.iter().any(|e| matches!(e, Entry::Agent(_)));
+    if !(has_user && has_agent) {
+        return None;
+    }
+    let mut out = String::new();
+    for entry in entries {
+        let (who, text) = match entry {
+            Entry::User(t) => ("User", t.as_str()),
+            Entry::Agent(t) => ("Assistant", t.as_str()),
+            _ => continue,
+        };
+        let clipped: String = text.chars().take(600).collect();
+        out.push_str(who);
+        out.push_str(": ");
+        out.push_str(clipped.trim());
+        out.push('\n');
+        if out.len() > 2000 {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// A readable fallback name for an agent command, used until the agent
+/// reports its own name over ACP. Reaches past runners and flags to the
+/// package/binary, drops the `@scope/`, the `@version`, and the `-acp`
+/// qualifier: `npx @zed-industries/claude-code-acp@0.59` → `claude-code`.
+fn agent_label(command: &[String]) -> String {
+    // runners wrap the real agent — skip them and any flags
+    const RUNNERS: &[&str] =
+        &["npx", "uvx", "bunx", "pnpm", "dlx", "node", "deno", "run", "exec", "python", "python3"];
+    let token = command
+        .iter()
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-') && !RUNNERS.contains(a))
+        .unwrap_or("agent");
+    // strip a version: name==1.2.3 (uvx/pip) or name@1.2.3 (npm; a leading
+    // @ is a scope, not a version)
+    let token = token.split("==").next().unwrap_or(token);
+    let token = match token.rsplit_once('@') {
+        Some((head, _)) if !head.is_empty() => head,
+        _ => token,
+    };
+    // @scope/name or a path → the last segment
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    // a trailing -acp / _acp is a protocol qualifier, not part of the name
+    let name = name.strip_suffix("-acp").or_else(|| name.strip_suffix("_acp")).unwrap_or(name);
+    if name.is_empty() { "agent".into() } else { name.to_string() }
 }
 
 #[cfg(test)]
@@ -2675,10 +3829,7 @@ mod tests {
     fn test_app() -> (TempDir, App) {
         let dir = TempDir::new().unwrap();
         write(dir.path().join("file.txt"), "hello\n").unwrap();
-        let mut app = App::new(
-            dir.path().to_path_buf(),
-            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-        );
+        let mut app = App::new(dir.path().to_path_buf());
         app.lsp_enabled = false; // no real language servers in tests
         (dir, app)
     }
@@ -2692,13 +3843,74 @@ mod tests {
         drop(cfg);
         drop(repo);
         write(dir.path().join("file.txt"), "hello\n").unwrap();
-        let mut app = App::new(
-            dir.path().to_path_buf(),
-            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-        );
+        let mut app = App::new(dir.path().to_path_buf());
         app.git.refresh();
         app.lsp_enabled = false; // no real language servers in tests
         (dir, app)
+    }
+
+    #[test]
+    fn mention_start_finds_the_at_token() {
+        let chars: Vec<char> = "see @src/main".chars().collect();
+        assert_eq!(mention_start(&chars, chars.len()), Some(4)); // the '@'
+        // cursor before the '@' — no active mention
+        assert_eq!(mention_start(&chars, 3), None);
+        // an '@' mid-word (email) doesn't trigger
+        let email: Vec<char> = "user@host".chars().collect();
+        assert_eq!(mention_start(&email, email.len()), None);
+        // a bare '@' at the start
+        let bare: Vec<char> = "@f".chars().collect();
+        assert_eq!(mention_start(&bare, 2), Some(0));
+    }
+
+    #[test]
+    fn at_mentions_and_active_file_become_context() {
+        // a canonical root (as parse_args gives), so editor + mention paths
+        // agree on macOS where TempDir lives under a /var → /private/var link
+        let dir = TempDir::new().unwrap();
+        write(dir.path().join("file.txt"), "hello\n").unwrap();
+        write(dir.path().join("main.rs"), "fn main(){}").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(root.clone());
+        app.lsp_enabled = false;
+        // open a file so the active-file context path is exercised too
+        app.open_file(&root.join("main.rs"));
+        // @file.txt resolves; @nope.txt does not; main.rs is the active file
+        let ctx = app.acp_prompt_context("fix @file.txt and @nope.txt now");
+        let names: Vec<&str> = ctx.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"file.txt"), "mention attached: {names:?}");
+        assert!(!names.contains(&"nope.txt"), "missing file skipped");
+        assert!(names.contains(&"main.rs"), "active file attached");
+        // deduped: mentioning the active file doesn't double it
+        let ctx = app.acp_prompt_context("look at @main.rs");
+        assert_eq!(ctx.iter().filter(|c| c.name == "main.rs").count(), 1, "deduped by path");
+    }
+
+    #[test]
+    fn at_mention_picker_opens_filters_and_inserts() {
+        let (_dir, mut app) = test_app();
+        app.shell = Shell::Agents;
+        app.focus = Focus::Terminal;
+        // a fake open session — the composer path needs no live agent
+        app.agent_view.open = Some((0, "s1".into()));
+        app.agent_view.ui.insert("s1".into(), SessionUi::default());
+
+        for c in "check @fil".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let m = app.agent_view.mention.as_ref().expect("picker open on @token");
+        assert!(m.results.iter().any(|r| r == "file.txt"), "filtered to match: {:?}", m.results);
+
+        // Enter accepts the highlighted file, rewriting the token
+        press(&mut app, KeyCode::Enter);
+        assert!(app.agent_view.mention.is_none(), "picker closes on accept");
+        assert_eq!(app.agent_view.ui.get("s1").unwrap().input.text(), "check @file.txt ");
+
+        // typing a space (or moving off) closes the picker without a match
+        for c in "@zzz ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.agent_view.mention.is_none(), "space ends the token");
     }
 
     #[test]
@@ -2730,7 +3942,7 @@ mod tests {
         drop(repo);
         std::fs::write(dir.path().join("file.txt"), "hello\nworld\n").unwrap();
         app.open_file(&dir.path().join("file.txt"));
-        assert!(app.editor_head.is_some(), "HEAD baseline loaded");
+        assert!(app.code_view.editor_head.is_some(), "HEAD baseline loaded");
         // buffer already differs from HEAD (world line added on disk)
         let d = app.editor_gutter_diff().expect("diff computed");
         assert!(d.added.contains(&1), "{d:?}");
@@ -2794,7 +4006,7 @@ mod tests {
         app.overlay =
             Some(Overlay::Hover(HoverDoc { text: "docs".into(), scroll: 0, diagnostics: vec![] }));
         // popup below the anchor, 30 wide
-        app.hover_anchor = Some(Position::new(40, 5));
+        app.code_view.hover_anchor = Some(Position::new(40, 5));
         app.layout.hover_rect = Rect::new(38, 6, 30, 8);
         let moved = |x, y| MouseEvent {
             kind: MouseEventKind::Moved,
@@ -2826,7 +4038,8 @@ mod tests {
             move |kind| MouseEvent { kind, column: cx, row: cy, modifiers: KeyModifiers::NONE };
         // button down, then the mouse rests mid-drag: no popup may open
         app.handle_mouse(at(MouseEventKind::Down(MouseButton::Left)));
-        app.mouse_rest = Some((Position::new(cx, cy), Instant::now() - Duration::from_secs(2)));
+        app.code_view.mouse_rest =
+            Some((Position::new(cx, cy), Instant::now() - Duration::from_secs(2)));
         app.maybe_dwell_hover();
         assert!(app.overlay.is_none(), "hover suppressed while the button is held");
         // release: the dwell clock restarts, so still no instant popup
@@ -2855,7 +4068,8 @@ mod tests {
         // dwell over the gutter opens the hover overlay
         app.layout.editor_gutter = Rect::new(0, 0, 6, 20);
         app.shell = Shell::Code;
-        app.mouse_rest = Some((Position::new(2, 0), Instant::now() - Duration::from_secs(2)));
+        app.code_view.mouse_rest =
+            Some((Position::new(2, 0), Instant::now() - Duration::from_secs(2)));
         app.maybe_dwell_hover();
         match &app.overlay {
             Some(Overlay::Hover(doc)) => assert!(doc.text.contains("- hello"), "{}", doc.text),
@@ -2873,41 +4087,6 @@ mod tests {
     }
 
     #[test]
-    fn leader_c_spawns_session() {
-        let (_dir, mut app) = test_app();
-        assert!(app.sessions.is_empty());
-        leader(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.sessions.len(), 1);
-        leader(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.sessions.len(), 2);
-        assert_eq!(app.sessions.active, 1);
-    }
-
-    #[test]
-    fn leader_x_closes_session() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        leader(&mut app, KeyCode::Char('x'));
-        assert!(app.sessions.is_empty());
-        assert!(app.status_msg.is_some());
-    }
-
-    #[test]
-    fn leader_n_p_and_digits_switch_sessions() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        leader(&mut app, KeyCode::Char('c'));
-        leader(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.sessions.active, 2);
-        leader(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.sessions.active, 0);
-        leader(&mut app, KeyCode::Char('p'));
-        assert_eq!(app.sessions.active, 2);
-        leader(&mut app, KeyCode::Char('2'));
-        assert_eq!(app.sessions.active, 1);
-    }
-
-    #[test]
     fn leader_q_quits() {
         let (_dir, mut app) = test_app();
         assert!(!app.should_quit);
@@ -2921,10 +4100,11 @@ mod tests {
         leader(&mut app, KeyCode::Char('g'));
         assert_eq!(app.shell, Shell::Git);
         assert_eq!(app.focus, Focus::Sidebar);
-        leader(&mut app, KeyCode::Char('f'));
-        assert_eq!(app.shell, Shell::Code);
         leader(&mut app, KeyCode::Char('h'));
         assert_eq!(app.shell, Shell::Agents);
+        leader(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.shell, Shell::Code);
+        assert_eq!(app.focus, Focus::Sidebar);
         // Esc stops at the sidebar (top of the context hierarchy)
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Sidebar);
@@ -2944,18 +4124,8 @@ mod tests {
     }
 
     #[test]
-    fn plain_keys_forward_to_terminal_not_app() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        // 'q' with terminal focus must NOT quit — it goes to the child
-        press(&mut app, KeyCode::Char('q'));
-        assert!(!app.should_quit);
-    }
-
-    #[test]
     fn double_ctrl_a_does_not_toggle_anything() {
         let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
         let before_focus = app.focus;
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -2979,73 +4149,11 @@ mod tests {
         assert_eq!(app.focus, Focus::Sidebar, "Esc stops at the top context");
     }
 
-    fn fake_chat(id: &str) -> crate::chats::ChatEntry {
-        crate::chats::ChatEntry {
-            session_id: id.into(),
-            modified: std::time::SystemTime::now(),
-            summary: format!("chat {id}"),
-        }
-    }
-
     #[test]
-    fn leader_h_opens_chats_tab_only() {
+    fn leader_h_opens_the_agents_shell() {
         let (_dir, mut app) = test_app();
         leader(&mut app, KeyCode::Char('h'));
         assert_eq!(app.shell, Shell::Agents);
-        assert_eq!(app.focus, Focus::Sidebar);
-    }
-
-    #[test]
-    fn enter_resumes_selected_chat_with_resume_args() {
-        let (_dir, mut app) = test_app();
-        app.chats.chats = vec![fake_chat("abc-123"), fake_chat("def-456")];
-        app.focus = Focus::Sidebar;
-        app.shell = Shell::Agents;
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.focus, Focus::Terminal);
-        let cmd = &app.sessions.sessions[0].command;
-        assert_eq!(&cmd[cmd.len() - 2..], &["--resume".to_string(), "def-456".to_string()][..]);
-        assert_eq!(app.status_msg.as_deref(), Some("resuming chat def-456"));
-        // the tab is named after the chat's summary, not a funny word
-        assert_eq!(app.sessions.sessions[0].title, "chat def-456");
-    }
-
-    #[test]
-    fn chat_title_trims_and_truncates_at_a_word_boundary() {
-        assert_eq!(chat_title("  Fix the parser  "), "Fix the parser");
-        let long = "Build UI environment with multiple Claude instances";
-        let t = chat_title(long);
-        assert!(t.chars().count() <= 28, "{t:?}");
-        assert!(t.ends_with('…'));
-        assert!(!t.contains("  ") && !t[..t.len() - '…'.len_utf8()].ends_with(' '));
-        assert!(long.starts_with(t.trim_end_matches('…').trim_end()));
-    }
-
-    #[test]
-    fn resume_with_no_chats_is_noop() {
-        let (_dir, mut app) = test_app();
-        app.focus = Focus::Sidebar;
-        app.shell = Shell::Agents;
-        press(&mut app, KeyCode::Enter);
-        assert!(app.sessions.is_empty());
-    }
-
-    #[test]
-    fn click_chat_selects_then_resumes() {
-        let (_dir, mut app) = test_app();
-        app.chats.chats = vec![fake_chat("aaa"), fake_chat("bbb")];
-        app.shell = Shell::Agents;
-        fake_layout(&mut app);
-        assert!(click(&mut app, 3, 3)); // row 1
-        assert_eq!(app.chats.selected, 1);
-        assert!(app.sessions.is_empty());
-        assert!(click(&mut app, 3, 3)); // same row again → resume
-        assert_eq!(app.sessions.len(), 1);
-        let cmd = &app.sessions.sessions[0].command;
-        assert!(cmd.contains(&"--resume".to_string()));
-        assert!(cmd.contains(&"bbb".to_string()));
     }
 
     #[test]
@@ -3085,6 +4193,60 @@ mod tests {
         assert!(app.overlay.is_none());
         assert!(app.status_msg.as_deref().unwrap_or("").starts_with("committed"));
         assert!(app.git.entries.is_empty());
+    }
+
+    #[test]
+    fn git_tab_unstage_reverses_stage() {
+        let (_dir, mut app) = git_app();
+        app.focus = Focus::Sidebar;
+        app.shell = Shell::Git;
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.git.entries[0].code(), "A ");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.git.entries[0].code(), "??");
+        // nothing staged: the failure lands in the status message
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.status_msg.as_deref().unwrap_or("").starts_with("unstage failed"));
+    }
+
+    #[test]
+    fn git_tab_push_runs_in_background_and_toasts() {
+        let (dir, mut app) = git_app();
+        app.focus = Focus::Sidebar;
+        app.shell = Shell::Git;
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        // a local bare remote: the file transport needs no credentials
+        let remote = TempDir::new().unwrap();
+        git2::Repository::init_bare(remote.path()).unwrap();
+        repo.remote("origin", remote.path().to_str().unwrap()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("push.autoSetupRemote", "true").unwrap();
+        drop(cfg);
+        drop(repo);
+        app.git.refresh();
+        press(&mut app, KeyCode::Char('P'));
+        assert_eq!(app.status_msg.as_deref(), Some("push…"));
+        assert!(app.git.op.is_some(), "push runs in the background");
+        // a second op is refused while one is in flight
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.toasts.iter().any(|t| t.text.contains("still running")));
+        // tick picks up the result, toasts it, and clears the progress note
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.op.is_some() && std::time::Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.git.op.is_none(), "push finished");
+        assert_ne!(app.status_msg.as_deref(), Some("push…"));
+        assert!(
+            app.toasts.iter().any(|t| t.text.starts_with("push") && !t.text.contains("failed")),
+            "toasts: {:?}",
+            app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+        // the branch now tracks the remote, in sync
+        assert_eq!(app.git.upstream, Some((0, 0)));
     }
 
     #[test]
@@ -3162,75 +4324,50 @@ mod tests {
     }
 
     #[test]
-    fn rename_prompt_renames_active_session() {
+    fn title_transcript_waits_for_a_full_exchange() {
+        use crate::acp::Entry;
+        // only a user message: nothing to title yet
+        assert!(title_transcript(&[Entry::User("hi".into())]).is_none());
+        // a full exchange produces a compact transcript
+        let t =
+            title_transcript(&[Entry::User("fix the parser".into()), Entry::Agent("done".into())])
+                .unwrap();
+        assert!(t.contains("User: fix the parser") && t.contains("Assistant: done"));
+    }
+
+    #[test]
+    fn generated_title_slots_between_agent_title_and_first_prompt() {
+        let (_dir, mut app) = test_app();
+        // with no agent connection the label falls back to the placeholder
+        assert_eq!(app.acp_session_label(0, "sess"), "new session");
+        // a generated title shows once present (conn absent, so it's the
+        // top available source here)
+        app.agent_view.titles.insert("sess".into(), Some("Fix the parser".into()));
+        assert_eq!(app.acp_session_label(0, "sess"), "Fix the parser");
+        // a failed generation (None) doesn't override the placeholder
+        app.agent_view.titles.insert("other".into(), None);
+        assert_eq!(app.acp_session_label(0, "other"), "new session");
+    }
+
+    #[test]
+    fn start_agent_without_config_warns() {
         let (_dir, mut app) = test_app();
         leader(&mut app, KeyCode::Char('c'));
-        leader(&mut app, KeyCode::Char('r'));
-        assert!(matches!(app.overlay, Some(Overlay::RenamePrompt(_))));
-        // prompt is prefilled with the current title; clear it first
-        for _ in 0..20 {
-            press(&mut app, KeyCode::Backspace);
-        }
-        for c in "builder".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        assert!(app.overlay.is_none());
-        assert_eq!(app.sessions.sessions[0].title, "builder");
+        assert!(app.acp.is_empty());
+        assert!(app.status_msg.as_deref().unwrap_or("").contains("no agent configured"));
     }
 
     #[test]
-    fn rename_prompt_escape_keeps_title() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        let before = app.sessions.sessions[0].title.clone();
-        leader(&mut app, KeyCode::Char('r'));
-        press(&mut app, KeyCode::Char('x'));
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.sessions.sessions[0].title, before);
-    }
-
-    #[test]
-    fn rename_without_sessions_is_noop() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('r'));
-        assert!(app.overlay.is_none());
-    }
-
-    #[test]
-    fn respawn_restarts_exited_session() {
-        let dir = TempDir::new().unwrap();
-        let mut app =
-            App::new(dir.path().to_path_buf(), vec!["/bin/sh".into(), "-c".into(), "true".into()]);
-        app.spawn_session();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.sessions.sessions[0].is_running() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        let old_id = app.sessions.sessions[0].id;
-        leader(&mut app, KeyCode::Char('R'));
-        assert_eq!(app.sessions.len(), 1);
-        assert_ne!(app.sessions.sessions[0].id, old_id);
-        assert_eq!(app.status_msg.as_deref(), Some("session respawned"));
-    }
-
-    #[test]
-    fn tick_reports_status_transitions() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        // first tick populates the snapshot (session just spawned → Working)
-        assert!(app.tick());
-        // immediately after, nothing has changed
-        assert!(!app.tick());
-    }
-
-    #[test]
-    fn spawn_failure_sets_status() {
-        let dir = TempDir::new().unwrap();
-        let mut app = App::new(dir.path().to_path_buf(), vec![]);
-        app.spawn_session();
-        assert!(app.sessions.is_empty());
-        assert!(app.status_msg.as_deref().unwrap_or("").contains("spawn failed"));
+    fn agent_label_is_readable() {
+        let cmd = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        // npx/uvx package specs reduce to the readable agent name
+        assert_eq!(agent_label(&cmd("npx @zed-industries/claude-code-acp@0.59")), "claude-code");
+        assert_eq!(agent_label(&cmd("npx -y @acme/gemini-acp")), "gemini");
+        assert_eq!(agent_label(&cmd("uvx fast-agent-acp==0.9.9")), "fast-agent");
+        // a bare binary or an absolute path keeps its own name
+        assert_eq!(agent_label(&cmd("gopls-agent")), "gopls-agent");
+        assert_eq!(agent_label(&cmd("/usr/local/bin/some-agent --acp")), "some-agent");
+        assert_eq!(agent_label(&[]), "agent");
     }
 
     fn click(app: &mut App, x: u16, y: u16) -> bool {
@@ -3256,8 +4393,10 @@ mod tests {
     fn fake_layout(app: &mut App) {
         app.layout = LayoutMap {
             sidebar_list: Rect::new(1, 2, 28, 20),
-            session_tabs: Rect::new(30, 0, 80, 1),
             terminal_pane: Rect::new(30, 1, 80, 22),
+            agent_mode_chip: Rect::default(),
+            agent_mode_menu: Rect::default(),
+            agent_mention_menu: Rect::default(),
             welcome_list: Rect::new(10, 10, 60, 10),
             editor_text: Rect::new(35, 2, 74, 20),
             palette_list: Rect::new(20, 5, 60, 12),
@@ -3267,8 +4406,12 @@ mod tests {
             hex_dump: Rect::new(65, 2, 44, 20),
             context_menu: Rect::default(),
             editor_gutter: Rect::default(),
+            editor_cursor: None,
             menu_items: Default::default(),
             menu_dropdown: Rect::default(),
+            menu_bell: Rect::default(),
+            notifications: Rect::default(),
+            notifications_clear: Rect::default(),
         };
     }
 
@@ -3279,23 +4422,6 @@ mod tests {
         app.focus = Focus::Sidebar;
         assert!(click(&mut app, 50, 10));
         assert_eq!(app.focus, Focus::Terminal);
-    }
-
-    #[test]
-    fn click_session_tab_switches_session() {
-        let (_dir, mut app) = test_app();
-        fake_layout(&mut app);
-        leader(&mut app, KeyCode::Char('c'));
-        leader(&mut app, KeyCode::Char('c'));
-        // as recorded by the UI: tab 0 spans x 30..40, tab 1 spans x 41..51
-        app.session_tab_hits = vec![(30, 40, 0), (41, 51, 1)];
-        assert_eq!(app.sessions.active, 1);
-        assert!(click(&mut app, 32, 0));
-        assert_eq!(app.sessions.active, 0);
-        assert_eq!(app.focus, Focus::Terminal);
-        // a click past the last tab keeps the current session
-        assert!(click(&mut app, 70, 0));
-        assert_eq!(app.sessions.active, 0);
     }
 
     #[test]
@@ -3356,13 +4482,16 @@ mod tests {
         fake_layout(&mut app);
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.git.view, crate::git::GitView::Tree);
-        // rows: file.txt(0), src(dir), lib.rs — click the dir row: inert
+        // rows dirs-first: src(0), lib.rs(1), file.txt(2) — clicking the
+        // dir folds it
+        assert!(click(&mut app, 3, 2));
+        assert_eq!(app.git.rows().len(), 2, "src collapsed");
+        assert!(click(&mut app, 3, 2));
+        assert_eq!(app.git.rows().len(), 3, "src expanded again");
+        // click lib.rs (row 1) selects its entry; second click focuses diff
         assert!(click(&mut app, 3, 3));
-        assert!(app.overlay.is_none());
-        // click lib.rs (row 2) selects its entry; second click focuses diff
-        assert!(click(&mut app, 3, 4));
         assert_eq!(app.git.selected_entry().unwrap().path, "src/lib.rs");
-        assert!(click(&mut app, 3, 4));
+        assert!(click(&mut app, 3, 3));
         assert_eq!(app.focus, Focus::Terminal);
     }
 
@@ -3424,7 +4553,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         // simulate a long-settled dwell position and tick past the delay
-        app.mouse_rest = Some((
+        app.code_view.mouse_rest = Some((
             Position::new(app.layout.editor_text.x + 2, app.layout.editor_text.y),
             Instant::now() - Duration::from_secs(2),
         ));
@@ -3433,7 +4562,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scrolls_terminal_and_lists() {
+    fn wheel_scrolls_file_list() {
         let (dir, mut app) = test_app();
         // pin the wheel step: the auto fallback is terminal-dependent
         app.config.mouse_scroll_multiplier = Some(3);
@@ -3444,14 +4573,6 @@ mod tests {
         app.tree.refresh();
         app.tree.selected = 0; // refresh kept the cursor on file.txt (last)
         fake_layout(&mut app);
-        leader(&mut app, KeyCode::Char('c'));
-        app.shell = Shell::Agents;
-        // wheel over the pane scrolls session scrollback
-        assert!(scroll(&mut app, 50, 10, true));
-        assert_eq!(app.sessions.sessions[0].scroll_offset, 3);
-        assert!(scroll(&mut app, 50, 10, false));
-        assert_eq!(app.sessions.sessions[0].scroll_offset, 0);
-        app.shell = Shell::Code;
         // wheel over the file list moves the selection
         assert!(scroll(&mut app, 3, 5, false));
         assert_eq!(app.tree.selected, 3);
@@ -3493,71 +4614,93 @@ mod tests {
         }
     }
 
-    fn welcome_app() -> (TempDir, TempDir, App) {
+    fn welcome_app() -> (TempDir, App) {
         let (dir, mut app) = test_app();
-        let other = TempDir::new().unwrap();
         app.screen = Screen::Welcome;
-        app.welcome.projects = vec![crate::projects::RecentProject {
-            path: other.path().to_path_buf(),
-            last_active: std::time::SystemTime::now(),
-            chat_count: 2,
-        }];
-        (dir, other, app)
+        (dir, app)
     }
 
     #[test]
     fn welcome_enter_opens_current_directory() {
-        let (dir, _other, mut app) = welcome_app();
+        let (dir, mut app) = welcome_app();
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.screen, Screen::Workspace);
         assert_eq!(app.workdir, dir.path().canonicalize().unwrap());
-        assert_eq!(app.sessions.len(), 1);
-    }
-
-    #[test]
-    fn welcome_navigates_and_opens_recent_project() {
-        let (_dir, other, mut app) = welcome_app();
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.welcome.selected, 1);
-        press(&mut app, KeyCode::Char('j')); // clamps at last row
-        assert_eq!(app.welcome.selected, 1);
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.screen, Screen::Workspace);
-        assert_eq!(app.workdir, other.path().canonicalize().unwrap());
-        // the workspace state was rebuilt for the new directory
         assert_eq!(app.tree.root, app.workdir);
     }
 
     #[test]
     fn welcome_q_quits_and_leader_keys_are_inert() {
-        let (_dir, _other, mut app) = welcome_app();
-        // Ctrl+A c must not spawn sessions on the welcome screen
+        let (_dir, mut app) = welcome_app();
+        // Ctrl+A c must not do anything on the welcome screen
         leader(&mut app, KeyCode::Char('c'));
-        assert!(app.sessions.is_empty());
         assert_eq!(app.screen, Screen::Welcome);
         press(&mut app, KeyCode::Char('q'));
         assert!(app.should_quit);
     }
 
     #[test]
-    fn welcome_click_selects_then_opens() {
-        let (_dir, other, mut app) = welcome_app();
+    fn welcome_click_opens_current_directory() {
+        let (dir, mut app) = welcome_app();
         fake_layout(&mut app);
         app.layout.welcome_list = Rect::new(10, 10, 60, 10);
-        assert!(click(&mut app, 12, 11)); // row 1 = recent project
-        assert_eq!(app.welcome.selected, 1);
-        assert_eq!(app.screen, Screen::Welcome);
-        assert!(click(&mut app, 12, 11));
+        assert!(click(&mut app, 12, 10)); // row 0 = current dir (already selected)
         assert_eq!(app.screen, Screen::Workspace);
-        assert_eq!(app.workdir, other.path().canonicalize().unwrap());
+        assert_eq!(app.workdir, dir.path().canonicalize().unwrap());
+    }
+
+    fn completion_item(label: &str, kind: &'static str) -> crate::lsp::CompletionItem {
+        crate::lsp::CompletionItem {
+            label: label.into(),
+            kind,
+            detail: None,
+            documentation: None,
+            insert_text: label.into(),
+            sort_text: label.into(),
+        }
     }
 
     #[test]
-    fn enter_welcome_excludes_current_dir_from_recents() {
-        let (_dir, mut app) = test_app();
-        app.enter_welcome();
-        assert_eq!(app.screen, Screen::Welcome);
-        assert!(app.welcome.projects.iter().all(|p| p.path != app.workdir));
+    fn completion_popup_filters_navigates_and_accepts() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("code.py");
+        write(&path, "x\n").unwrap();
+        app.open_file(&path);
+        app.shell = Shell::Code;
+        app.focus = Focus::Terminal;
+        // insert-mode, type "templates.Templa" (no LSP → no auto popup)
+        press(&mut app, KeyCode::Char('i'));
+        for c in "templates.Templa".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        // inject a server reply; it filters by the "Templa" prefix
+        app.open_completion(vec![
+            completion_item("TemplateResponse", "Method"),
+            completion_item("get_template", "Method"),
+            completion_item("unrelated", "Variable"),
+        ]);
+        let comp = app.completion.as_ref().expect("popup open");
+        assert_eq!(comp.filtered.len(), 2, "only the two 'templa' matches, not 'unrelated'");
+        assert_eq!(comp.selected, 0);
+
+        // Ctrl+n / Ctrl+p move the selection
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.completion.as_ref().unwrap().selected, 0);
+
+        // typing keeps the popup and re-filters (get_template still matches)
+        press(&mut app, KeyCode::Char('t'));
+        assert!(app.completion.is_some());
+
+        // Enter accepts the selection, replacing the typed prefix
+        press(&mut app, KeyCode::Enter);
+        assert!(app.completion.is_none());
+        assert!(
+            app.editor.as_ref().unwrap().text.to_string().contains("templates.TemplateResponse"),
+            "accepted: {:?}",
+            app.editor.as_ref().unwrap().text.to_string()
+        );
     }
 
     #[test]
@@ -3612,14 +4755,14 @@ mod tests {
     }
 
     #[test]
-    fn session_switch_leaves_editor_open_in_background() {
+    fn switching_to_agents_leaves_editor_open_in_background() {
         let (dir, mut app) = test_app();
         let path = dir.path().join("code.rs");
         write(&path, "x\n").unwrap();
         app.open_file(&path);
-        // from the editor, new agents come via the palette (Ctrl+A = select all)
+        // from the editor, hop to the agents shell via the palette
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        palette_type(&mut app, ">agent: new");
+        palette_type(&mut app, ">view agent");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.shell, Shell::Agents);
         assert!(app.editor.is_some(), "editor stays open in the Code shell");
@@ -3939,22 +5082,10 @@ mod tests {
     fn palette_command_mode_runs_actions() {
         let (_dir, mut app) = test_app();
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        palette_type(&mut app, ">new");
+        palette_type(&mut app, ">view git");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.sessions.len(), 1, "agent: new executed");
+        assert_eq!(app.shell, Shell::Git, "view: git executed");
         assert!(app.overlay.is_none());
-    }
-
-    #[test]
-    fn palette_lists_agents_by_name() {
-        let (_dir, mut app) = test_app();
-        leader(&mut app, KeyCode::Char('c'));
-        let name = app.sessions.sessions[0].title.clone();
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-        palette_type(&mut app, &format!(">switch {name}"));
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.sessions.active, 0);
-        assert_eq!(app.focus, Focus::Terminal);
     }
 
     #[test]
@@ -4096,14 +5227,9 @@ mod tests {
         app.focus = Focus::Terminal;
         assert!(app.editor.is_none());
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.code_home_selected, 1); // New Agent
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.shell, Shell::Agents);
-        // back in code shell: Search Files opens the palette
-        app.switch_shell(Shell::Code);
-        app.focus = Focus::Terminal;
-        app.code_home_selected = 0;
+        assert_eq!(app.code_view.home_selected, 1); // Start Agent
+        // Search Files (row 0) opens the palette
+        app.code_view.home_selected = 0;
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.overlay, Some(Overlay::Palette(_))));
     }

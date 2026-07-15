@@ -166,7 +166,9 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
         } else if line.starts_with("@@") {
             if let Some((old, new)) = parse_hunk_header(line) {
                 if in_hunk {
-                    out.push(DiffLine::plain(DiffLineKind::HunkSep, String::new()));
+                    // the lines git omitted between hunks, counted from
+                    // the headers — rendered as a "N unchanged lines" band
+                    out.push(DiffLine::folded_gap(old.saturating_sub(old_no)));
                 }
                 old_no = old;
                 new_no = new;
@@ -226,6 +228,156 @@ pub struct DiffView {
     pub title: String,
     pub lines: Vec<DiffLine>,
     pub scroll: usize,
+}
+
+impl DiffLine {
+    /// A bare ⋯ separator row (folded-context marker).
+    pub fn hunk_sep() -> Self {
+        Self {
+            kind: DiffLineKind::HunkSep,
+            old_no: None,
+            new_no: None,
+            text: String::new(),
+            lang: None,
+        }
+    }
+
+    /// A folded-gap band: `text` carries the hidden-line count, which the
+    /// renderer expands into a full-width "N unchanged lines" divider.
+    pub fn folded_gap(hidden: u32) -> Self {
+        Self {
+            kind: DiffLineKind::HunkSep,
+            old_no: None,
+            new_no: None,
+            text: hidden.to_string(),
+            lang: None,
+        }
+    }
+}
+
+/// A fold region's identity: both coordinates, because in an
+/// additions-only diff the old side never advances (and vice versa) —
+/// single-sided keys would collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionKey {
+    pub old: u32,
+    pub new: u32,
+}
+
+/// One row of fold metadata: the line index it renders at, its region,
+/// and whether it's a folded band (false = an expanded region's line,
+/// which folds back on click).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldRow {
+    pub row: usize,
+    pub key: RegionKey,
+    pub band: bool,
+}
+
+/// The git pane's display model: parsed diff lines with every unchanged
+/// region folded (or expanded) per the fold state, plus the fold rows for
+/// mouse mapping and the change counts for the status bar. Pure — build
+/// it in the update phase, never during draw.
+#[derive(Debug, Default)]
+pub struct PaneModel {
+    pub lines: Vec<DiffLine>,
+    pub folds: Vec<FoldRow>,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Build the pane model from a parsed single-file diff. `fold_all` folds
+/// every unchanged region (false = expand everything); `overrides` flips
+/// individual regions. Expanded regions splice their lines from
+/// `file_text` (the working tree — unchanged lines are identical there);
+/// without it they degrade to bands.
+pub fn fold_unchanged(
+    parsed: Vec<DiffLine>,
+    fold_all: bool,
+    overrides: &std::collections::HashSet<RegionKey>,
+    file_text: Option<&str>,
+    lang: Option<&'static str>,
+) -> PaneModel {
+    let file_lines: Option<Vec<&str>> = file_text.map(|t| t.lines().collect());
+    let mut model = PaneModel::default();
+    let (mut last_old, mut last_new) = (0u32, 0u32);
+    let (mut gap_old, mut gap_new) = (1u32, 1u32);
+    let mut in_gap = false;
+    let mut gap_rows = 0u32; // counted context rows (unreadable-file fallback)
+    let flush = |model: &mut PaneModel, hidden: u32, gap_old: u32, gap_new: u32| {
+        if hidden == 0 {
+            return;
+        }
+        let key = RegionKey { old: gap_old, new: gap_new };
+        let folded = fold_all != overrides.contains(&key);
+        let from_file = (!folded).then_some(file_lines.as_ref()).flatten();
+        if let Some(file) = from_file {
+            for i in 0..hidden {
+                let Some(text) = file.get((gap_new - 1 + i) as usize) else { break };
+                model.folds.push(FoldRow { row: model.lines.len(), key, band: false });
+                model.lines.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_no: Some(gap_old + i),
+                    new_no: Some(gap_new + i),
+                    text: (*text).to_string(),
+                    lang,
+                });
+            }
+        } else {
+            // folded — or expanded with no readable file, where the band
+            // (with its count) is still the honest rendering
+            model.folds.push(FoldRow { row: model.lines.len(), key, band: true });
+            model.lines.push(DiffLine::folded_gap(hidden));
+        }
+    };
+    for line in parsed {
+        match line.kind {
+            DiffLineKind::FileHeader | DiffLineKind::FileStat => continue,
+            DiffLineKind::Context | DiffLineKind::HunkSep => {
+                if !in_gap {
+                    gap_old = last_old + 1;
+                    gap_new = last_new + 1;
+                    in_gap = true;
+                    gap_rows = 0;
+                }
+                if line.kind == DiffLineKind::Context {
+                    gap_rows += 1;
+                }
+            }
+            _ => {
+                if in_gap {
+                    let hidden = line
+                        .old_no
+                        .map(|o| o.saturating_sub(gap_old))
+                        .or_else(|| line.new_no.map(|n| n.saturating_sub(gap_new)))
+                        .filter(|&n| n > 0)
+                        .unwrap_or(gap_rows);
+                    flush(&mut model, hidden, gap_old, gap_new);
+                    in_gap = false;
+                }
+                if let Some(o) = line.old_no {
+                    last_old = o;
+                }
+                if let Some(n) = line.new_no {
+                    last_new = n;
+                }
+                match line.kind {
+                    DiffLineKind::Add => model.added += 1,
+                    DiffLineKind::Remove => model.removed += 1,
+                    _ => {}
+                }
+                model.lines.push(line);
+            }
+        }
+    }
+    if in_gap {
+        let hidden = file_lines
+            .as_ref()
+            .map(|f| (f.len() as u32).saturating_sub(gap_new - 1))
+            .unwrap_or(gap_rows);
+        flush(&mut model, hidden, gap_old, gap_new);
+    }
+    model
 }
 
 impl DiffView {
@@ -336,6 +488,36 @@ mod tests {
             .map(|l| l.text.as_str())
             .collect();
         assert_eq!(stats, vec!["Added 1 line", "Removed 1 line"]);
+    }
+
+    #[test]
+    fn fold_model_is_pure_and_splices_from_file() {
+        let text = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+@@ -2,3 +2,3 @@\n l2\n-l3\n+L3\n l4\n";
+        let file = "l1\nl2\nL3\nl4\nl5\n";
+        // folded default: change rows + counted bands, exact counts
+        let model =
+            fold_unchanged(parse(text), true, &std::collections::HashSet::new(), Some(file), None);
+        let kinds: Vec<_> = model.lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DiffLineKind::HunkSep, // 2 leading unchanged
+                DiffLineKind::Remove,
+                DiffLineKind::Add,
+                DiffLineKind::HunkSep, // 2 trailing unchanged (from file len)
+            ]
+        );
+        assert_eq!((model.added, model.removed), (1, 1));
+        assert_eq!(model.folds.len(), 2);
+        assert!(model.folds.iter().all(|f| f.band));
+        // overriding the first region splices its lines from the file
+        let mut overrides = std::collections::HashSet::new();
+        overrides.insert(model.folds[0].key);
+        let model = fold_unchanged(parse(text), true, &overrides, Some(file), None);
+        assert_eq!(model.lines[0].text, "l1");
+        assert_eq!(model.lines[1].text, "l2");
+        assert_eq!(model.lines[0].old_no, Some(1));
     }
 
     #[test]

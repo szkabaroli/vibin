@@ -12,38 +12,17 @@ use std::time::Duration;
 
 use app::App;
 
-fn parse_args() -> (Option<PathBuf>, Vec<String>) {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // usage: vibin [dir] [-- command args...]
-    // With a dir the workspace opens directly; without one, the welcome
-    // screen offers the current directory and recent projects.
-    let mut workdir: Option<PathBuf> = None;
-    let mut command: Vec<String> = std::env::var("VIBIN_CMD")
-        .ok()
-        .map(|v| v.split_whitespace().map(String::from).collect())
-        .unwrap_or_else(|| vec!["claude".to_string()]);
-
-    let mut iter = args.into_iter().peekable();
-    if let Some(first) = iter.peek()
-        && first != "--"
-    {
-        let dir = PathBuf::from(first);
-        if dir.is_dir() {
-            workdir = Some(dir.canonicalize().unwrap_or(dir));
-            iter.next();
-        } else {
-            eprintln!("error: {first:?} is not a directory");
-            std::process::exit(1);
-        }
+fn parse_args() -> Option<PathBuf> {
+    // usage: vibin [dir]. With a dir the workspace opens directly; without
+    // one, the welcome screen offers the current directory.
+    let first = std::env::args().nth(1)?;
+    let dir = PathBuf::from(&first);
+    if dir.is_dir() {
+        Some(dir.canonicalize().unwrap_or(dir))
+    } else {
+        eprintln!("error: {first:?} is not a directory");
+        std::process::exit(1);
     }
-    if iter.peek().map(String::as_str) == Some("--") {
-        iter.next();
-        let cmd: Vec<String> = iter.collect();
-        if !cmd.is_empty() {
-            command = cmd;
-        }
-    }
-    (workdir, command)
 }
 
 fn main() -> Result<()> {
@@ -60,6 +39,9 @@ fn main() -> Result<()> {
                 vibin::keybind::print_keybinds(&kb);
             }
             "+list-actions" => vibin::keybind::print_actions(),
+            "+version" => println!("vibin {}", env!("CARGO_PKG_VERSION")),
+            "+update" => vibin::update::run(), // downloads, swaps binary, exits
+
             // the fully resolved config for this directory (defaults ←
             // global ← nearest .vibin), as TOML that can be pasted back
             "+show-config" => {
@@ -74,7 +56,7 @@ fn main() -> Result<()> {
             }
             other => {
                 eprintln!(
-                    "unknown command {other} (try +list-keybinds, +list-actions, +show-config)"
+                    "unknown command {other} (try +version, +update, +list-keybinds, +list-actions, +show-config)"
                 );
                 std::process::exit(1);
             }
@@ -82,15 +64,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (workdir_arg, command) = parse_args();
+    let workdir_arg = parse_args();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let explicit = workdir_arg.is_some();
-    let mut app = App::new(workdir_arg.unwrap_or(cwd), command);
+    let mut app = App::new(workdir_arg.unwrap_or(cwd));
+    // opt-in, throttled to once a day: kick off a background release check
+    // now; any newer version is printed on exit (below), after the terminal
+    // is restored, so it survives the alternate screen.
+    if app.config.check_for_updates {
+        vibin::update::spawn_background_check();
+    }
     if !explicit {
         app.enter_welcome();
     } else {
-        // straight into a workspace: eager LSP start from config markers
+        // straight into a workspace: eager LSP start + the configured agent
         app.activate_workspace_lsp();
+        app.start_configured_agent();
     }
 
     // manual init on our undercurl-aware backend (ratatui::init would
@@ -130,9 +119,6 @@ fn main() -> Result<()> {
         }
     })?;
     let _ = execute!(std::io::stdout(), EndSynchronizedUpdate);
-    if explicit {
-        app.spawn_session();
-    }
 
     let result = run(&mut terminal, &mut app);
 
@@ -145,6 +131,13 @@ fn main() -> Result<()> {
         crossterm::cursor::SetCursorStyle::DefaultUserShape
     );
     ratatui::restore();
+    // now that we're back on the normal screen, surface any release the
+    // background check turned up during the session.
+    if app.config.check_for_updates
+        && let Some(notice) = vibin::update::pending_notice()
+    {
+        eprintln!("{notice}");
+    }
     result
 }
 
@@ -158,14 +151,8 @@ fn run(terminal: &mut vibin::backend::VibinTerminal, app: &mut App) -> Result<()
     let mut dirty = true;
     // whether the mouse pointer is currently the hand shape (over a link)
     let mut hand_pointer = false;
-    let mut last_generation = app.sessions.render_generation();
     let mut bar_cursor = false;
     loop {
-        let generation = app.sessions.render_generation();
-        if generation != last_generation {
-            last_generation = generation;
-            dirty = true;
-        }
         if dirty {
             // synchronized update: the frame (including cursor hide/show)
             // applies atomically, so no transient cursor flashes on popups
@@ -261,6 +248,13 @@ fn run(terminal: &mut vibin::backend::VibinTerminal, app: &mut App) -> Result<()
         }
         if app.tick() {
             dirty = true;
+        }
+        // audible nudge when an agent finishes or needs a decision
+        if app.take_bell() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x07");
+            let _ = out.flush();
         }
         if app.should_quit {
             return Ok(());

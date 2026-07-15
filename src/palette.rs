@@ -14,19 +14,16 @@ pub const MAX_RESULTS: usize = 12;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     OpenFile(PathBuf),
-    NewAgent,
-    SelectAgent(usize),
-    RenameAgent,
-    RespawnAgent,
-    CloseAgent,
+    /// Launch the configured ACP agent in the agents shell.
+    StartAgent,
     GitCommit,
     GitStageAll,
     DiffAll,
     ShowFiles,
     ShowGit,
-    ShowChats,
+    /// Switch to the agents shell.
+    ShowAgent,
     FocusEditor,
-    ResumeChat(String),
     ToggleHidden,
     SaveSettings,
     TestToast,
@@ -121,6 +118,29 @@ impl Palette {
     }
 }
 
+/// All workspace files as sorted, workdir-relative path strings — the same
+/// set the palette searches. For the composer's @-mention picker to cache.
+pub fn workspace_files(root: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files);
+    files.sort();
+    files
+}
+
+/// Top `limit` entries of `files` fuzzily matching `query`, best first (all,
+/// in order, when the query is empty). Reuses the palette's nucleo matching.
+pub fn fuzzy_filter(query: &str, files: &[String], limit: usize) -> Vec<String> {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    fuzzy(&mut matcher, query, &refs).into_iter().take(limit).map(|i| files[i].clone()).collect()
+}
+
+/// Indices of `items` fuzzily matching `query`, best match first — for the
+/// completion popup to filter candidates by the typed prefix.
+pub fn fuzzy_indices(query: &str, items: &[&str]) -> Vec<usize> {
+    fuzzy(&mut Matcher::new(Config::DEFAULT), query, items)
+}
+
 /// Indices of `items` fuzzily matching `query`, best first. An empty query
 /// keeps the original order.
 fn fuzzy(matcher: &mut Matcher, query: &str, items: &[&str]) -> Vec<usize> {
@@ -182,7 +202,7 @@ mod tests {
         write(dir.path().join(".git/config"), "").unwrap();
         write(dir.path().join("node_modules/junk/x.js"), "").unwrap();
         let commands = vec![
-            CommandEntry { label: "agent: new".into(), action: PaletteAction::NewAgent },
+            CommandEntry { label: "agent: start".into(), action: PaletteAction::StartAgent },
             CommandEntry { label: "git: stage all".into(), action: PaletteAction::GitStageAll },
             CommandEntry { label: "vibin: quit".into(), action: PaletteAction::Quit },
         ];

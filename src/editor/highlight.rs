@@ -116,6 +116,29 @@ pub fn config_for(path: &std::path::Path) -> Option<HighlightConfiguration> {
     config_for_lang(ext)
 }
 
+/// [`config_for`] through the shared cache — the accessor every
+/// per-open / per-frame path should use.
+pub fn cached_config_for(path: &std::path::Path) -> Option<std::sync::Arc<HighlightConfiguration>> {
+    if let Some(lang) = filename_language(path) {
+        return cached_config_for_lang(lang);
+    }
+    cached_config_for_lang(path.extension()?.to_str()?)
+}
+
+/// [`config_for_lang`] through a process-wide cache. Building a config
+/// compiles the language's queries (~14 ms) — far too expensive to pay per
+/// file open or per rendered code fence, so a language is compiled once
+/// and shared. The lock is held across the compile on purpose: two threads
+/// racing on a new language wait for one compile instead of doing two.
+pub fn cached_config_for_lang(lang: &str) -> Option<std::sync::Arc<HighlightConfiguration>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CONFIGS: OnceLock<Mutex<HashMap<String, Option<Arc<HighlightConfiguration>>>>> =
+        OnceLock::new();
+    let mut cache = CONFIGS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    cache.entry(lang.to_string()).or_insert_with(|| config_for_lang(lang).map(Arc::new)).clone()
+}
+
 /// Languages recognized by filename rather than extension — Dockerfiles,
 /// the go.mod family, and lock/manifest files that have no distinguishing
 /// extension but are really a format we already highlight.
@@ -458,24 +481,14 @@ pub struct HighlightSpan {
     pub highlight: usize,
 }
 
-/// Highlight one line of code in the given language, using a per-thread
-/// config cache (configs are expensive to build). Used by the diff views;
-/// single-line parses lose multi-line context but tokenize well enough.
+/// Highlight one line of code in the given language, via the shared config
+/// cache. Used by the diff views; single-line parses lose multi-line
+/// context but tokenize well enough.
 pub fn line_spans(lang: &str, text: &str) -> Vec<HighlightSpan> {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    thread_local! {
-        static CONFIGS: RefCell<HashMap<String, Option<HighlightConfiguration>>> =
-            RefCell::new(HashMap::new());
+    match cached_config_for_lang(lang) {
+        Some(config) => highlight_source(&config, text),
+        None => Vec::new(),
     }
-    CONFIGS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let config = cache.entry(lang.to_string()).or_insert_with(|| config_for_lang(lang));
-        match config {
-            Some(config) => highlight_source(config, text),
-            None => Vec::new(),
-        }
-    })
 }
 
 /// Incremental highlighter for an open file: keeps the tree-sitter `Tree`
@@ -485,7 +498,7 @@ pub fn line_spans(lang: &str, text: &str) -> Vec<HighlightSpan> {
 /// tree-sitter-highlight event stream here, since injections are never
 /// resolved anyway (see `highlight_source`'s `|_| None`).
 pub struct FileHighlighter {
-    config: HighlightConfiguration,
+    config: std::sync::Arc<HighlightConfiguration>,
     /// capture index → HIGHLIGHT_NAMES slot, resolved once per query
     captures: Vec<Option<usize>>,
     parser: tree_sitter::Parser,
@@ -495,7 +508,7 @@ pub struct FileHighlighter {
 }
 
 impl FileHighlighter {
-    pub fn new(config: HighlightConfiguration) -> Option<Self> {
+    pub fn new(config: std::sync::Arc<HighlightConfiguration>) -> Option<Self> {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&config.language).ok()?;
         let captures = capture_map(&config.query);
@@ -509,6 +522,15 @@ impl FileHighlighter {
         self.highlight_window(new, None)
     }
 
+    /// Parse `text` and keep the tree without extracting any spans — the
+    /// open path builds the first tree on a background thread, and the
+    /// first `highlight_window` call then only pays the query pass (or an
+    /// incremental reparse, if the buffer was edited in the meantime).
+    pub fn prime(&mut self, text: String) {
+        self.tree = self.parser.parse(&text, None);
+        self.source = text;
+    }
+
     /// Like `highlight`, but extracts spans only for the given byte range
     /// (the parse is always whole-file — it has to be — but the query pass
     /// is the expensive part and the renderer only reads the viewport).
@@ -517,10 +539,10 @@ impl FileHighlighter {
         new: String,
         window: Option<std::ops::Range<usize>>,
     ) -> Vec<HighlightSpan> {
-        if let Some(tree) = &mut self.tree {
-            if self.source != new {
-                tree.edit(&synth_edit(&self.source, &new));
-            }
+        if let Some(tree) = &mut self.tree
+            && self.source != new
+        {
+            tree.edit(&synth_edit(&self.source, &new));
         }
         self.tree = self.parser.parse(&new, self.tree.as_ref());
         self.source = new;
@@ -745,7 +767,7 @@ mod tests {
         assert_eq!(language_name(Path::new("fix.patch")), "diff");
         assert_eq!(language_name(Path::new("changes.diff")), "diff");
         let src = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n";
-        let mut inc = FileHighlighter::new(config_for_lang("patch").unwrap()).unwrap();
+        let mut inc = FileHighlighter::new(cached_config_for_lang("patch").unwrap()).unwrap();
         let spans = inc.highlight(src.to_string());
         let name_at = |pos: usize| {
             spans
@@ -777,7 +799,7 @@ mod tests {
     fn incremental_matches_event_stream_extraction() {
         let src = include_str!("../spell.rs");
         let reference = highlight_source(&config_for_lang("rust").unwrap(), src);
-        let mut inc = FileHighlighter::new(config_for_lang("rust").unwrap()).unwrap();
+        let mut inc = FileHighlighter::new(cached_config_for_lang("rust").unwrap()).unwrap();
         // the extraction merges adjacent same-highlight runs (the event
         // stream splits e.g. consecutive comment lines), so compare the
         // merged forms — per-byte styling must be identical
@@ -799,14 +821,14 @@ mod tests {
     /// if these can never diverge.
     #[test]
     fn incremental_edits_equal_fresh_parse() {
-        let mut inc = FileHighlighter::new(config_for_lang("rust").unwrap()).unwrap();
+        let mut inc = FileHighlighter::new(cached_config_for_lang("rust").unwrap()).unwrap();
         let v0 = "fn main() { let x = 1; }\n".to_string();
         let v1 = "fn main() { let x = 1; println!(\"hé\"); }\n".to_string(); // insert (multibyte)
         let v2 = "fn main() { println!(\"hé\"); }\n".to_string(); // delete
         let v3 = "fn máin() { println!(\"hi\"); }\n// trailing comment\n".to_string(); // replace
         for v in [&v0, &v1, &v2, &v3] {
             let incremental = inc.highlight(v.clone());
-            let mut fresh = FileHighlighter::new(config_for_lang("rust").unwrap()).unwrap();
+            let mut fresh = FileHighlighter::new(cached_config_for_lang("rust").unwrap()).unwrap();
             assert_eq!(incremental, fresh.highlight(v.clone()), "diverged at {v:?}");
         }
     }
@@ -816,7 +838,7 @@ mod tests {
     #[test]
     fn windowed_extraction_matches_full() {
         let src = include_str!("../spell.rs");
-        let mut inc = FileHighlighter::new(config_for_lang("rust").unwrap()).unwrap();
+        let mut inc = FileHighlighter::new(cached_config_for_lang("rust").unwrap()).unwrap();
         let full = inc.highlight(src.to_string());
         // a window on line boundaries somewhere in the middle of the file
         let nth_line = |n: usize| src.split_inclusive('\n').take(n).map(str::len).sum::<usize>();

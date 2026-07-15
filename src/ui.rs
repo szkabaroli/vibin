@@ -4,17 +4,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Tabs,
-};
-use tui_term::widget::PseudoTerminal;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph};
 
 use crate::app::{App, Focus, Overlay, Screen, Shell};
 use crate::diff::{DiffLine, DiffLineKind};
 use crate::editor::Mode;
-use crate::git::{GitView, StatusKind};
-use crate::projects::display_path;
-use crate::session::SessionStatus;
+use crate::git::StatusKind;
 
 const SIDEBAR_WIDTH: u16 = 34;
 
@@ -87,6 +82,7 @@ fn rainbow_line(text: &str, phase: f32) -> Line<'static> {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.link_hits.clear();
+    app.toast_hits.clear();
     if app.screen == Screen::Welcome {
         draw_welcome(frame, app);
         return;
@@ -102,15 +98,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(outer[1]);
 
     draw_sidebar(frame, app, main[0]);
-    // collapsed borders: the main pane overlaps the sidebar's right border
-    // column so the two share one line; junctions are arm-unions (┬ ┴ ├)
-    let shared_x = main[0].right().saturating_sub(1);
-    let pane = Rect::new(shared_x, main[1].y, main[1].width + 1, main[1].height);
-    let prior: Vec<String> = (pane.y..pane.bottom())
-        .map(|y| frame.buffer_mut()[(shared_x, y)].symbol().to_string())
-        .collect();
+    // the sidebar keeps its own frame — the main pane sits beside it with
+    // its own border, so the two read as separate layers (the same
+    // treatment the notification panel gets against the code pane, below)
+    let mut pane = main[1];
+    // bell pane: carve the notification panel off the pane's right side —
+    // same idea, its own frame next to the code
+    let notifications = app.notifications_open.then(|| {
+        let w = 38.min(pane.width / 2);
+        let panel = Rect::new(pane.right().saturating_sub(w), pane.y, w, pane.height);
+        pane.width -= w;
+        panel
+    });
     draw_main_area(frame, app, pane);
-    merge_shared_column(frame.buffer_mut(), shared_x, pane.y, &prior);
+    if let Some(panel) = notifications {
+        draw_notifications(frame, app, panel);
+    }
     draw_status_bar(frame, app, outer[2]);
     draw_menu_dropdown(frame, app);
 
@@ -119,13 +122,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let modal_open = app.leader_pending
         || matches!(
             &app.overlay,
-            Some(
-                Overlay::Diff(_)
-                    | Overlay::Help
-                    | Overlay::CommitPrompt(_)
-                    | Overlay::RenamePrompt(_)
-                    | Overlay::Palette(_)
-            )
+            Some(Overlay::Diff(_) | Overlay::Help | Overlay::CommitPrompt(_) | Overlay::Palette(_))
         );
     if modal_open {
         dim_background(frame.buffer_mut());
@@ -136,9 +133,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Overlay::Help) => draw_help_overlay(frame, app.welcome.phase),
         Some(Overlay::CommitPrompt(buf)) => {
             draw_prompt(frame, "commit message (Enter commit · Esc cancel)", buf, app.welcome.phase)
-        }
-        Some(Overlay::RenamePrompt(buf)) => {
-            draw_prompt(frame, "rename session (Enter apply · Esc cancel)", buf, app.welcome.phase)
         }
         Some(Overlay::Hover(_)) => draw_hover_overlay(frame, app),
         Some(Overlay::Palette(_)) => draw_palette(frame, app),
@@ -157,6 +151,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Paragraph::new(Span::styled(text, Style::default().fg(STATUS_DIM()).bg(DIALOG_BG()))),
             chip,
         );
+    }
+
+    // the LSP completion popup floats over the editor, below the cursor
+    if app.completion.is_some() && app.overlay.is_none() && !app.leader_pending {
+        draw_completion_popup(frame, app);
     }
 
     // right-click context menu, above everything but the debug overlay
@@ -192,7 +191,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_hitbox_debug(frame: &mut Frame, app: &App) {
     let boxes: Vec<(&str, Rect)> = vec![
         ("sidebar", app.layout.sidebar_list),
-        ("tabs", app.layout.session_tabs),
         ("term", app.layout.terminal_pane),
         ("welcome", app.layout.welcome_list),
         ("editor", app.layout.editor_text),
@@ -237,19 +235,104 @@ fn draw_hitbox_debug(frame: &mut Frame, app: &App) {
     for (i, (rect, _)) in app.link_hits.iter().enumerate() {
         tint("link", *rect, boxes.len() + i);
     }
-    // per-tab click ranges inside the session tab bar — stored as x spans,
-    // the only hit targets that aren't whole rects
-    let tabs_y = app.layout.session_tabs.y;
-    for (i, &(x0, x1, session)) in app.session_tab_hits.iter().enumerate() {
-        let label = format!("t{session}");
-        let rect = Rect::new(x0, tabs_y, x1.saturating_sub(x0), 1);
-        tint(&label, rect, boxes.len() + app.link_hits.len() + i);
-    }
 }
 
 /// Right-click menu: a small bordered list anchored at the click, below
 /// it when there's room, above otherwise. The item area is recorded in
 /// the layout map for mouse hit-testing.
+/// The LSP autocomplete popup: a list of candidates (label + kind) anchored
+/// below the cursor, with a documentation panel beside it showing the
+/// selected item's signature and docs.
+fn draw_completion_popup(frame: &mut Frame, app: &mut App) {
+    let Some(anchor) = app.layout.editor_cursor else { return };
+    let Some(completion) = &app.completion else { return };
+    if completion.filtered.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let items = &completion.items;
+    let rows: Vec<usize> = completion.filtered.clone();
+
+    // list geometry: widest label + kind, capped; at most 10 rows visible
+    let label_w = rows.iter().map(|&i| items[i].label.chars().count()).max().unwrap_or(4);
+    let kind_w = rows.iter().map(|&i| items[i].kind.len()).max().unwrap_or(0);
+    let list_w = ((label_w + kind_w + 4) as u16).clamp(14, 48).min(area.width);
+    let visible = (rows.len() as u16).min(10);
+    // below the cursor if it fits, else above
+    let (y, height) = if anchor.y + 1 + visible <= area.bottom() {
+        (anchor.y + 1, visible)
+    } else {
+        (anchor.y.saturating_sub(visible), visible)
+    };
+    let x = anchor.x.min(area.right().saturating_sub(list_w));
+    let list_rect = Rect::new(x, y, list_w, height);
+
+    // scroll so the selection stays visible
+    let off = completion.selected.saturating_sub(height.saturating_sub(1) as usize);
+    let dim = STATUS_DIM();
+    let inner = list_w.saturating_sub(2) as usize; // one pad each side
+    let lines: Vec<Line> = (off..off + height as usize)
+        .filter_map(|vi| rows.get(vi).map(|&i| (vi, &items[i])))
+        .map(|(vi, item)| {
+            let selected = vi == completion.selected;
+            let mut label: String =
+                item.label.chars().take(inner.saturating_sub(item.kind.len() + 1)).collect();
+            let used = label.chars().count() + item.kind.len();
+            label.push_str(&" ".repeat(inner.saturating_sub(used).max(1)));
+            let bg = if selected { SELECTION_BG() } else { DIALOG_BG() };
+            let name_style = Style::default().bg(bg);
+            let name_style =
+                if selected { name_style.add_modifier(Modifier::BOLD) } else { name_style };
+            Line::from(vec![
+                Span::styled(" ", Style::default().bg(bg)),
+                Span::styled(label, name_style),
+                Span::styled(format!("{} ", item.kind), Style::default().fg(dim).bg(bg)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Clear, list_rect);
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(DIALOG_BG())), list_rect);
+
+    // documentation panel for the selected item, beside the list
+    let item = &items[rows[completion.selected]];
+    let mut doc_lines: Vec<String> = Vec::new();
+    if let Some(detail) = &item.detail {
+        doc_lines.extend(detail.lines().map(str::to_string));
+    }
+    if let Some(docs) = &item.documentation {
+        if !doc_lines.is_empty() {
+            doc_lines.push(String::new());
+        }
+        doc_lines.extend(docs.lines().map(str::to_string));
+    }
+    if doc_lines.is_empty() {
+        return;
+    }
+    let doc_w = 44u16.min(area.width);
+    // right of the list if it fits, else left
+    let doc_x = if list_rect.right() + doc_w <= area.right() {
+        list_rect.right()
+    } else {
+        list_rect.x.saturating_sub(doc_w)
+    };
+    let doc_h = (doc_lines.len() as u16).min(12);
+    let doc_rect = Rect::new(doc_x, y, doc_w, doc_h).intersection(area);
+    if doc_rect.width < 6 {
+        return;
+    }
+    let wrapped: Vec<Line> = doc_lines
+        .iter()
+        .flat_map(|l| wrap_text(l, doc_rect.width.saturating_sub(2) as usize))
+        .take(doc_rect.height as usize)
+        .map(|l| Line::from(Span::raw(format!(" {l}"))))
+        .collect();
+    frame.render_widget(Clear, doc_rect);
+    frame.render_widget(
+        Paragraph::new(wrapped).style(Style::default().bg(DIALOG_BG()).fg(STATUS_DIM())),
+        doc_rect,
+    );
+}
+
 fn draw_context_menu(frame: &mut Frame, app: &mut App) {
     let Some(menu) = &app.context_menu else { return };
     let area = frame.area();
@@ -318,7 +401,6 @@ fn toast_tint(accent: Color) -> Color {
 /// around until answered; plain ones expire in `App::tick`. Hitboxes for
 /// buttons and card bodies land in `app.toast_hits`.
 fn draw_toasts(frame: &mut Frame, app: &mut App) {
-    app.toast_hits.clear();
     if app.toasts.is_empty() {
         return;
     }
@@ -372,8 +454,13 @@ fn draw_toasts(frame: &mut Frame, app: &mut App) {
             break;
         }
         // inset from the right edge: clear of the pane border and its
-        // scrollbar column
-        let rect = Rect::new(area.right().saturating_sub(w + 3), y, w, h);
+        // scrollbar column — and of the notification pane when it's open
+        let right_edge = if app.notifications_open && app.layout.notifications.width > 0 {
+            app.layout.notifications.x.saturating_sub(1)
+        } else {
+            area.right().saturating_sub(2)
+        };
+        let rect = Rect::new(right_edge.saturating_sub(w + 1), y, w, h);
         let mut rows: Vec<Line> = lines
             .iter()
             .map(|l| {
@@ -453,22 +540,179 @@ fn draw_toasts(frame: &mut Frame, app: &mut App) {
         hits.push((rect, index, None));
         y += h; // flush stack — tint and ragged widths separate the cards
     }
-    app.toast_hits = hits;
+    app.toast_hits.extend(hits);
+}
+
+/// The notification pane (bell toggle): every notification of the
+/// session, newest first — severity dot, markdown body (links become
+/// OSC 8 cells + hitboxes, like toasts), dim age.
+fn draw_notifications(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(false));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.layout.notifications = area;
+    if app.notifications.is_empty() {
+        app.layout.notifications_clear = Rect::default();
+        frame.render_widget(
+            Paragraph::new(Span::styled(" no notifications", Style::default().fg(STATUS_DIM()))),
+            inner,
+        );
+        return;
+    }
+    let age = |elapsed: std::time::Duration| -> String {
+        let s = elapsed.as_secs();
+        match s {
+            0..=59 => "now".into(),
+            60..=3599 => format!("{}m", s / 60),
+            _ => format!("{}h", s / 3600),
+        }
+    };
+    let wrap = (inner.width as usize).saturating_sub(3).max(8);
+    // header: title left, "clear all" right (clickable)
+    let clear = "clear all";
+    let title = " notifications";
+    let pad =
+        (inner.width as usize).saturating_sub(title.chars().count() + clear.chars().count() + 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(title, Style::default().fg(STATUS_DIM()).add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                clear,
+                Style::default().fg(STATUS_DIM()).add_modifier(Modifier::UNDERLINED),
+            ),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    app.layout.notifications_clear = Rect::new(
+        inner.right().saturating_sub(clear.len() as u16 + 1),
+        inner.y,
+        clear.len() as u16,
+        1,
+    );
+    let inner = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+    let mut rows: Vec<Line> = Vec::new();
+    // (row, col, label, url) of every rendered link, for the OSC 8 pass
+    let mut pane_links: Vec<(usize, usize, String, String)> = Vec::new();
+    // pending-question button hitboxes (toast index + button index)
+    let mut button_hits: Vec<(Rect, usize, Option<usize>)> = Vec::new();
+    for (level, text, born) in app.notifications.iter().rev() {
+        let dot = match level {
+            crate::app::ToastLevel::Info => chip_accent(6, (134, 220, 214), (1, 132, 188)),
+            crate::app::ToastLevel::Warn => severity_color(2),
+            crate::app::ToastLevel::Error => severity_color(1),
+        };
+        let (mut lines, mut links) = crate::markdown::render_with_links(text, wrap);
+        while lines.first().is_some_and(|l| l.width() == 0) {
+            lines.remove(0);
+            links.retain_mut(|l| {
+                if l.line == 0 {
+                    false
+                } else {
+                    l.line -= 1;
+                    true
+                }
+            });
+        }
+        while lines.last().is_some_and(|l| l.width() == 0) {
+            lines.pop();
+        }
+        let base = rows.len();
+        for link in links {
+            pane_links.push((base + link.line, link.col, link.text, link.url));
+        }
+        for (i, line) in lines.into_iter().enumerate() {
+            let head = if i == 0 { " ● " } else { "   " };
+            let mut spans = vec![Span::styled(head, Style::default().fg(dot))];
+            spans.extend(line.spans);
+            rows.push(Line::from(spans));
+        }
+        // a pending question renders its buttons here too — same chips
+        // as the toast, resolved through the same machinery on click
+        if let Some((toast_index, toast)) =
+            app.toasts.iter().enumerate().find(|(_, t)| !t.buttons.is_empty() && t.text == *text)
+        {
+            let fancy = crate::color::fancy_glyphs();
+            let hover = app.toast_hover;
+            let row_y = inner.y + rows.len() as u16;
+            let mut spans = vec![Span::raw("   ")];
+            let mut x = inner.x + 3;
+            let last = toast.buttons.len() - 1;
+            for (b, blabel) in toast.buttons.iter().enumerate() {
+                let chip = format!(" {blabel} ");
+                let hovered = hover == Some((toast_index, b));
+                let bg = if hovered { dot } else { MENU_TINT() };
+                let style = if hovered {
+                    Style::default().fg(chip_text()).bg(bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().bg(bg)
+                };
+                let cap = |g: &'static str| {
+                    Span::styled(if fancy { g } else { " " }, Style::default().fg(bg))
+                };
+                let mut chip_w = chip.chars().count() as u16;
+                if b > 0 {
+                    spans.push(cap("\u{25e2}"));
+                    chip_w += 1;
+                }
+                spans.push(Span::styled(chip, style));
+                if b < last {
+                    spans.push(cap("\u{25e4}"));
+                    chip_w += 1;
+                }
+                if (row_y as usize) < (inner.bottom()) as usize {
+                    button_hits.push((Rect::new(x, row_y, chip_w, 1), toast_index, Some(b)));
+                }
+                x += chip_w;
+            }
+            rows.push(Line::from(spans));
+        }
+        rows.push(Line::from(Span::styled(
+            format!("   {}", age(born.elapsed())),
+            Style::default().fg(STATUS_DIM()),
+        )));
+        if rows.len() >= inner.height as usize {
+            break;
+        }
+    }
+    app.toast_hits.extend(button_hits);
+    rows.truncate(inner.height as usize);
+    frame.render_widget(Paragraph::new(rows), inner);
+    // clickable links: OSC 8 cells + hitboxes (see draw_toasts)
+    for (row, col, label, url) in pane_links {
+        if row >= inner.height as usize || 3 + col + label.chars().count() > inner.width as usize {
+            continue; // clipped labels would render a broken sequence
+        }
+        let (x, y) = (inner.x + 3 + col as u16, inner.y + row as u16);
+        let hitbox = Rect::new(x, y, label.chars().count().max(1) as u16, 1);
+        let style = frame.buffer_mut().cell((x, y)).map(|c| c.style()).unwrap_or_default();
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            use unicode_width::UnicodeWidthStr;
+            let label_width = label.as_str().width().max(1) as u16;
+            cell.set_symbol(&format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\"));
+            cell.set_style(style);
+            cell.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(
+                std::num::NonZeroU16::new(label_width).expect("max(1) above"),
+            ));
+        }
+        app.link_hits.push((hitbox, url));
+    }
 }
 
 fn draw_whichkey(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let accent = chip_accent(6, (134, 220, 214), (1, 132, 188));
     let key = |k: &str| {
-        Span::styled(
-            format!(" {k:<5}"),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(format!(" {k:<5}"), Style::default().fg(accent).add_modifier(Modifier::BOLD))
     };
     let label = |l: &str| Span::styled(format!("{l:<18}"), Style::default());
     let head = |t: &str| {
         Span::styled(
             format!(" {t:<23}"),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default().fg(STATUS_DIM()).add_modifier(Modifier::BOLD),
         )
     };
     let editor_label = if app.editor.is_some() { "editor" } else { "editor (none open)" };
@@ -516,7 +760,7 @@ fn draw_whichkey(frame: &mut Frame, app: &App) {
         ]),
         Line::from(Span::styled(
             " esc cancel · ctrl+a ctrl+a literal · ctrl+k palette · ? full help",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(STATUS_DIM()),
         )),
     ];
     let width = 76.min(area.width.saturating_sub(2));
@@ -530,10 +774,14 @@ fn draw_whichkey(frame: &mut Frame, app: &App) {
     .intersection(area);
     draw_dialog_base(frame, rect);
     frame.render_widget(
-        Paragraph::new(rows).style(Style::default().bg(DIALOG_BG())).block(dialog_block()),
+        Paragraph::new(rows).style(Style::default().bg(DIALOG_BG())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIALOG_BORDER())),
+        ),
         rect,
     );
-    draw_dialog_frame(frame, rect, "", app.welcome.phase);
 }
 
 /// Command palette: input on top, fuzzy results below. Files by
@@ -561,16 +809,17 @@ fn draw_palette(frame: &mut Frame, app: &mut App) {
 
     let mut lines: Vec<Line> = Vec::new();
     let prompt = if is_cmd { "❯" } else { "🔍" };
+    let accent = chip_accent(6, (134, 220, 214), (1, 132, 188));
     lines.push(Line::from(vec![
-        Span::styled(format!(" {prompt} "), Style::default().fg(Color::Cyan)),
+        Span::styled(format!(" {prompt} "), Style::default().fg(accent)),
         Span::raw(input.clone()),
     ]));
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled("   no matches", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("   no matches", Style::default().fg(STATUS_DIM()))));
     }
     for (i, label) in rows.iter().enumerate() {
         let style = if i == selected {
-            Style::default().bg(Color::Rgb(58, 62, 78)).add_modifier(Modifier::BOLD)
+            Style::default().bg(SELECTION_BG()).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -579,15 +828,19 @@ fn draw_palette(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from(Span::styled(format!(" {marker}{text}"), style)));
     }
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(DIALOG_BG())).block(dialog_block()),
+        Paragraph::new(lines).style(Style::default().bg(DIALOG_BG())).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIALOG_BORDER())),
+        ),
         rect,
     );
-    // result rows start after title + input
+    // result rows start after the padding + input rows
     app.layout.palette_list =
         Rect { x: rect.x, y: rect.y + 2, width: rect.width, height: rect.height.saturating_sub(3) };
     let prefix = if is_cmd { 3 } else { 4 }; // " ❯ " vs " 🔍 " (emoji is 2 wide)
     frame.set_cursor_position((rect.x + 2 + prefix + input.chars().count() as u16, rect.y + 1));
-    draw_dialog_frame(frame, rect, "", app.welcome.phase);
 }
 
 /// Greedy word wrap for diagnostic messages.
@@ -614,7 +867,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 /// surface, no frame or badge, scrollable when tall.
 fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let anchor = app.hover_anchor;
+    let anchor = app.code_view.hover_anchor;
     // inline code and unlabeled fences highlight as the hovered file's
     // language, so docs read like the source they describe
     let hover_lang =
@@ -806,6 +1059,17 @@ fn draw_hover_overlay(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// A path for display: the home directory abbreviated to `~`.
+fn display_path(path: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        let rest = rest.to_string_lossy();
+        return if rest.is_empty() { "~".into() } else { format!("~/{rest}") };
+    }
+    path.to_string_lossy().into_owned()
+}
+
 fn draw_welcome(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let art_height = LOGO.len() as u16 + 1; // wordmark + version row
@@ -864,31 +1128,14 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
     );
     app.layout.welcome_list = list_area;
 
-    let now = std::time::SystemTime::now();
-    let mut items: Vec<ListItem> = Vec::with_capacity(app.welcome.len());
-    items.push(ListItem::new(Line::from(vec![
+    let items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
         Span::styled("open ", Style::default().fg(Color::Gray)),
         Span::styled(
             display_path(&app.workdir),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  (current directory)", Style::default().fg(Color::DarkGray)),
-    ])));
-    for project in &app.welcome.projects {
-        let chats = format!(
-            "{} chat{}",
-            project.chat_count,
-            if project.chat_count == 1 { "" } else { "s" }
-        );
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("{:>4}  ", project.age(now)),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(display_path(&project.path)),
-            Span::styled(format!("  · {chats}"), Style::default().fg(Color::DarkGray)),
-        ])));
-    }
+    ]))];
     let list = List::new(items)
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ");
@@ -935,11 +1182,33 @@ fn draw_menu_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         app.layout.menu_items[i] = Rect::new(area.x + used, area.y + 1, chip_width, 1);
         used += chip_width;
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "you".into());
-    let right = format!("{user}     ⚙   ");
-    let pad = (area.width as usize).saturating_sub(used as usize + right.width());
+    // bell chip at the right edge (a notification center, someday) —
+    // same slant chip treatment as the menu items
+    let bell = if app.config.icons { "\u{f009a}" } else { "•" };
+    let unread = app.notifications.len().saturating_sub(app.notifications_seen);
+    let label = if unread > 0 && !app.notifications_open {
+        format!(" {bell} {unread} ")
+    } else {
+        format!(" {bell} ")
+    };
+    let bell_bg = if app.notifications_open {
+        SELECTION_BG()
+    } else if unread > 0 {
+        // unread badge accent, like VS Code's dot on the bell
+        chip_accent(6, (134, 220, 214), (1, 132, 188))
+    } else {
+        tint
+    };
+    let cap =
+        |s: &'static str| Span::styled(if fancy { s } else { " " }, Style::default().fg(bell_bg));
+    let right_width = label.width() + 3; // caps + one column of margin
+    let pad = (area.width as usize).saturating_sub(used as usize + right_width);
+    let chip_width = label.width() as u16 + 2;
+    app.layout.menu_bell = Rect::new(area.x + used + pad as u16, area.y + 1, chip_width, 1);
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+    spans.push(cap("◢"));
+    spans.push(Span::styled(label, Style::default().bg(bell_bg)));
+    spans.push(cap("◤"));
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect::new(area.x, area.y + 1, area.width, 1),
@@ -986,15 +1255,6 @@ fn draw_menu_dropdown(frame: &mut Frame, app: &mut App) {
 }
 
 /// Dashboard glyph and color for a session status.
-fn status_indicator(status: SessionStatus) -> (&'static str, Color) {
-    match status {
-        SessionStatus::Working => ("●", Color::Green),
-        SessionStatus::Attention => ("●", Color::Yellow),
-        SessionStatus::Idle => ("○", Color::DarkGray),
-        SessionStatus::Exited(_) => ("✖", Color::Red),
-    }
-}
-
 /// Hairline chrome grey shared by unfocused pane borders and the editor's
 /// gutter rule — derived from the terminal's own colors (wash), so the two
 /// always match and follow light/dark theme flips together.
@@ -1010,46 +1270,144 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.shell {
         Shell::Code => draw_file_tree(frame, app, area),
         Shell::Git => draw_git_panel(frame, app, area),
-        Shell::Agents => draw_chats_panel(frame, app, area),
+        Shell::Agents => draw_agents_sidebar(frame, app, area),
     }
 }
 
-fn draw_chats_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+/// A status icon, one-word label, and accent color for a connection state.
+/// The icon is a Material Design Nerd Font glyph when the terminal supports
+/// them, else a geometric fallback — matching the tool-call glyphs.
+fn agent_status(
+    state: &crate::acp::ConnState,
+    working: bool,
+) -> (&'static str, &'static str, Color) {
+    use crate::acp::ConnState;
+    let fancy = crate::color::fancy_glyphs();
+    let icon = |nerd: &'static str, plain: &'static str| if fancy { nerd } else { plain };
+    match (state, working) {
+        (ConnState::Starting, _) => (icon("\u{f051f}", "○"), "connecting", STATUS_DIM()),
+        (ConnState::NeedsAuth, _) => {
+            (icon("\u{f033e}", "!"), "sign in", chip_accent(3, (250, 210, 60), (176, 130, 10)))
+        }
+        (ConnState::Failed, _) => (icon("\u{f0159}", "✖"), "exited", REMOVE_BG()),
+        (_, true) => {
+            (icon("\u{f04e6}", "◐"), "working", chip_accent(3, (229, 200, 144), (193, 132, 1)))
+        }
+        _ => (icon("\u{f05e0}", "●"), "ready", chip_accent(6, (134, 220, 214), (1, 132, 188))),
+    }
+}
+
+/// The status icon + color for a session row: a permission request, a
+/// running turn, or idle. Same Nerd-vs-plain discipline as [`agent_status`].
+fn session_dot(needs_perm: bool, working: bool) -> (&'static str, Color) {
+    let fancy = crate::color::fancy_glyphs();
+    let icon = |nerd: &'static str, plain: &'static str| if fancy { nerd } else { plain };
+    if needs_perm {
+        (icon("\u{f0028}", "●"), chip_accent(1, (240, 120, 120), (200, 40, 40)))
+    } else if working {
+        (icon("\u{f04e6}", "◐"), chip_accent(3, (229, 200, 144), (193, 132, 1)))
+    } else {
+        (icon("\u{f09de}", "○"), STATUS_DIM())
+    }
+}
+
+/// The agents sidebar: a file-tree-style view of every agent connection
+/// with its sessions nested under it. The cursor row is highlighted; a
+/// session opens in the main pane, an agent collapses/expands.
+fn draw_agents_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::app::AcpRow;
     let focused = app.focus == Focus::Sidebar;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(border_style(focused));
+        .border_style(border_style(focused))
+        .title(Span::styled(" agents ", Style::default().fg(STATUS_DIM())));
     app.layout.sidebar_list = block.inner(area);
 
-    if app.chats.chats.is_empty() {
-        let msg = Paragraph::new("no past chats for this directory").block(block);
+    if app.acp.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  no agent running", Style::default().fg(STATUS_DIM()))),
+            Line::from(""),
+            Line::from(Span::styled("  Ctrl+A c  start agent", Style::default().fg(Color::Cyan))),
+        ])
+        .block(block);
         frame.render_widget(msg, area);
         return;
     }
 
-    let now = std::time::SystemTime::now();
-    let items: Vec<ListItem> = app
-        .chats
-        .chats
+    let dim = Style::default().fg(STATUS_DIM());
+    let open = app.agent_view.open.clone();
+    let fancy = crate::color::fancy_glyphs();
+    let rows = app.acp_rows();
+    let cursor = app.agent_view.cursor.min(rows.len().saturating_sub(1));
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|chat| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:>3} ", chat.age(now)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(chat.summary.clone()),
-            ]))
+        .map(|row| match row {
+            AcpRow::Agent(ci) => {
+                let client = app.acp.conn(*ci);
+                let name = app.acp.name(*ci);
+                let working = client.map(session_working).unwrap_or(false);
+                let state = client.map(|c| c.state()).unwrap_or(crate::acp::ConnState::Failed);
+                let (icon, _, color) = agent_status(&state, working);
+                let collapsed = app.agent_view.collapsed.contains(ci);
+                let caret = match (fancy, collapsed) {
+                    (true, true) => "▸ ",
+                    (true, false) => "▾ ",
+                    (false, true) => "> ",
+                    (false, false) => "v ",
+                };
+                let mut spans = vec![
+                    Span::styled(caret, dim),
+                    Span::styled(format!("{icon} "), Style::default().fg(color)),
+                    Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                ];
+                // a failed agent: append its error inline so the red dot
+                // isn't a silent dead end
+                if state == crate::acp::ConnState::Failed
+                    && let Some(err) = client.and_then(|c| c.error())
+                {
+                    let brief: String = err.chars().take(24).collect();
+                    spans.push(Span::styled(format!(" — {brief}"), dim));
+                }
+                ListItem::new(Line::from(spans))
+            }
+            AcpRow::Session(ci, id) => {
+                let client = app.acp.conn(*ci);
+                let label = app.acp_session_label(*ci, id);
+                let working = client.map(|c| c.turn_active(id)).unwrap_or(false);
+                let needs_perm =
+                    client.map(|c| c.pending_permission(id).is_some()).unwrap_or(false);
+                let (dot, dot_color) = session_dot(needs_perm, working);
+                let is_open = open.as_ref().is_some_and(|(c, s)| c == ci && s == id);
+                let style = if is_open {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled("   ", dim),
+                    Span::styled(format!("{dot} "), Style::default().fg(dot_color)),
+                    Span::styled(label, style),
+                ]))
+            }
         })
         .collect();
+
+    // a List with the file-tree's persistent selection highlight
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-    app.chats_list.select(Some(app.chats.selected));
-    let mut state = std::mem::take(&mut app.chats_list);
+    let mut state = std::mem::take(&mut app.agent_view.list);
+    state.select((!rows.is_empty()).then_some(cursor));
     frame.render_stateful_widget(list, area, &mut state);
-    app.chats_list = state;
+    app.agent_view.list = state;
+    let _ = focused;
+}
+
+/// True if any of a connection's sessions has a turn running.
+fn session_working(client: &crate::acp::AcpClient) -> bool {
+    client.sessions().iter().any(|s| s.working)
 }
 
 fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1088,10 +1446,24 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|item| {
             let indent = "  ".repeat(item.depth);
-            let icon = if item.is_dir {
-                if item.expanded { "[▼] " } else { "[▶] " }
+            // devicons when enabled (folders too); plain glyphs otherwise
+            let (icon, icon_style) = if app.config.icons {
+                if item.is_dir {
+                    let glyph = if item.expanded {
+                        crate::devicons::FOLDER_OPEN
+                    } else {
+                        crate::devicons::FOLDER
+                    };
+                    (format!("{glyph}  "), Style::default().fg(Color::Blue))
+                } else {
+                    let (glyph, (r, g, b)) = crate::devicons::icon(&item.name);
+                    (format!("{glyph}  "), Style::default().fg(Color::Rgb(r, g, b)))
+                }
+            } else if item.is_dir {
+                let glyph = if item.expanded { "[▼] " } else { "[▶] " };
+                (glyph.to_string(), Style::default())
             } else {
-                "   " // aligns with the double-width folder emoji
+                ("   ".to_string(), Style::default())
             };
             let rel = rel_of(&item.path);
             // name color: git status wins, else folders are blue
@@ -1106,7 +1478,7 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let mut spans = vec![
                 Span::raw(indent.clone()),
-                Span::raw(icon.to_string()),
+                Span::styled(icon.clone(), icon_style),
                 Span::styled(item.name.clone(), name_style),
             ];
             // right-aligned badges at the row's edge: a dim link arrow for
@@ -1162,13 +1534,13 @@ fn draw_file_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     if app.tree.items.is_empty() {
-        app.tree_list.select(None);
+        app.code_view.tree_list.select(None);
     } else {
-        app.tree_list.select(Some(app.tree.selected));
+        app.code_view.tree_list.select(Some(app.tree.selected));
     }
-    let mut state = std::mem::take(&mut app.tree_list);
+    let mut state = std::mem::take(&mut app.code_view.tree_list);
     frame.render_stateful_widget(list, area, &mut state);
-    app.tree_list = state;
+    app.code_view.tree_list = state;
 }
 
 fn status_color(kind: StatusKind) -> Color {
@@ -1182,94 +1554,119 @@ fn status_color(kind: StatusKind) -> Color {
     }
 }
 
+/// One row of the changes panel, shared by both boxes and both views.
+fn git_row_item(app: &App, row: &crate::git::GitRow) -> ListItem<'static> {
+    let indent = "  ".repeat(row.depth);
+    match row.entry {
+        // same folder affordances as the file tree
+        None => {
+            let icon = if app.config.icons {
+                if row.collapsed {
+                    format!("{}  ", crate::devicons::FOLDER)
+                } else {
+                    format!("{}  ", crate::devicons::FOLDER_OPEN)
+                }
+            } else if row.collapsed {
+                "[▶] ".to_string()
+            } else {
+                "[▼] ".to_string()
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("   {indent}")),
+                Span::styled(icon, Style::default().fg(Color::Blue)),
+                Span::styled(
+                    row.name.clone(),
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        }
+        Some(idx) => {
+            let entry = &app.git.entries[idx];
+            let mut spans = vec![
+                Span::styled(
+                    entry.code(),
+                    Style::default().fg(status_color(entry.kind)).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {indent}")),
+            ];
+            if app.config.icons {
+                let name = row.name.rsplit('/').next().unwrap_or(&row.name);
+                let (glyph, (r, g, b)) = crate::devicons::icon(name);
+                spans.push(Span::styled(
+                    format!("{glyph}  "),
+                    Style::default().fg(Color::Rgb(r, g, b)),
+                ));
+            }
+            spans.push(Span::raw(row.name.clone()));
+            ListItem::new(spans.into_iter().collect::<Line>())
+        }
+    }
+}
+
 fn draw_git_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
-    app.layout.sidebar_list = block.inner(area);
+    let inner = block.inner(area);
+    app.layout.sidebar_list = inner;
 
     if !app.git.is_repo() {
-        let msg = Paragraph::new("not a git repository").block(block);
-        frame.render_widget(msg, area);
+        frame.render_widget(Paragraph::new("not a git repository").block(block), area);
         return;
     }
     if app.git.entries.is_empty() {
-        let msg = Paragraph::new("working tree clean").block(block);
-        frame.render_widget(msg, area);
+        frame.render_widget(Paragraph::new("working tree clean").block(block), area);
         return;
     }
 
-    let (items, selected_row) = match app.git.view {
-        GitView::List => {
-            let items: Vec<ListItem> = app
-                .git
-                .entries
-                .iter()
-                .map(|entry| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            entry.code(),
-                            Style::default()
-                                .fg(status_color(entry.kind))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(" "),
-                        Span::raw(entry.path.clone()),
-                    ]))
-                })
-                .collect();
-            (items, app.git.selected)
+    let rows = app.git.rows();
+    let split = rows.iter().filter(|r| r.staged).count();
+    let cursor = app.git.cursor.min(rows.len().saturating_sub(1));
+    // a rule row marks the staged/unstaged boundary (only while both
+    // sections have rows); the cursor steps over it
+    let sep = split > 0 && split < rows.len();
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 1);
+    for (i, row) in rows.iter().enumerate() {
+        if sep && i == split {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(chrome_grey()),
+            ))));
         }
-        GitView::Tree => {
-            let rows = app.git.tree_rows();
-            let selected_row =
-                rows.iter().position(|r| r.entry == Some(app.git.selected)).unwrap_or(0);
-            let items: Vec<ListItem> = rows
-                .iter()
-                .map(|row| {
-                    let indent = "  ".repeat(row.depth);
-                    match row.entry {
-                        None => ListItem::new(Line::from(vec![
-                            Span::raw(format!("   {indent}")),
-                            Span::raw("📂 "),
-                            Span::styled(
-                                row.name.clone(),
-                                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-                            ),
-                        ])),
-                        Some(idx) => {
-                            let entry = &app.git.entries[idx];
-                            ListItem::new(Line::from(vec![
-                                Span::styled(
-                                    entry.code(),
-                                    Style::default()
-                                        .fg(status_color(entry.kind))
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::raw(format!(" {indent}")),
-                                Span::raw(row.name.clone()),
-                            ]))
-                        }
-                    }
-                })
-                .collect();
-            (items, selected_row)
-        }
-    };
+        items.push(git_row_item(app, row));
+    }
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
-    app.git_list.select(Some(selected_row));
-    let mut state = std::mem::take(&mut app.git_list);
+    app.git_view.list.select(Some(cursor + (sep && cursor >= split) as usize));
+    let mut state = std::mem::take(&mut app.git_view.list);
     frame.render_stateful_widget(list, area, &mut state);
-    app.git_list = state;
+    // the separator joins the pane borders with proper junctions
+    if sep && split >= state.offset() {
+        let row_in_view = (split - state.offset()) as u16;
+        if row_in_view < inner.height {
+            let y = inner.y + row_in_view;
+            let buf = frame.buffer_mut();
+            for (x, arm) in [(area.x, 8u8), (area.right().saturating_sub(1), 4u8)] {
+                let cell = &mut buf[(x, y)];
+                if let Some(arms) = box_arms(cell.symbol())
+                    && let Some(merged) = arms_box(arms | arm)
+                {
+                    cell.set_symbol(merged);
+                }
+            }
+        }
+    }
+    app.git_view.list = state;
 }
 
 fn draw_main_area(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.shell {
-        Shell::Agents => draw_terminal_area(frame, app, area),
+        Shell::Agents if app.agent_view.open.is_some() => draw_acp_conversation(frame, app, area),
+        Shell::Agents => draw_agent_placeholder(frame, app, area),
         Shell::Git => draw_git_diff_main(frame, app, area),
         Shell::Code => {
             app.layout.terminal_pane = area;
@@ -1325,7 +1722,7 @@ fn draw_editor_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
         if y >= inner.bottom() {
             break;
         }
-        let selected = i == app.code_home_selected;
+        let selected = i == app.code_view.home_selected;
         let base =
             if selected { Style::default().bg(Color::Rgb(58, 62, 78)) } else { Style::default() };
         let marker = if selected { "▸ " } else { "  " };
@@ -1354,29 +1751,20 @@ fn draw_editor_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_git_diff_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Terminal;
     app.layout.terminal_pane = area;
-    let text = if !app.git.is_repo() {
-        String::new()
-    } else {
-        let path = app.git.selected_entry().map(|e| e.path.clone());
-        app.git.diff(path.as_deref()).unwrap_or_default()
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style(focused));
     let inner = block.inner(area);
-    let lines = crate::diff::parse(&text);
+    // pure render of the cached pane model (built in the update phase —
+    // see App::refresh_git_pane); draw does no git/fs work
+    let lines = &app.git_view.pane.lines;
     let viewport = inner.height as usize;
-    app.git_diff_viewport = viewport.max(1);
+    app.git_view.diff_viewport = viewport.max(1);
     let max_scroll = lines.len().saturating_sub(viewport);
-    app.git_diff_scroll = app.git_diff_scroll.min(max_scroll);
-    let visible: Vec<Line> = lines
-        .iter()
-        .skip(app.git_diff_scroll)
-        .take(viewport)
-        .map(|line| render_diff_line(line, inner.width as usize))
-        .collect();
-    if text.trim().is_empty() {
+    app.git_view.diff_scroll = app.git_view.diff_scroll.min(max_scroll);
+    app.git_view.diff_scroll_rendered = app.git_view.diff_scroll;
+    if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 if app.git.is_repo() { " no changes " } else { " not a git repository " },
@@ -1387,116 +1775,586 @@ fn draw_git_diff_main(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    frame.render_widget(Paragraph::new(visible).block(block), area);
-}
-
-fn draw_terminal_area(frame: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-
-    // session tab bar with status dots: ● working · ● attention · ○ idle · ✖ exited
-    let statuses = app.sessions.statuses();
-    app.statuses = statuses.clone();
-    let titles: Vec<Line> = app
-        .sessions
-        .sessions
+    let visible: Vec<Line> = lines
         .iter()
-        .zip(statuses.iter())
         .enumerate()
-        .map(|(i, (s, status))| {
-            let (dot, color) = status_indicator(*status);
-            Line::from(vec![
-                Span::styled(format!(" {dot} "), Style::default().fg(color)),
-                Span::raw(format!("{}:{} ", i + 1, s.title)),
-            ])
+        .skip(app.git_view.diff_scroll)
+        .take(viewport)
+        .map(|(idx, line)| {
+            render_diff_line(
+                line,
+                inner.width as usize,
+                app.git_view.gap_hover == Some(idx),
+                app.config.icons,
+            )
         })
         .collect();
-    let selected_tab = app.sessions.active;
-    // Record each tab's clickable x-range: Tabs renders
-    // [space][title][space][divider] repeatedly.
-    app.layout.session_tabs = chunks[0];
-    app.session_tab_hits.clear();
-    let mut x = chunks[0].x;
-    for (i, title) in titles.iter().enumerate() {
-        let width = title.width() as u16 + 2;
-        app.session_tab_hits.push((x, x + width, i));
-        x += width + 1;
+    frame.render_widget(Paragraph::new(visible).block(block), area);
+    // the gutter rule joins the pane border with proper junctions
+    // (the bar sits after the two 5-wide line-number columns)
+    if inner.width > 10 {
+        let x = inner.x + 10;
+        let buf = frame.buffer_mut();
+        for (y, arm) in [(area.y, 2u8), (area.bottom().saturating_sub(1), 1u8)] {
+            let cell = &mut buf[(x, y)];
+            if let Some(arms) = box_arms(cell.symbol())
+                && let Some(merged) = arms_box(arms | arm)
+            {
+                cell.set_symbol(merged);
+            }
+        }
     }
-    let tabs = Tabs::new(titles)
-        .select(selected_tab)
-        .highlight_style(
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )
-        .divider("|");
-    frame.render_widget(tabs, chunks[0]);
+}
 
+/// The agents shell with no agent running: a prompt to start one.
+fn draw_agent_placeholder(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Terminal;
-    let active_exited = matches!(statuses.get(app.sessions.active), Some(SessionStatus::Exited(_)));
-    let pane = chunks[1];
-    app.layout.terminal_pane = pane;
-    let block =
-        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(
-            if active_exited { Style::default().fg(Color::Red) } else { border_style(focused) },
-        );
-
-    let inner = block.inner(pane);
-    // Remember pane size for new sessions and keep the active one in sync.
-    app.term_size = (inner.height.max(1), inner.width.max(1));
-    let scroll_offset = match app.sessions.active_session() {
-        Some(session) => {
-            session.resize(inner.height.max(1), inner.width.max(1));
-            session.scroll_offset
+    app.layout.terminal_pane = area;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(focused));
+    let dim = Style::default().fg(STATUS_DIM());
+    // a connection awaiting authentication: show its methods, keyed 1–9
+    if let Some(conn) = app.acp_auth_target()
+        && let Some(client) = app.acp.conn(conn)
+    {
+        let accent = chip_accent(3, (250, 210, 60), (176, 130, 10));
+        let lock = if crate::color::fancy_glyphs() { "\u{f0341} " } else { "" };
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("  {lock}"), Style::default().fg(accent)),
+                Span::styled(
+                    format!("{} needs you to sign in", app.acp.name(conn)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        for (i, method) in client.auth_methods().iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", i + 1),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(method.name.clone()),
+            ]));
+            if let Some(desc) = &method.description {
+                lines.push(Line::from(Span::styled(format!("      {desc}"), dim)));
+            }
         }
-        None => 0,
+        if let Some(err) = client.auth_error() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  ✖ {err}"),
+                Style::default().fg(REMOVE_BG()),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    // a connection that died before opening a session: show WHY (its last
+    // stderr line) instead of a perpetual "connecting…"
+    let failed = app
+        .acp
+        .conns()
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.state() == crate::acp::ConnState::Failed);
+    let lines = if let Some((ci, client)) = failed {
+        let err = client.error().unwrap_or_else(|| "the agent exited during startup".into());
+        let mut out = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ✖ ", Style::default().fg(REMOVE_BG())),
+                Span::styled(
+                    format!("{} failed to start", app.acp.name(ci)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        for line in wrap_text(&err, area.width.saturating_sub(6) as usize) {
+            out.push(Line::from(Span::styled(format!("  {line}"), dim)));
+        }
+        out
+    } else if !app.acp.is_empty() {
+        // a connection exists but no session is open yet: handshake in flight
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  connecting to the agent…", dim)),
+            Line::from(""),
+            Line::from(Span::styled("  pick a session in the sidebar", dim)),
+        ]
+    } else {
+        let hint = if app.config.agent_command().is_some() {
+            "  Ctrl+A c  start the configured agent"
+        } else {
+            "  set `agent` in .vibin/config.toml, then Ctrl+A c"
+        };
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  no agent running", dim)),
+            Line::from(""),
+            Line::from(Span::styled(hint, Style::default().fg(Color::Cyan))),
+        ]
     };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
 
-    let overlay_open = app.overlay.is_some() || app.leader_pending;
-    match app.sessions.active_session() {
-        Some(session) => {
-            let title = if let Some(code) = session.exit_code() {
-                format!(" {} — exited ({code}) · Ctrl+A R respawn · Ctrl+A x close ", session.title)
-            } else if scroll_offset > 0 {
-                format!(" {} [scroll:{}] ", session.title, scroll_offset)
-            } else {
-                format!(" {} ", session.title)
-            };
-            let parser = session.parser.lock().unwrap();
-            let screen = parser.screen();
-            // When the pane is focused, place the real (blinking) terminal
-            // cursor on the embedded screen's cursor and hide tui-term's
-            // painted one; a painted cell can never blink.
-            let use_real_cursor =
-                focused && !overlay_open && scroll_offset == 0 && !screen.hide_cursor();
-            let mut term = PseudoTerminal::new(screen).block(block.title(title));
-            if use_real_cursor {
-                let mut cursor = tui_term::widget::Cursor::default();
-                cursor.hide();
-                term = term.cursor(cursor);
+/// Kind → glyph for an ACP tool call. Nerd Font icons when fancy, ASCII
+/// otherwise — the same slant/glyph discipline as the rest of the chrome.
+fn acp_tool_glyph(kind: &str) -> &'static str {
+    let fancy = crate::color::fancy_glyphs();
+    match (kind, fancy) {
+        ("read", true) => "\u{f0e2f}",    // book-open
+        ("edit", true) => "\u{f03eb}",    // pencil
+        ("delete", true) => "\u{f0a7a}",  // trash
+        ("move", true) => "\u{f0450}",    // file-move
+        ("search", true) => "\u{f0349}",  // magnify
+        ("execute", true) => "\u{f018d}", // console
+        ("fetch", true) => "\u{f0ac0}",   // download
+        ("think", true) => "\u{f0210}",   // lightbulb
+        (_, true) => "\u{f0877}",         // wrench
+        _ => "*",
+    }
+}
+
+/// The ACP agent conversation: a scrollable transcript (user prompts,
+/// streamed agent text, tool calls, plans) with a permission prompt and a
+/// prompt composer pinned to the bottom. Pure reader of `app.acp` — the
+/// client's reader thread owns all the state (see [`crate::acp`]).
+fn draw_acp_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::acp::{ConnState, Entry};
+    let Some((conn, id)) = app.agent_view.open.clone() else { return };
+    let Some(client) = app.acp.conn(conn) else { return };
+    let focused = app.focus == Focus::Terminal;
+    app.layout.terminal_pane = area;
+    // cleared each draw, re-recorded only when the composer paints them, so a
+    // permission prompt or a dead agent leaves no phantom hit target behind
+    app.layout.agent_mode_chip = Rect::default();
+    app.layout.agent_mode_menu = Rect::default();
+    app.layout.agent_mention_menu = Rect::default();
+    let mode_hover = app.agent_view.mode_hover;
+    let menu_open = app.agent_view.mode_menu.is_some();
+
+    let (state, entries, pending) =
+        (client.state(), client.entries(&id), client.pending_permission(&id));
+    let working = client.turn_active(&id);
+    // the session's selectable modes and which one is active, for the meta
+    // line's dropdown (empty when the agent has no modes)
+    let modes = client.modes(&id);
+    let current_mode = client.current_mode(&id);
+    let ui = app.agent_view.ui.get(&id);
+    let composer_text = ui.map(|u| u.input.text()).unwrap_or_default();
+    let composer_cursor = ui.map(|u| u.input.cursor()).unwrap_or(0);
+    let composer_sel = ui.and_then(|u| u.input.selection());
+    let mut scroll = ui.map(|u| u.scroll).unwrap_or(0);
+
+    // the composer meta line just names the agent; the mode (if any) sits
+    // beside it as a dropdown
+    let agent_brand = app.acp.name(conn);
+    let mode_name = current_mode
+        .as_ref()
+        .and_then(|cur| modes.iter().find(|m| &m.id == cur))
+        .map(|m| m.name.clone())
+        .or_else(|| modes.first().map(|m| m.name.clone()));
+
+    // the turn-status accent, for the composer prompt + permission block
+    let accent = match (&state, working) {
+        (ConnState::Starting, _) => MENU_TINT(),
+        (ConnState::Failed, _) => REMOVE_BG(),
+        (_, true) => chip_accent(3, (229, 200, 144), (193, 132, 1)),
+        _ => chip_accent(6, (134, 220, 214), (1, 132, 188)),
+    };
+    // plain pane frame, like the editor and git diff panes — the session's
+    // name lives in the status bar (as the editor bar shows the filename)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // vertical split: transcript · [permission] · composer · key hints.
+    // the composer is a padded box (input, blank, meta line); a permission
+    // prompt or a dead agent collapses it to a single status line.
+    let perm_h = pending
+        .as_ref()
+        .map(|p| p.options.len() as u16 + 3) // title + options + frame
+        .unwrap_or(0);
+    let composer_h = if pending.is_some() || matches!(state, ConnState::Failed) { 1 } else { 5 };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(perm_h),
+            Constraint::Length(composer_h),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // ---- transcript ----
+    let width = rows[0].width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    // (line index into `lines`, col, label, url) of every markdown link, for
+    // the OSC 8 + hitbox pass once the visible window is known
+    let mut transcript_links: Vec<(usize, usize, String, String)> = Vec::new();
+    let dim = Style::default().fg(STATUS_DIM());
+    for entry in &entries {
+        match entry {
+            Entry::User(text) => {
+                lines.push(Line::from(""));
+                for (i, w) in wrap_text(text, width.saturating_sub(4)).into_iter().enumerate() {
+                    let prefix = if i == 0 { " › " } else { "   " };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(w, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
             }
-            frame.render_widget(term, pane);
-            if use_real_cursor {
-                let (row, col) = screen.cursor_position();
-                let x = (inner.x + col).min(inner.right().saturating_sub(1));
-                let y = (inner.y + row).min(inner.bottom().saturating_sub(1));
-                frame.set_cursor_position((x, y));
+            Entry::Agent(text) => {
+                // agent prose is markdown: headings, lists, code fences, and
+                // inline styling, wrapped to the pane and indented a column to
+                // match the transcript's left margin
+                let (md_lines, md_links) =
+                    crate::markdown::render_with_links(text, width.saturating_sub(2));
+                let base = lines.len();
+                for link in md_links {
+                    // +1 col for the indent space prepended below
+                    transcript_links.push((base + link.line, link.col + 1, link.text, link.url));
+                }
+                for md in md_lines {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(md.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
+            Entry::Tool(tc) => {
+                let glyph = acp_tool_glyph(&tc.kind);
+                let (mark, mstyle) = match tc.status.as_str() {
+                    "completed" => {
+                        ("✓", Style::default().fg(chip_accent(2, (152, 195, 121), (80, 161, 79))))
+                    }
+                    "failed" => ("✗", Style::default().fg(REMOVE_BG())),
+                    "in_progress" => ("◐", Style::default().fg(accent)),
+                    _ => ("·", dim),
+                };
+                let mut spans = vec![
+                    Span::raw("   "),
+                    Span::styled(format!("{mark} "), mstyle),
+                    Span::styled(format!("{glyph} "), dim),
+                    Span::raw(tc.title.clone()),
+                ];
+                if !tc.locations.is_empty() {
+                    spans.push(Span::styled(format!("  {}", tc.locations.join(", ")), dim));
+                }
+                lines.push(Line::from(spans));
+            }
+            Entry::Plan(plan) => {
+                for e in plan {
+                    let g = match e.status.as_str() {
+                        "completed" => "✓",
+                        "in_progress" => "◐",
+                        _ => "○",
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   {g} "), dim),
+                        Span::raw(e.content.clone()),
+                    ]));
+                }
+            }
+            Entry::Notice(text) => {
+                lines.push(Line::from(Span::styled(format!("   ! {text}"), dim)));
             }
         }
-        None => {
-            let msg = Paragraph::new(vec![
-                Line::from(""),
-                Line::from("  no active sessions"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Ctrl+A c  start a new Claude session",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(Span::styled("  Ctrl+A ?  help", Style::default().fg(Color::DarkGray))),
-            ])
-            .block(block.title(" vibin "));
-            frame.render_widget(msg, pane);
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  ask the agent anything to begin", dim)));
+    }
+
+    // scroll counts lines above the tail (0 = follow the tail); clamp and
+    // write the clamped value back onto the open session
+    let height = rows[0].height as usize;
+    let total = lines.len();
+    let max_up = total.saturating_sub(height);
+    scroll = scroll.min(max_up);
+    app.agent_view.ui.entry(id.clone()).or_default().scroll = scroll;
+    let start = max_up.saturating_sub(scroll);
+    let view: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
+    frame.render_widget(Paragraph::new(view), rows[0]);
+
+    // clickable markdown links on the visible rows: OSC 8 cells (native
+    // terminal click) + hitboxes (our own click + hand pointer), like the
+    // notification pane
+    for (row, col, label, url) in transcript_links {
+        if row < start || row >= start + height {
+            continue; // scrolled out of view
         }
+        if col + label.chars().count() > width {
+            continue; // clipped labels would render a broken sequence
+        }
+        let x = rows[0].x + col as u16;
+        let y = rows[0].y + (row - start) as u16;
+        let hitbox = Rect::new(x, y, label.chars().count().max(1) as u16, 1);
+        let style = frame.buffer_mut().cell((x, y)).map(|c| c.style()).unwrap_or_default();
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            use unicode_width::UnicodeWidthStr;
+            let label_width = label.as_str().width().max(1) as u16;
+            cell.set_symbol(&format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\"));
+            cell.set_style(style);
+            cell.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(
+                std::num::NonZeroU16::new(label_width).expect("max(1) above"),
+            ));
+        }
+        app.link_hits.push((hitbox, url));
+    }
+
+    // ---- permission prompt ----
+    if let Some(perm) = &pending {
+        let pblock = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent))
+            .title(Span::styled(
+                " permission ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ));
+        let pinner = pblock.inner(rows[1]);
+        frame.render_widget(pblock, rows[1]);
+        let mut plines = vec![Line::from(format!(" {}", perm.title))];
+        for (i, opt) in perm.options.iter().enumerate() {
+            let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+            plines.push(Line::from(vec![
+                Span::styled(format!("  {} ", i + 1), key),
+                Span::raw(opt.name.clone()),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(plines), pinner);
+    }
+
+    // ---- composer ----
+    if pending.is_some() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(" 1–9 choose · Esc reject", dim))),
+            rows[2],
+        );
+    } else if matches!(state, ConnState::Failed) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " agent exited — Ctrl+A then Tools to restart",
+                dim,
+            ))),
+            rows[2],
+        );
+    } else {
+        // an accent-barred input box: the message on top, then a meta line
+        // naming the agent · session · status. inset a column on each side,
+        // with half-block top and bottom edges, so it floats as a soft panel;
+        // a left bar in the turn-status color and a faint fill are its frame.
+        let box_area = rows[2];
+        let panel_x = box_area.x + 1;
+        let panel_w = box_area.width.saturating_sub(2);
+        let panel_h = box_area.height;
+        let bg = wash(22);
+        let base = bg.map(|c| Style::default().bg(c)).unwrap_or_default();
+        if let Some(fill) = bg {
+            // filled middle, then upper/lower half blocks for the soft edges
+            frame.render_widget(
+                Block::default().style(base),
+                Rect { x: panel_x, y: box_area.y + 1, width: panel_w, height: panel_h - 2 },
+            );
+            let edge = Style::default().fg(fill);
+            frame.render_widget(
+                Paragraph::new(Span::styled("▄".repeat(panel_w as usize), edge)),
+                Rect { x: panel_x, y: box_area.y, width: panel_w, height: 1 },
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled("▀".repeat(panel_w as usize), edge)),
+                Rect { x: panel_x, y: box_area.y + panel_h - 1, width: panel_w, height: 1 },
+            );
+        }
+        // the accent bar spans the content rows, between the soft edges
+        let bar = if crate::color::fancy_glyphs() { "▎" } else { "│" };
+        for dy in 1..panel_h.saturating_sub(1) {
+            frame.render_widget(
+                Paragraph::new(Span::styled(bar, base.fg(accent))),
+                Rect { x: panel_x, y: box_area.y + dy, width: 1, height: 1 },
+            );
+        }
+        // one column of padding inside the bar, one before the right edge
+        let content_x = panel_x + 2;
+        let field_w = panel_w.saturating_sub(3) as usize;
+
+        // the message row, with the selection highlighted; a horizontal window
+        // keeps the cursor visible in a long line
+        let input_y = box_area.y + 1;
+        let chars: Vec<char> = composer_text.chars().collect();
+        let start = composer_cursor.saturating_sub(field_w);
+        let field_rect = Rect { x: content_x, y: input_y, width: field_w as u16, height: 1 };
+        if chars.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!("message {agent_brand}…"), base.patch(dim)))
+                    .style(base),
+                field_rect,
+            );
+        } else {
+            let sel_style = Style::default().bg(SELECTION_BG());
+            let mut spans = Vec::new();
+            for (i, c) in chars.iter().enumerate().skip(start).take(field_w) {
+                let selected = composer_sel.is_some_and(|(s, e)| i >= s && i < e);
+                let style = if selected { sel_style } else { base };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)).style(base), field_rect);
+        }
+        // the real (blinking) terminal cursor sits at the composer cursor
+        if focused {
+            let x = content_x + (composer_cursor - start) as u16;
+            let right = panel_x + panel_w.saturating_sub(1);
+            frame.set_cursor_position((x.min(right), input_y));
+        }
+
+        // the meta row: the active mode as a dropdown (accent), then the
+        // agent's brand (dim); one blank line below the message
+        if panel_h >= 5 {
+            let meta_y = box_area.y + 3;
+            let mut meta = Vec::new();
+            if let Some(name) = &mode_name {
+                let caret = if crate::color::fancy_glyphs() { " ▾" } else { " v" };
+                let label = format!("{name}{caret}");
+                // record the chip's rect so a click opens the dropdown; a
+                // hover (or the open menu) tints it like a menu-bar button
+                let chip_w = label.chars().count() as u16;
+                app.layout.agent_mode_chip =
+                    Rect { x: content_x, y: meta_y, width: chip_w, height: 1 };
+                let mut chip = base.fg(accent).add_modifier(Modifier::BOLD);
+                if mode_hover || menu_open {
+                    chip = chip.bg(SELECTION_BG());
+                }
+                meta.push(Span::styled(label, chip));
+                meta.push(Span::styled("   ", base));
+            }
+            meta.push(Span::styled(agent_brand.clone(), base.patch(dim)));
+            frame.render_widget(
+                Paragraph::new(Line::from(meta)).style(base),
+                Rect { x: content_x, y: meta_y, width: field_w as u16, height: 1 },
+            );
+        }
+    }
+
+    // ---- key hints, right-aligned beneath the composer ----
+    if pending.is_none() && !matches!(state, ConnState::Failed) {
+        let key = Style::default().add_modifier(Modifier::BOLD);
+        let scroll_key = if crate::color::fancy_glyphs() { "↑↓" } else { "pgup" };
+        let mut hint = vec![Span::styled(scroll_key, key), Span::styled(" scroll   ", dim)];
+        if !modes.is_empty() {
+            hint.push(Span::styled("shift+tab", key));
+            hint.push(Span::styled(" mode   ", dim));
+        }
+        hint.push(Span::styled("esc", key));
+        hint.push(Span::styled(" back   ", dim));
+        hint.push(Span::styled("enter", key));
+        hint.push(Span::styled(" send ", dim));
+        frame.render_widget(
+            Paragraph::new(Line::from(hint)).alignment(ratatui::layout::Alignment::Right),
+            rows[3],
+        );
+    }
+
+    // ---- mode dropdown: a floating list popping up from the meta line ----
+    if let Some(sel) = app.agent_view.mode_menu
+        && !modes.is_empty()
+    {
+        let width =
+            modes.iter().map(|m| m.name.chars().count()).max().unwrap_or(4).clamp(8, 28) as u16 + 4;
+        let height = modes.len() as u16 + 2;
+        let anchor_x = rows[2].x + 3; // aligns under the meta line's mode chip
+        let meta_y = rows[2].y + 3;
+        let y = meta_y.saturating_sub(height);
+        let popup = Rect {
+            x: anchor_x.min(area.right().saturating_sub(width)),
+            y,
+            width: width.min(area.width),
+            height,
+        };
+        app.layout.agent_mode_menu = popup;
+        frame.render_widget(Clear, popup);
+        // square borders mark a floating layer, unlike the rounded panes
+        let mblock =
+            Block::default().borders(Borders::ALL).border_style(Style::default().fg(accent)).title(
+                Span::styled(" mode ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            );
+        let minner = mblock.inner(popup);
+        frame.render_widget(mblock, popup);
+        let items: Vec<ListItem> = modes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let active = current_mode.as_deref() == Some(m.id.as_str());
+                let mark = if active { "● " } else { "  " };
+                let style = if i == sel {
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(mark, Style::default().fg(accent)),
+                    Span::styled(m.name.clone(), style),
+                ]))
+            })
+            .collect();
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(sel));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+            minner,
+            &mut list_state,
+        );
+    }
+
+    // ---- @-mention file picker, popping up from the composer input line ----
+    if let Some(mention) = &app.agent_view.mention
+        && !mention.results.is_empty()
+    {
+        let width =
+            mention.results.iter().map(|r| r.chars().count()).max().unwrap_or(10).clamp(12, 48)
+                as u16
+                + 2;
+        let height = mention.results.len() as u16 + 2;
+        let anchor_x = rows[2].x + 3;
+        let input_y = rows[2].y + 1;
+        let popup = Rect {
+            x: anchor_x.min(area.right().saturating_sub(width)),
+            y: input_y.saturating_sub(height),
+            width: width.min(area.width),
+            height,
+        };
+        app.layout.agent_mention_menu = popup;
+        frame.render_widget(Clear, popup);
+        let mblock =
+            Block::default().borders(Borders::ALL).border_style(Style::default().fg(accent)).title(
+                Span::styled(" @file ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            );
+        let minner = mblock.inner(popup);
+        frame.render_widget(mblock, popup);
+        let items: Vec<ListItem> = mention
+            .results
+            .iter()
+            .map(|r| ListItem::new(Line::from(Span::raw(r.clone()))))
+            .collect();
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(mention.selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+            minner,
+            &mut list_state,
+        );
     }
 }
 
@@ -1624,30 +2482,6 @@ fn arms_box(arms: u8) -> Option<&'static str> {
         0b1111 => "┼",
         _ => return None,
     })
-}
-
-/// Collapse-borders merge for the column two panes share: each cell's
-/// final glyph is the arm-union of what the sidebar drew there and what
-/// the overlapping main pane drew on top (┌∪┐=┬, └∪┘=┴, ┌∪│=├). A pane
-/// cell that erased a sidebar border glyph with a blank gets it back.
-fn merge_shared_column(buf: &mut ratatui::buffer::Buffer, x: u16, y0: u16, prior: &[String]) {
-    for (i, before) in prior.iter().enumerate() {
-        let y = y0 + i as u16;
-        let Some(prev_arms) = box_arms(before) else { continue };
-        let cell = &mut buf[(x, y)];
-        match box_arms(cell.symbol()) {
-            Some(cur_arms) => {
-                if let Some(merged) = arms_box(cur_arms | prev_arms) {
-                    cell.set_symbol(merged);
-                }
-            }
-            // blank content over a former border glyph: restore the border
-            None if cell.symbol() == " " => {
-                cell.set_symbol(before);
-            }
-            None => {}
-        }
-    }
 }
 
 /// Theme-native grey (see color::wash), as a ratatui Color.
@@ -1904,6 +2738,11 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
     let hscroll = editor.hscroll;
     let spans = editor.highlights().to_vec();
     let spell_lang = crate::editor::highlight::language_name(&editor.path);
+    // ghost skeleton while the background parse runs: the real text in a
+    // dim theme-grey, no syntax colors — resolves in place a frame or two
+    // later. Readable, so it reads as loading rather than a wall of bars.
+    let hl_pending = editor.highlight_pending();
+    let ghost_style = Style::default().fg(STATUS_DIM());
 
     for row in 0..text_height {
         let line_idx = scroll + row;
@@ -1939,6 +2778,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         // of added/modified rows thickens together, previewing exactly
         // what the dwell popup will describe
         let hovered = app
+            .code_view
             .gutter_hover
             .and_then(|l| gutter_marks.hover_range(l, total_lines))
             .is_some_and(|r| r.contains(&line_idx));
@@ -1982,7 +2822,8 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
             .skip(hscroll)
             .take(text_area.width as usize)
             .collect();
-        let mut styles: Vec<Style> = vec![Style::default(); visible.chars().count()];
+        let base_style = if hl_pending { ghost_style } else { Style::default() };
+        let mut styles: Vec<Style> = vec![base_style; visible.chars().count()];
         // which visible chars are prose (comment/string) — spell-check scope
         let mut spellable: Vec<bool> = vec![false; visible.chars().count()];
 
@@ -2065,7 +2906,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
         // hover origin: while an LSP hover popup is open, the word it
         // describes keeps a marker tint
         if let (Some(crate::app::Overlay::Hover(_)), Some((h_line, h_col))) =
-            (&app.overlay, app.hover_doc_pos)
+            (&app.overlay, app.code_view.hover_doc_pos)
             && line_idx == h_line
         {
             let chars: Vec<char> = content.chars().collect();
@@ -2073,11 +2914,11 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
             let col = h_col.min(chars.len());
             if chars.get(col).is_some_and(is_word) {
                 let mut lo = col;
-                while lo > 0 && is_word(&&chars[lo - 1]) {
+                while lo > 0 && is_word(&chars[lo - 1]) {
                     lo -= 1;
                 }
                 let mut hi = col;
-                while hi < chars.len() && is_word(&&chars[hi]) {
+                while hi < chars.len() && is_word(&chars[hi]) {
                     hi += 1;
                 }
                 let (lo, hi) = (lo.saturating_sub(hscroll), hi.saturating_sub(hscroll));
@@ -2187,14 +3028,34 @@ fn draw_editor(frame: &mut Frame, app: &mut App, pane: Rect) {
     // real terminal cursor on the text — only when the pane is focused
     // and nothing (overlay or leader menu) is drawn on top
     let cursor_allowed = focused && app.overlay.is_none() && !app.leader_pending;
+    app.layout.editor_cursor = None;
     if cursor_allowed && editor.command.is_none() && cursor_line >= scroll && cursor_col >= hscroll
     {
         let row = (cursor_line - scroll) as u16;
         if row < text_area.height {
             let col = (cursor_col - hscroll) as u16;
             let x = text_area.x + col.min(text_area.width.saturating_sub(1));
-            frame.set_cursor_position((x, text_area.y + row));
+            let pos = ratatui::layout::Position::new(x, text_area.y + row);
+            frame.set_cursor_position(pos);
+            app.layout.editor_cursor = Some(pos);
         }
+    }
+
+    // register each visible document link as a hitbox, so the shared hover
+    // preview and hand pointer treat it like any other link (ctrl+click still
+    // opens it, via link_at)
+    for link in &doc_links {
+        if link.line < scroll || link.line >= scroll + text_height {
+            continue;
+        }
+        let col = link.col_start.saturating_sub(hscroll);
+        let end = link.col_end.saturating_sub(hscroll).min(text_area.width as usize);
+        if end <= col {
+            continue;
+        }
+        let x = text_area.x + col as u16;
+        let y = text_area.y + (link.line - scroll) as u16;
+        app.link_hits.push((Rect::new(x, y, (end - col) as u16, 1), link.target.clone()));
     }
 
     // the gutter rule joins the pane border with proper junctions
@@ -2700,10 +3561,12 @@ fn draw_editor_status_bar(
     let (chip_bg, chip_fg) = mode_colors(editor.mode);
     let mut left = vec![Span::raw(" ")];
     left.extend(slant_chip(format!(" {} ", editor.mode.label()), chip_bg, Some(chip_fg)));
-    // branch chip right after the mode chip, same as the app bar
-    if let Some(branch) = &app.git.branch {
-        left.extend(slant_chip(format!(" {branch} "), MENU_TINT(), None));
+    // branch chip right after the mode chip, same as the app bar, with the
+    // push/pull counts trailing it
+    if let Some(label) = branch_chip_label(&app.git) {
+        left.extend(slant_chip(label, MENU_TINT(), None));
     }
+    left.extend(push_pull_spans(&app.git));
     left.push(Span::raw(format!(" {}{}", editor.file_name(), dirty)));
     if let Some(msg) = &app.status_msg {
         left.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::Yellow)));
@@ -2755,6 +3618,37 @@ fn draw_editor_status_bar(
     );
 }
 
+/// Branch chip text: just the branch name (the push/pull counts ride in
+/// their own segment right after — see [`push_pull_spans`]).
+fn branch_chip_label(git: &crate::git::GitState) -> Option<String> {
+    Some(format!(" {} ", git.branch.as_ref()?))
+}
+
+/// Sync indicator: a circular arrow followed by the incoming/outgoing
+/// commit counts vs the branch's upstream — ` ↺ 1↓ 2↑ ` (behind then
+/// ahead, count before arrow). Just the arrow when in sync; empty when
+/// there's no upstream. The ASCII fallback has no glyph, so it only shows
+/// once there's a count to report.
+fn push_pull_spans(git: &crate::git::GitState) -> Vec<Span<'static>> {
+    let Some((ahead, behind)) = git.upstream else { return Vec::new() };
+    let fancy = crate::color::fancy_glyphs();
+    let diverged = ahead + behind > 0;
+    if !fancy && !diverged {
+        return Vec::new();
+    }
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ")];
+    if fancy {
+        spans.push(Span::styled("↺", style));
+    }
+    if diverged {
+        let (down, up) = if fancy { ("↓", "↑") } else { ("v", "^") };
+        spans.push(Span::styled(format!(" {behind}{down} {ahead}{up}"), style));
+    }
+    spans.push(Span::raw(" "));
+    spans
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // with the editor or hex viewer active, the app bar IS its statusline
     if app.screen == Screen::Workspace && app.shell == Shell::Code {
@@ -2785,20 +3679,66 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Some(chip_text()),
         ));
     }
-    if let Some(branch) = &app.git.branch {
+    // agents shell: the open session's connection/turn status as a chip
+    if app.shell == Shell::Agents
+        && let Some((conn, id)) = &app.agent_view.open
+        && let Some(client) = app.acp.conn(*conn)
+    {
+        let (icon, label, color) = agent_status(&client.state(), client.turn_active(id));
+        let text = if crate::color::fancy_glyphs() {
+            format!(" {icon} {label} ")
+        } else {
+            format!(" {label} ")
+        };
+        spans.extend(slant_chip(text, color, Some(chip_text())));
+    }
+    if let Some(label) = branch_chip_label(&app.git) {
         // quiet menu-tint box — same treatment as the menu-bar chips
         // (clickable someday); back to back, the caps carve the gap
-        spans.extend(slant_chip(format!(" {branch} "), MENU_TINT(), None));
+        spans.extend(slant_chip(label, MENU_TINT(), None));
     }
+    // commits to push/pull vs upstream, right after the branch
+    spans.extend(push_pull_spans(&app.git));
     // message before the workdir: the path is the least important part and
     // the only span that may safely fall off the right edge
     if let Some(msg) = &app.status_msg {
         spans.push(Span::styled(format!(" · {msg}"), Style::default().fg(Color::Yellow)));
     }
-    spans.push(Span::styled(
-        format!(" · {}", app.workdir.display()),
-        Style::default().fg(Color::DarkGray),
-    ));
+    // after the chips: the selected file in the git shell / the open
+    // session's name in the agents shell (styled like the editor bar's
+    // filename), the workspace path everywhere else
+    match app.shell {
+        Shell::Git => {
+            if let Some(entry) = app.git.selected_entry() {
+                spans.push(Span::raw(format!(" {}", entry.path)));
+            }
+        }
+        Shell::Agents if app.agent_view.open.is_some() => {
+            if let Some((conn, id)) = &app.agent_view.open {
+                spans.push(Span::raw(format!(" {}", app.acp_session_label(*conn, id))));
+            }
+        }
+        _ => spans.push(Span::styled(
+            format!(" · {}", app.workdir.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
+    // git shell: the visible diff's line counts, on the same tints the
+    // diff pane highlights its lines with
+    if app.shell == Shell::Git
+        && let (added, removed) = (app.git_view.pane.added, app.git_view.pane.removed)
+        && added + removed > 0
+    {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" +{added} "),
+            Style::default().fg(ADD_ACCENT()).bg(ADD_BG()),
+        ));
+        spans.push(Span::styled(
+            format!(" -{removed} "),
+            Style::default().fg(REMOVE_ACCENT()).bg(REMOVE_BG()),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(STATUSBAR_BG())),
         area,
@@ -3005,11 +3945,16 @@ fn diff_code_spans(line: &DiffLine, bg: Option<Color>) -> Vec<Span<'static>> {
 
 /// Render one parsed diff line as a full-width styled row with a
 /// line-number gutter, like Claude Code's change view.
-fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
+fn render_diff_line(line: &DiffLine, width: usize, hovered: bool, icons: bool) -> Line<'static> {
+    // gutter: old number, new number, colored bar, marker — 13 columns
     let pad = |text: &str| {
         let visible = text.chars().count();
-        let fill = width.saturating_sub(visible + 8);
+        let fill = width.saturating_sub(visible + 13);
         " ".repeat(fill)
+    };
+    let no = |n: Option<u32>| match n {
+        Some(n) => format!("{n:>4} "),
+        None => "     ".to_string(),
     };
     match line.kind {
         DiffLineKind::FileHeader => Line::from(vec![
@@ -3026,12 +3971,41 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
             Span::styled(line.text.clone(), Style::default().fg(Color::Gray)),
         ]),
         DiffLineKind::HunkSep => {
-            Line::from(Span::styled("      ⋯", Style::default().fg(Color::DarkGray)))
+            // folded gap: the number gutter stays blank and the divider
+            // hangs off the gutter rule with a ├ junction, so the vertical
+            // line flows through instead of being cut
+            if let Ok(hidden) = line.text.parse::<u32>() {
+                let unit = if hidden == 1 { "unchanged line" } else { "unchanged lines" };
+                // click to expand — nf-md-arrow_expand_vertical when the
+                // devicons are on, a plain chevron otherwise (NBSP after
+                // the glyph keeps it one cell wide)
+                let marker = if icons { "\u{f084f}\u{a0}" } else { "⌄ " };
+                let label = format!(" {marker}{hidden} {unit} ");
+                let label_style = if hovered {
+                    Style::default()
+                        .fg(chip_accent(6, (134, 220, 214), (1, 132, 188)))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(STATUS_DIM())
+                };
+                let rule = Style::default().fg(chrome_grey());
+                let used = 10 + 1 + 2 + label.chars().count();
+                return Line::from(vec![
+                    Span::raw(" ".repeat(10)), // the two number columns
+                    Span::styled("├", rule),
+                    Span::styled("──", rule),
+                    Span::styled(label, label_style),
+                    Span::styled("─".repeat(width.saturating_sub(used)), rule),
+                ]);
+            }
+            Line::from(Span::styled("           ⋯", Style::default().fg(Color::DarkGray)))
         }
         DiffLineKind::Add => {
             let bg = Style::default().bg(ADD_BG());
             let mut spans = vec![
-                Span::styled(format!("{:>5} ", line.new_no.unwrap_or(0)), bg.fg(ADD_ACCENT())),
+                Span::styled(no(line.old_no), bg.fg(STATUS_DIM())),
+                Span::styled(no(line.new_no), bg.fg(ADD_ACCENT())),
+                Span::styled("┃", bg.fg(ADD_ACCENT())),
                 Span::styled("+ ", bg.fg(ADD_ACCENT()).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(diff_code_spans(line, Some(ADD_BG())));
@@ -3041,7 +4015,9 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
         DiffLineKind::Remove => {
             let bg = Style::default().bg(REMOVE_BG());
             let mut spans = vec![
-                Span::styled(format!("{:>5} ", line.old_no.unwrap_or(0)), bg.fg(REMOVE_ACCENT())),
+                Span::styled(no(line.old_no), bg.fg(REMOVE_ACCENT())),
+                Span::styled(no(line.new_no), bg.fg(STATUS_DIM())),
+                Span::styled("┃", bg.fg(REMOVE_ACCENT())),
                 Span::styled("- ", bg.fg(REMOVE_ACCENT()).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(diff_code_spans(line, Some(REMOVE_BG())));
@@ -3049,11 +4025,13 @@ fn render_diff_line(line: &DiffLine, width: usize) -> Line<'static> {
             Line::from(spans)
         }
         DiffLineKind::Context => {
+            let dim = Style::default().fg(STATUS_DIM());
             let mut spans = vec![
-                Span::styled(
-                    format!("{:>5} ", line.new_no.unwrap_or(0)),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(no(line.old_no), dim),
+                Span::styled(no(line.new_no), dim),
+                // unchanged lines: a plain rule in the editor gutter's grey,
+                // so the accent bars read as the changes
+                Span::styled("│", Style::default().fg(chrome_grey())),
                 Span::raw("  "),
             ];
             spans.extend(diff_code_spans(line, None));
@@ -3079,7 +4057,7 @@ fn draw_diff_overlay(frame: &mut Frame, app: &mut App) {
         .iter()
         .skip(view.scroll)
         .take(inner_height)
-        .map(|line| render_diff_line(line, inner_width))
+        .map(|line| render_diff_line(line, inner_width, false, false))
         .collect();
 
     let title = format!(
@@ -3124,7 +4102,8 @@ fn draw_help_overlay(frame: &mut Frame, phase: f32) {
         ("        v select · u/U undo/redo · gg/ge top/bottom · :w :q :wq", ""),
         ("        hover docs: rest the mouse on a symbol (or space-k) · diagnostics inline", ""),
         ("        gd / ctrl+click goto definition · ctrl+o jump back", ""),
-        ("git: j/k move · s stage · a stage all · c commit · Enter diff · t list/tree", ""),
+        ("git: j/k move · s/u stage/unstage · a stage all · c commit · t list/tree", ""),
+        ("git: p pull · P push · f fetch · Enter diff", ""),
         ("diff: j/k scroll · PgUp/PgDn page · g top · q close", ""),
     ];
     let text: Vec<Line> = lines
@@ -3210,11 +4189,556 @@ mod tests {
     fn test_app() -> (tempfile::TempDir, App) {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "hi\n").unwrap();
-        let app = App::new(
-            dir.path().to_path_buf(),
-            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-        );
+        let app = App::new(dir.path().to_path_buf());
         (dir, app)
+    }
+
+    /// A canned ACP agent (see acp::tests) whose live session and title are
+    /// tagged, so two agents can run with distinct session ids. On a prompt
+    /// it streams a chunk, opens a tool call, asks permission, reflects the
+    /// choice, ends the turn — all routed by sessionId.
+    fn fake_acp_agent_tagged(dir: &std::path::Path, tag: &str) -> Vec<String> {
+        let script = dir.join(format!("fake-acp-{tag}.sh"));
+        let body = format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"sessionCapabilities":{{"list":true}}}},"authMethods":[]}}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"{tag}","modes":{{"currentModeId":"ask","availableModes":[{{"id":"ask","name":"Ask"}},{{"id":"code","name":"Code"}}]}}}}}}\n' "$id" ;;
+    *'"method":"session/set_mode"'*)
+      mid=$(printf '%s' "$line" | sed -n 's/.*"modeId":"\([^"]*\)".*/\1/p')
+      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"%s","update":{{"sessionUpdate":"current_mode_update","modeId":"%s"}}}}}}}}\n' "$sid" "$mid"
+      printf '{{"jsonrpc":"2.0","id":%s,"result":null}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"{tag}","title":"work {tag}"}}]}}}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"%s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"hello world"}}}}}}}}\n' "$sid"
+      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"%s","update":{{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Read file","kind":"read","status":"pending"}}}}}}}}\n' "$sid"
+      printf '{{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{{"sessionId":"%s","toolCall":{{"toolCallId":"c1","title":"Read file"}},"options":[{{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}},{{"optionId":"reject-once","name":"Reject","kind":"reject_once"}}]}}}}\n' "$sid"
+      IFS= read -r perm
+      opt=$(printf '%s' "$perm" | sed -n 's/.*"optionId":"\([^"]*\)".*/\1/p')
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id" ;;
+  esac
+done
+"#,
+        );
+        std::fs::write(&script, body).unwrap();
+        vec!["/bin/sh".to_string(), script.to_string_lossy().into_owned()]
+    }
+
+    fn fake_acp_agent(dir: &std::path::Path) -> Vec<String> {
+        fake_acp_agent_tagged(dir, "s1")
+    }
+
+    /// A fake ACP agent whose prompt reply is a markdown snippet (heading +
+    /// bullets), for exercising the transcript's markdown rendering. `\\n`
+    /// in the format string is a JSON string escape; a lone `\n` frames a
+    /// message.
+    fn fake_acp_agent_markdown(dir: &std::path::Path) -> Vec<String> {
+        let script = dir.join("fake-acp-md.sh");
+        std::fs::write(
+            &script,
+            r###"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"list":true}},"authMethods":[]}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[{"sessionId":"s1","title":"work"}]}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"## Summary\\n- parsed the file\\n- fixed the bug\\n\\nsee [docs](https://example.com)"}}}}\n' "$sid"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"###,
+        )
+        .unwrap();
+        vec!["/bin/sh".to_string(), script.to_string_lossy().into_owned()]
+    }
+
+    /// Pump ticks until `f` holds — needed for state that only advances in
+    /// `tick` (a started agent's session auto-opening).
+    fn pump_until(app: &mut App, mut f: impl FnMut(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            app.tick();
+            if f(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("condition not met within timeout");
+    }
+
+    fn wait_for(app: &App, mut f: impl FnMut(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if f(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("condition not met within timeout");
+    }
+
+    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    /// The open session id once a started agent's session auto-opens.
+    fn open_id(app: &App) -> String {
+        app.agent_view.open.as_ref().map(|(_, id)| id.clone()).expect("a session is open")
+    }
+
+    #[test]
+    fn agents_sidebar_tree_lists_sessions_and_status_bar_shows_state() {
+        let (dir, mut app) = test_app();
+        app.shell = Shell::Agents;
+        app.focus = Focus::Sidebar;
+        // no agent: the sidebar prompts to start one
+        assert!(buf_text(&render(&mut app)).contains("no agent running"));
+        // start one; its live session auto-opens and, once session/list
+        // round-trips, the tree shows its title
+        app.start_acp(&fake_acp_agent(dir.path()));
+        pump_until(&mut app, |a| a.acp.conn(0).is_some_and(|c| c.title("s1").is_some()));
+        app.focus = Focus::Sidebar;
+        let buf = render(&mut app);
+        let text = buf_text(&buf);
+        assert!(text.contains("work s1"), "session title in the tree: {text:?}");
+        // "ready" sits on the bottom row (the status bar), not the sidebar
+        let last_row: String =
+            (0..buf.area.width).map(|x| buf[(x, buf.area.bottom() - 1)].symbol()).collect();
+        assert!(last_row.contains("ready"), "status is in the status bar: {last_row:?}");
+    }
+
+    #[test]
+    fn two_agents_group_in_the_tree_and_sessions_stay_separate() {
+        let (dir, mut app) = test_app();
+        app.start_acp(&fake_acp_agent_tagged(dir.path(), "s1"));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        app.start_acp(&fake_acp_agent_tagged(dir.path(), "s2"));
+        pump_until(&mut app, |a| a.agent_view.open.as_ref().map(|(c, _)| *c) == Some(1));
+        assert_eq!(app.acp.len(), 2, "two connections");
+
+        // prompt only the second agent's open session
+        let id = open_id(&app);
+        app.acp.conn(1).unwrap().prompt(&id, "second only");
+        pump_until(&mut app, |a| {
+            a.acp
+                .conn(1)
+                .unwrap()
+                .entries("s2")
+                .iter()
+                .any(|e| matches!(e, crate::acp::Entry::User(t) if t == "second only"))
+        });
+        // the first agent's session is untouched
+        assert!(app.acp.conn(0).unwrap().entries("s1").is_empty(), "agent 1 untouched");
+
+        // the sidebar tree shows both agents' sessions (wait out session/list)
+        pump_until(&mut app, |a| {
+            a.acp.conn(0).unwrap().title("s1").is_some()
+                && a.acp.conn(1).unwrap().title("s2").is_some()
+        });
+        app.focus = Focus::Sidebar;
+        let text = buf_text(&render(&mut app));
+        assert!(
+            text.contains("work s1") && text.contains("work s2"),
+            "both sessions listed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn acp_conversation_renders_transcript_tool_call_and_permission() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        assert!(app.start_acp(&fake_acp_agent(dir.path())));
+        assert_eq!(app.shell, Shell::Agents);
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+
+        // a prompt streams agent text and a tool-call row into the transcript
+        app.acp.conn(0).unwrap().prompt(&id, "refactor the parser");
+        pump_until(&mut app, |a| {
+            a.acp
+                .conn(0)
+                .unwrap()
+                .entries(&id)
+                .iter()
+                .any(|e| matches!(e, crate::acp::Entry::Agent(t) if t.contains("hello")))
+        });
+        let text = buf_text(&render(&mut app));
+        assert!(text.contains("refactor the parser"), "user prompt shown");
+        assert!(text.contains("hello world"), "agent text streamed in");
+        assert!(text.contains("Read file"), "tool call row rendered");
+
+        // the agent blocks on a permission request → the prompt renders
+        pump_until(&mut app, |a| a.acp.conn(0).unwrap().pending_permission(&id).is_some());
+        let text = buf_text(&render(&mut app));
+        assert!(text.contains("permission"), "permission block shown: {text:?}");
+        assert!(text.contains("Allow once") && text.contains("Reject"), "options shown");
+
+        // pressing '1' selects the first option and the turn completes
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        pump_until(&mut app, |a| {
+            let c = a.acp.conn(0).unwrap();
+            !c.turn_active(&id) && c.pending_permission(&id).is_none()
+        });
+    }
+
+    #[test]
+    fn mode_dropdown_shows_modes_and_tab_switches_the_active_one() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        assert!(app.start_acp(&fake_acp_agent(dir.path())));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        wait_for(&app, |a| a.acp.conn(0).is_some_and(|c| !c.modes(&id).is_empty()));
+
+        // the composer meta line names the active mode with a dropdown caret
+        app.focus = Focus::Terminal;
+        assert!(buf_text(&render(&mut app)).contains("Ask ▾"), "active mode + caret shown");
+
+        // Shift+Tab opens the dropdown; both modes appear in the floating list
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.agent_view.mode_menu, Some(0), "menu opens on the active mode");
+        let text = buf_text(&render(&mut app));
+        assert!(text.contains("Ask") && text.contains("Code"), "both modes listed: {text:?}");
+
+        // move to "Code" and apply it; the agent confirms the switch
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.agent_view.mode_menu, None, "menu closes on select");
+        wait_for(&app, |a| a.acp.conn(0).unwrap().current_mode(&id).as_deref() == Some("code"));
+        assert!(buf_text(&render(&mut app)).contains("Code ▾"), "meta line follows the switch");
+    }
+
+    #[test]
+    fn mode_chip_hover_and_click_drive_the_dropdown() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (dir, mut app) = test_app();
+        assert!(app.start_acp(&fake_acp_agent(dir.path())));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        wait_for(&app, |a| a.acp.conn(0).is_some_and(|c| !c.modes(&id).is_empty()));
+        app.focus = Focus::Terminal;
+        render(&mut app); // records the chip's hit rect
+        let moved = |c, r| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: c,
+            row: r,
+            modifiers: KeyModifiers::NONE,
+        };
+        let click = |c, r| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: c,
+            row: r,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // hovering the chip highlights it, clicking opens the dropdown
+        let chip = app.layout.agent_mode_chip;
+        assert!(chip.area() > 0, "chip rect recorded");
+        assert!(app.handle_mouse(moved(chip.x, chip.y)));
+        assert!(app.agent_view.mode_hover, "chip hovered");
+        assert!(app.handle_mouse(click(chip.x, chip.y)));
+        assert_eq!(app.agent_view.mode_menu, Some(0), "dropdown opens on the active mode");
+        render(&mut app); // records the dropdown box rect
+
+        // hovering the second row moves the highlight; clicking it picks "code"
+        let menu = app.layout.agent_mode_menu;
+        let row1 = menu.y + 2; // border row + second item
+        assert!(app.handle_mouse(moved(menu.x + 2, row1)));
+        assert_eq!(app.agent_view.mode_menu, Some(1), "row hover moves the highlight");
+        assert!(app.handle_mouse(click(menu.x + 2, row1)));
+        assert_eq!(app.agent_view.mode_menu, None, "menu closes on the pick");
+        wait_for(&app, |a| a.acp.conn(0).unwrap().current_mode(&id).as_deref() == Some("code"));
+    }
+
+    #[test]
+    fn agent_messages_render_as_markdown() {
+        let (dir, mut app) = test_app();
+        assert!(app.start_acp(&fake_acp_agent_markdown(dir.path())));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        app.acp.conn(0).unwrap().prompt(&id, "summarize");
+        pump_until(&mut app, |a| {
+            a.acp
+                .conn(0)
+                .unwrap()
+                .entries(&id)
+                .iter()
+                .any(|e| matches!(e, crate::acp::Entry::Agent(t) if t.contains("Summary")))
+        });
+        let text = buf_text(&render(&mut app));
+        // markdown is styled, not shown raw: bullets become glyphs and the
+        // heading marker is stripped
+        assert!(text.contains('•'), "bullets rendered as glyphs: {text:?}");
+        assert!(text.contains("Summary") && text.contains("parsed the file"), "content shown");
+        assert!(!text.contains("## Summary"), "raw heading marker consumed: {text:?}");
+        assert!(!text.contains("- parsed"), "raw bullet dash consumed: {text:?}");
+    }
+
+    #[test]
+    fn transcript_markdown_links_are_clickable() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (dir, mut app) = test_app();
+        assert!(app.start_acp(&fake_acp_agent_markdown(dir.path())));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        app.acp.conn(0).unwrap().prompt(&id, "summarize");
+        pump_until(&mut app, |a| {
+            a.acp
+                .conn(0)
+                .unwrap()
+                .entries(&id)
+                .iter()
+                .any(|e| matches!(e, crate::acp::Entry::Agent(t) if t.contains("docs")))
+        });
+        let buf = render(&mut app);
+        // the link label became an OSC 8 cell (native terminal click)
+        assert!(
+            buf.content().iter().any(|c| c.symbol().contains("\x1b]8;;https://example.com")),
+            "transcript link is an OSC 8 cell"
+        );
+        // and a hitbox was recorded; clicking it opens the url
+        let (hit, url) = app
+            .link_hits
+            .iter()
+            .find(|(_, u)| u.contains("example.com"))
+            .cloned()
+            .expect("link hitbox recorded");
+        // hovering the link previews its url in the corner chip
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(moved));
+        assert_eq!(app.hovered_link.as_deref(), Some(url.as_str()), "url previewed on hover");
+        assert!(buf_text(&render(&mut app)).contains(&url), "preview chip shows the url");
+        // clicking it opens the url
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click));
+        assert_eq!(app.status_msg.as_deref(), Some(format!("opened {url}").as_str()));
+    }
+
+    #[test]
+    fn completion_popup_renders_labels_kinds_and_docs() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("code.py");
+        std::fs::write(&path, "x\n").unwrap();
+        app.open_file(&path);
+        app.shell = Shell::Code;
+        app.focus = Focus::Terminal;
+        // insert mode → the cursor draws, so the popup has an anchor
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        render(&mut app);
+        let item = |label: &str, detail: Option<&str>| crate::lsp::CompletionItem {
+            label: label.into(),
+            kind: "Method",
+            detail: detail.map(str::to_string),
+            documentation: None,
+            insert_text: label.into(),
+            sort_text: label.into(),
+        };
+        app.completion = Some(crate::app::Completion {
+            items: vec![
+                item("TemplateResponse", Some("def TemplateResponse(name: str)")),
+                item("get_template", None),
+            ],
+            filtered: vec![0, 1],
+            selected: 0,
+            anchor: 0,
+        });
+        let text = buf_text(&render(&mut app));
+        assert!(text.contains("TemplateResponse"), "label shown: {text:?}");
+        assert!(text.contains("get_template"), "second candidate shown");
+        assert!(text.contains("Method"), "kind column shown");
+        assert!(text.contains("def TemplateResponse"), "doc panel shows the signature");
+    }
+
+    #[test]
+    fn bell_rings_on_permission_and_completion() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        app.start_acp(&fake_acp_agent(dir.path()));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        app.take_bell(); // clear any startup edge
+
+        app.acp.conn(0).unwrap().prompt(&id, "go");
+        // the agent blocks on a permission → bell
+        pump_until(&mut app, |a| a.acp.conn(0).unwrap().pending_permission(&id).is_some());
+        assert!(app.take_bell(), "permission request rings the bell");
+
+        // answering it lets the turn finish → working→idle edge → bell
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        pump_until(&mut app, |a| !a.acp.conn(0).unwrap().turn_active(&id));
+        assert!(app.take_bell(), "finishing the turn rings the bell");
+    }
+
+    #[test]
+    fn acp_composer_edits_with_cursor_and_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        app.start_acp(&fake_acp_agent(dir.path()));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        let plain = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let shift = |c| KeyEvent::new(c, KeyModifiers::SHIFT);
+        let inp = |a: &App, id: &str| a.agent_view.ui.get(id).unwrap().input.clone();
+
+        for c in "hello world".chars() {
+            app.handle_key(plain(KeyCode::Char(c)));
+        }
+        // Home, then insert mid-line — the cursor isn't stuck at the end
+        app.handle_key(plain(KeyCode::Home));
+        assert_eq!(inp(&app, &id).cursor(), 0);
+        app.handle_key(plain(KeyCode::Char('>')));
+        assert_eq!(inp(&app, &id).text(), ">hello world");
+
+        // cursor is right after the '>'; shift+End selects the rest
+        app.handle_key(shift(KeyCode::End));
+        assert_eq!(inp(&app, &id).selected_text().as_deref(), Some("hello world"));
+        app.handle_key(plain(KeyCode::Char('x')));
+        assert_eq!(inp(&app, &id).text(), ">x");
+    }
+
+    #[test]
+    fn acp_conversation_navigates_like_git_arrows_and_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        app.start_acp(&fake_acp_agent(dir.path()));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        // Up arrow scrolls the transcript (lines above the tail)
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.agent_view.ui.get(&id).unwrap().scroll, 1, "Up scrolls back");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.agent_view.ui.get(&id).unwrap().scroll, 0, "Down scrolls forward");
+
+        // Esc steps back to the sidebar tree, like the git diff pane
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn acp_composer_types_and_submits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        app.start_acp(&fake_acp_agent(dir.path()));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        let id = open_id(&app);
+        // typing lands in the composer, visible in the frame
+        for c in "hi".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.agent_view.ui.get(&id).unwrap().input.text(), "hi");
+        assert!(buf_text(&render(&mut app)).contains("hi"));
+        // Enter submits and clears the composer
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.agent_view.ui.get(&id).unwrap().input.is_empty(), "composer cleared");
+        pump_until(&mut app, |a| {
+            a.acp
+                .conn(0)
+                .unwrap()
+                .entries(&id)
+                .iter()
+                .any(|e| matches!(e, crate::acp::Entry::User(t) if t == "hi"))
+        });
+    }
+
+    #[test]
+    fn agent_auth_prompt_shows_and_number_key_signs_in() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (dir, mut app) = test_app();
+        // an agent that needs auth, then opens a session once signed in
+        let script = dir.path().join("auth.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"authMethods":[{"id":"login","name":"Sign in with Google"}]}}\n' "$id" ;;
+    *'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        app.start_acp(&["/bin/sh".into(), script.to_string_lossy().into_owned()]);
+        // the auth prompt appears in the main pane
+        pump_until(&mut app, |a| a.acp_auth_target().is_some());
+        let text = buf_text(&render(&mut app));
+        assert!(text.contains("needs you to sign in"), "auth prompt shown: {text:?}");
+        assert!(text.contains("Sign in with Google"), "method listed");
+
+        // pressing 1 signs in and a session opens
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        assert!(app.acp_auth_target().is_none(), "no longer awaiting auth");
+    }
+
+    #[test]
+    fn agent_write_reflects_into_the_open_editor() {
+        let (dir, mut app) = test_app();
+        // an agent that, on prompt, writes a file through fs/write_text_file
+        let script = dir.path().join("writer.sh");
+        let target = dir.path().join("code.rs");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"s1"}}}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '{{"jsonrpc":"2.0","id":50,"method":"fs/write_text_file","params":{{"sessionId":"%s","path":"{}","content":"new from agent"}}}}\n' "$sid"
+      IFS= read -r _ack
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id" ;;
+  esac
+done
+"#,
+                target.display()
+            ),
+        )
+        .unwrap();
+        app.start_acp(&["/bin/sh".into(), script.to_string_lossy().into_owned()]);
+        pump_until(&mut app, |a| a.agent_view.open.is_some());
+        // open the target in the editor (clean buffer), then prompt the agent
+        app.open_file(&target);
+        assert_eq!(app.editor.as_ref().unwrap().text.to_string(), "old\n");
+        let id = open_id(&app);
+        app.acp.conn(0).unwrap().prompt(&id, "write the file");
+        // the write lands on disk and reloads the clean open buffer
+        pump_until(&mut app, |a| {
+            a.editor.as_ref().is_some_and(|e| e.text.to_string().contains("new from agent"))
+        });
+        assert!(std::fs::read_to_string(&target).unwrap().contains("new from agent"));
     }
 
     #[test]
@@ -3317,16 +4841,16 @@ mod tests {
         app.open_file(&path);
         let buf = render(&mut app);
         let cells: Vec<&str> = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(cells.iter().any(|s| *s == "┃"), "vertical thumb rendered");
-        assert!(cells.iter().any(|s| *s == "━"), "horizontal thumb rendered");
+        assert!(cells.contains(&"┃"), "vertical thumb rendered");
+        assert!(cells.contains(&"━"), "horizontal thumb rendered");
         // a short file shows neither
         let small = dir.path().join("small.txt");
         std::fs::write(&small, "hi\n").unwrap();
         app.open_file(&small);
         let buf = render(&mut app);
         let cells: Vec<&str> = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(!cells.iter().any(|s| *s == "┃"), "no vertical thumb when it fits");
-        assert!(!cells.iter().any(|s| *s == "━"), "no horizontal thumb when it fits");
+        assert!(!cells.contains(&"┃"), "no vertical thumb when it fits");
+        assert!(!cells.contains(&"━"), "no horizontal thumb when it fits");
     }
 
     #[test]
@@ -3364,7 +4888,42 @@ mod tests {
         app.overlay = Some(crate::app::Overlay::Diff(crate::diff::DiffView::new("f", &text)));
         let buf = render(&mut app);
         let cells: Vec<&str> = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(cells.iter().any(|s| *s == "┃"), "diff scrollbar thumb rendered");
+        assert!(cells.contains(&"┃"), "diff scrollbar thumb rendered");
+    }
+
+    #[test]
+    fn open_paints_a_skeleton_then_resolves_colors() {
+        let (dir, mut app) = test_app();
+        let path = dir.path().join("skel.rs");
+        std::fs::write(&path, "fn main() { let answer = 42; }\n").unwrap();
+        app.open_file(&path);
+        // the highlighter builds on a background thread and is only
+        // received in tick() — right after open the frame is always the
+        // ghost skeleton: real text in dim grey, no syntax colors
+        assert!(app.editor.as_ref().unwrap().highlight_pending(), "parse in flight");
+        let buf = render(&mut app);
+        let ghosted: String = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().fg == Some(STATUS_DIM()))
+            .map(|c| c.symbol())
+            .collect();
+        assert!(ghosted.contains("fn main"), "skeleton shows dim text: {ghosted:?}");
+        // "keyword" is slot 10 of HIGHLIGHT_NAMES — the color `fn` gets
+        let keyword = crate::editor::highlight::style_for(10).fg;
+        assert!(keyword.is_some() && keyword != Some(STATUS_DIM()));
+        assert!(
+            !buf.content().iter().any(|c| c.style().fg == keyword),
+            "no syntax colors while pending"
+        );
+
+        // once the parse lands, the same frame resolves into real colors
+        app.editor.as_mut().unwrap().wait_for_highlighter();
+        assert!(!app.editor.as_ref().unwrap().highlight_pending());
+        let buf = render(&mut app);
+        let colored: String =
+            buf.content().iter().filter(|c| c.style().fg == keyword).map(|c| c.symbol()).collect();
+        assert!(colored.contains("fn"), "keywords colored after resolve: {colored:?}");
     }
 
     #[test]
@@ -3377,6 +4936,9 @@ mod tests {
         let path = dir.path().join("code.rs");
         std::fs::write(&path, "// teh mispeld wrds\nfn ok() {}\n").unwrap();
         app.open_file(&path);
+        // spell scope comes from the highlight spans — wait out the
+        // background parse (interactively a skeleton frame shows instead)
+        app.editor.as_mut().unwrap().wait_for_highlighter();
         assert!(app.editor.as_ref().unwrap().spell_check, "spell on by default");
         let buf = render(&mut app);
         // misspelled comment words carry the UNDERCURL modifier in the
@@ -3395,7 +4957,7 @@ mod tests {
         // :spell toggles it off
         app.editor.as_mut().unwrap().spell_check = false;
         let buf = render(&mut app);
-        assert!(!buf.content().iter().any(|c| is_spell_curl(c)), "toggled off");
+        assert!(!buf.content().iter().any(is_spell_curl), "toggled off");
     }
 
     #[test]
@@ -3408,10 +4970,7 @@ mod tests {
         drop(cfg);
         drop(repo);
         std::fs::write(dir.path().join("added.txt"), "hi\n").unwrap();
-        let mut app = App::new(
-            dir.path().to_path_buf(),
-            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-        );
+        let mut app = App::new(dir.path().to_path_buf());
         app.lsp_enabled = false;
         app.git.refresh();
         app.switch_shell(crate::app::Shell::Code); // file tree sidebar
@@ -3501,6 +5060,9 @@ mod tests {
         assert!(!curl_cells[0].style().add_modifier.contains(Modifier::UNDERLINED));
     }
 
+    // the overlay only exists in debug builds; so does its test (`cargo
+    // bench` compiles this target under the release profile)
+    #[cfg(debug_assertions)]
     #[test]
     fn hitbox_debug_overlay_outlines_rects() {
         // call the overlay directly — flipping the env var would race the
@@ -3543,19 +5105,24 @@ mod tests {
     }
 
     #[test]
-    fn pane_borders_collapse_into_shared_junctions() {
+    fn sidebar_and_main_pane_keep_separate_borders() {
         let (_dir, mut app) = test_app();
         app.shell = Shell::Code;
         let buf = render(&mut app);
-        let x = SIDEBAR_WIDTH - 1; // the shared border column
-        // pane top border sits below the two menu-bar rows
-        let (top, bottom) = (2u16, buf.area.bottom() - 2); // above the status bar
-        assert_eq!(buf[(x, top)].symbol(), "┬", "top junction merged");
-        assert_eq!(buf[(x, bottom)].symbol(), "┴", "bottom junction merged");
-        // single shared line: the next column is pane content, not a border
+        let sidebar_edge = SIDEBAR_WIDTH - 1; // sidebar's own right border
+        let pane_edge = SIDEBAR_WIDTH; // main pane's own left border
+        // pane borders sit below the two menu-bar rows, above the status bar
+        let (top, bottom) = (2u16, buf.area.bottom() - 2);
         let mid = (top + bottom) / 2;
-        assert_eq!(buf[(x, mid)].symbol(), "│");
-        assert_ne!(buf[(x + 1, mid)].symbol(), "│", "no doubled border");
+        // each pane keeps its own frame: two adjacent vertical borders, not
+        // one merged line — the sidebar reads as a separate layer
+        assert_eq!(buf[(sidebar_edge, mid)].symbol(), "│", "sidebar right border");
+        assert_eq!(buf[(pane_edge, mid)].symbol(), "│", "main pane left border");
+        // both frames close their own corners rather than merging into ┬/┴
+        assert_eq!(buf[(sidebar_edge, top)].symbol(), "╮", "sidebar top-right corner");
+        assert_eq!(buf[(pane_edge, top)].symbol(), "╭", "main pane top-left corner");
+        assert_eq!(buf[(sidebar_edge, bottom)].symbol(), "╯", "sidebar bottom-right corner");
+        assert_eq!(buf[(pane_edge, bottom)].symbol(), "╰", "main pane bottom-left corner");
     }
 
     #[test]
@@ -3590,7 +5157,7 @@ mod tests {
             scroll: 0,
             diagnostics: vec![],
         }));
-        app.hover_doc_pos = Some((0, 6)); // inside "example"
+        app.code_view.hover_doc_pos = Some((0, 6)); // inside "example"
         let buf = render(&mut app);
         let tinted: String = buf
             .content()
@@ -3780,6 +5347,162 @@ mod tests {
     }
 
     #[test]
+    fn bell_toggles_the_notification_pane() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notify(ToastLevel::Warn, "engine two is on fire");
+        app.toasts.clear(); // the transient toast would show the text too
+        let buf = render(&mut app);
+        assert!(!format!("{buf:?}").contains("engine two"), "pane closed by default");
+        // click the bell chip
+        let bell = app.layout.menu_bell;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bell.x,
+            row: bell.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click));
+        assert!(app.notifications_open);
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("engine two is on fire"), "history shown:\n{text}");
+        // history persists even after the toast itself expired
+        app.toasts.clear();
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("engine two is on fire"));
+        // click again: closed (re-read the rect — the unread badge
+        // changes the chip's width between renders)
+        render(&mut app);
+        let bell = app.layout.menu_bell;
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bell.x,
+            row: bell.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!app.notifications_open);
+    }
+
+    #[test]
+    fn notification_center_behaves_like_vscode() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        // unread badge on the bell while the pane is closed
+        app.notify(ToastLevel::Info, "first");
+        app.notify(ToastLevel::Warn, "second");
+        app.toasts.clear();
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains(" 2 "), "unread count badge:\n{text}");
+        // opening the pane marks everything read
+        let bell = app.layout.menu_bell;
+        let click_at = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click_at(bell.x, bell.y)));
+        assert_eq!(app.notifications_seen, 2);
+        // while open, plain notifications go straight to the pane, no toast
+        app.notify(ToastLevel::Info, "third");
+        assert!(app.toasts.is_empty(), "no toast while the center is open");
+        assert_eq!(app.notifications.len(), 3);
+        assert_eq!(app.notifications_seen, 3, "arrivals in an open pane are read");
+        // …but buttoned questions still pop (the pane can't answer them)
+        app.notify_actions(ToastLevel::Info, "pick", vec!["A".into()], None);
+        assert_eq!(app.toasts.len(), 1);
+        app.toasts.clear();
+        // clear all empties the history
+        render(&mut app);
+        let clear = app.layout.notifications_clear;
+        assert!(app.handle_mouse(click_at(clear.x, clear.y)));
+        assert!(app.notifications.is_empty());
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("no notifications"));
+    }
+
+    #[test]
+    fn pane_renders_pending_question_buttons() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notifications_open = true;
+        app.notify_actions(ToastLevel::Warn, "deploy?", vec!["Yes".into(), "No".into()], None);
+        render(&mut app);
+        // the pane lists the question WITH its buttons
+        let pane = app.layout.notifications;
+        let (hit, ti, b) = app
+            .toast_hits
+            .iter()
+            .find(|(r, ..)| pane.contains(ratatui::layout::Position::new(r.x, r.y)))
+            .copied()
+            .expect("button hitbox inside the pane");
+        assert_eq!((ti, b), (0, Some(0)));
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x + 1,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.toasts.is_empty(), "clicking a pane button resolves the question");
+        // resolved: the buttons leave the pane, the entry stays
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("deploy?"));
+        assert!(!text.contains(" Yes "), "buttons gone after resolution:\n{text}");
+    }
+
+    #[test]
+    fn notification_pane_renders_markdown_and_clickable_links() {
+        use crate::app::ToastLevel;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (_dir, mut app) = test_app();
+        app.notify(ToastLevel::Info, "**bold** and a [manual](https://example.com/man)");
+        app.toasts.clear();
+        app.notifications_open = true;
+        let buf = render(&mut app);
+        let text = format!("{buf:?}");
+        assert!(!text.contains("**bold**"), "markdown is rendered, not raw");
+        assert!(
+            buf.content().iter().any(|c| c.symbol().contains("]8;;https://example.com/man")),
+            "pane link becomes an OSC 8 cell"
+        );
+        // the link hitbox opens the url on click
+        let (hit, url) = app
+            .link_hits
+            .iter()
+            .find(|(_, u)| u.contains("example.com"))
+            .cloned()
+            .expect("link hitbox registered");
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.status_msg.as_deref(), Some(format!("opened {url}").as_str()));
+        assert!(app.notifications_open, "click doesn't close the pane");
+    }
+
+    #[test]
+    fn file_tree_devicons_follow_the_config_flag() {
+        let (dir, mut app) = test_app();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        app.tree = crate::filetree::FileTree::new(dir.path());
+        app.shell = Shell::Code;
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains(crate::devicons::FOLDER), "folder icon (default on)");
+        assert!(text.contains('\u{e7a8}'), "rust icon on main.rs");
+        // plain glyphs when disabled
+        app.config.icons = false;
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("[▶]"), "plain fallback");
+        assert!(!text.contains('\u{e7a8}'));
+    }
+
+    #[test]
     fn menu_bar_hover_opens_dropdown_and_click_runs_action() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (_dir, mut app) = test_app();
@@ -3912,6 +5635,280 @@ mod tests {
     }
 
     #[test]
+    fn inter_hunk_bands_hover_and_expand_without_fold_mode() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        let base: String = (1..=25).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(dir.path().join("f.txt"), &base).unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        let changed = base.replace("l2\n", "L2\n").replace("l20\n", "L20\n");
+        std::fs::write(dir.path().join("f.txt"), changed).unwrap();
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        app.refresh_git_pane(true);
+        // default mode: the lines git omitted between hunks band up…
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("unchanged lines"), "inter-hunk band:\n{text}");
+        assert!(!text.contains("l10"), "omitted lines hidden");
+        // …with a hover state…
+        let fold = app.git_view.pane.folds[0].clone();
+        assert!(fold.band);
+        let row = fold.row;
+        let pane = app.layout.terminal_pane;
+        let at = (pane.x + 4, pane.y + 1 + row as u16);
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: at.0,
+            row: at.1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.git_view.gap_hover, Some(row));
+        // …and a click expands the omitted lines from the file. With the
+        // compact default the first band is the single leading line, so
+        // the big middle region (containing l10) is the second band.
+        let fold = app.git_view.pane.folds[1].clone();
+        assert!(fold.band);
+        let row = fold.row;
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x + 4,
+            row: pane.y + 1 + row as u16,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("l10"), "omitted lines spliced in:\n{text}");
+    }
+
+    #[test]
+    fn additions_only_regions_fold_independently() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        let base: String = (1..=20).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(dir.path().join("f.txt"), &base).unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        // two pure-insertion hunks: the old side never advances at the
+        // change rows, which used to collide the region keys
+        let changed = base.replace("l3\n", "l3\nNEW-A\n").replace("l15\n", "l15\nNEW-B\n");
+        std::fs::write(dir.path().join("f.txt"), changed).unwrap();
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        app.refresh_git_pane(true);
+        render(&mut app);
+        let bands: Vec<crate::diff::FoldRow> =
+            app.git_view.pane.folds.iter().filter(|f| f.band).cloned().collect();
+        assert!(bands.len() >= 3, "{bands:?}");
+        let keys: std::collections::HashSet<_> = bands.iter().map(|f| f.key).collect();
+        assert_eq!(keys.len(), bands.len(), "region keys must be unique: {bands:?}");
+        // clicking the middle band expands only its region
+        let row = bands[1].row;
+        let pane = app.layout.terminal_pane;
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x + 14,
+            row: pane.y + 1 + row as u16,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("l8"), "middle region expanded:\n{text}");
+        assert!(!text.contains("l18"), "trailing region stays folded:\n{text}");
+        assert!(
+            !text.contains("l1\\u{a0}") && !text.contains(" l1 "),
+            "leading region stays folded"
+        );
+    }
+
+    #[test]
+    fn diff_folds_unchanged_regions_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        app.refresh_git_pane(true);
+        // default: compact — only the change, unchanged regions banded
+        let text = format!("{:?}", render(&mut app));
+        assert!(!text.contains("two"), "unchanged folded by default:\n{text}");
+        assert!(text.contains("THREE"), "changes stay:\n{text}");
+        assert!(text.contains("2 unchanged lines"), "counted gap bands:\n{text}");
+        // z: everything expands (the whole file), z again refolds
+        app.git.fold_all = false;
+        app.refresh_git_pane(true);
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("two") && text.contains("five"), "z expands all:\n{text}");
+        app.git.fold_all = true;
+        app.refresh_git_pane(true);
+        // clicking the first band expands just that region
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let row = app.git_view.pane.folds[0].row;
+        let pane = app.layout.terminal_pane;
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x + 4,
+            row: pane.y + 1 + row as u16,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let text = format!("{:?}", render(&mut app));
+        assert!(text.contains("two"), "clicked region expanded:\n{text}");
+        assert!(text.contains("unchanged line"), "the other region stays folded:\n{text}");
+        // clicking a context line of the expanded region folds it back
+        let row =
+            app.git_view.pane.folds.iter().find(|f| !f.band).expect("expanded rows registered").row;
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x + 4,
+            row: pane.y + 1 + row as u16,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let text = format!("{:?}", render(&mut app));
+        assert!(!text.contains("two"), "region folded back:\n{text}");
+    }
+
+    #[test]
+    fn status_bar_shows_push_pull_counts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        crate::git::stage(&repo, "a.txt").unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        // pin a stand-in upstream (remote "." = this repo) at "base", then
+        // advance the local branch one commit past it → one to push
+        {
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("base", &head, false).unwrap();
+        }
+        let name = crate::git::head_branch(&repo).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str(&format!("branch.{name}.remote"), ".").unwrap();
+        cfg.set_str(&format!("branch.{name}.merge"), "refs/heads/base").unwrap();
+        drop(cfg);
+        std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        crate::git::stage(&repo, "b.txt").unwrap();
+        crate::git::commit(&repo, "ahead").unwrap();
+        drop(repo);
+
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        assert_eq!(app.git.upstream, Some((1, 0)));
+        let buf = render(&mut app);
+        // the status bar (last row) carries the sync arrow and the
+        // behind/ahead counts: ↺ 0↓ 1↑
+        let bottom = buf.area.bottom() - 1;
+        let bar: String =
+            (0..buf.area.width).map(|x| buf[(x, bottom)].symbol().to_string()).collect();
+        assert!(bar.contains('↺'), "sync glyph on the status bar: {bar:?}");
+        assert!(bar.contains("0↓ 1↑"), "behind then ahead counts: {bar:?}");
+    }
+
+    #[test]
+    fn staged_boundary_gets_a_separator_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        std::fs::write(dir.path().join("staged.txt"), "one\n").unwrap();
+        std::fs::write(dir.path().join("pending.txt"), "two\n").unwrap();
+        crate::git::stage(&repo, "staged.txt").unwrap();
+        drop(repo);
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        let buf = render(&mut app);
+        // the rule between the staged and unstaged sections joins the pane
+        // borders: ├───…───┤
+        let y = (1..buf.area.height - 1)
+            .find(|&y| buf[(0, y)].symbol() == "├")
+            .expect("separator junction on the left border");
+        assert_eq!(buf[(SIDEBAR_WIDTH - 1, y)].symbol(), "┤", "right junction");
+        assert_eq!(buf[(1, y)].symbol(), "─", "rule spans the row");
+        // staged above the rule, unstaged below
+        let row_text = |row: u16| -> String {
+            (0..SIDEBAR_WIDTH).map(|x| buf[(x, row)].symbol().to_string()).collect()
+        };
+        assert!(row_text(y - 1).contains("staged.txt"));
+        assert!(row_text(y + 1).contains("pending.txt"));
+        // unstage everything: the separator disappears
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        crate::git::unstage(&repo, "staged.txt").unwrap();
+        drop(repo);
+        app.git.refresh();
+        let buf = render(&mut app);
+        assert!(
+            (1..buf.area.height - 1).all(|y| buf[(0, y)].symbol() != "├"),
+            "rule gone without staged files"
+        );
+    }
+
+    #[test]
+    fn git_diff_gutter_rule_joins_the_pane_border() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "T").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        drop(cfg);
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        crate::git::stage_all(&repo).unwrap();
+        crate::git::commit(&repo, "base").unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\nTWO\nthree\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf());
+        app.lsp_enabled = false;
+        app.shell = Shell::Git;
+        app.git.refresh();
+        app.refresh_git_pane(true);
+        let buf = render(&mut app);
+        // find the rule column: the bar right of the two line-number
+        // columns (the pane top border sits below the two menu-bar rows)
+        let pane_y = 2u16;
+        let row1 = 3u16;
+        // the first row may be a fold band (├ at the rule column), so
+        // scan all pane rows for the rule
+        let _ = row1;
+        let x = (0..buf.area.width)
+            .find(|&x| {
+                x > SIDEBAR_WIDTH
+                    && buf[(x, pane_y)].symbol() != "│"
+                    && (3..buf.area.bottom() - 2).any(|y| matches!(buf[(x, y)].symbol(), "│" | "┃"))
+            })
+            .expect("diff gutter rule rendered");
+        assert_eq!(buf[(x, pane_y)].symbol(), "┬", "joins the top border");
+        assert_eq!(buf[(x, buf.area.bottom() - 2)].symbol(), "┴", "joins the bottom border");
+    }
+
+    #[test]
     fn toasts_render_and_expire() {
         use crate::app::ToastLevel;
         let (_dir, mut app) = test_app();
@@ -3922,7 +5919,7 @@ mod tests {
         assert!(text.contains("toast says hi"), "info toast rendered");
         assert!(text.contains("toast says ouch"), "error toast rendered");
         // an expired toast is pruned by tick (and triggers a redraw)
-        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        app.toasts[0].born = std::time::Instant::now() - std::time::Duration::from_secs(60);
         assert!(app.tick());
         assert_eq!(app.toasts.len(), 1);
         let buf = render(&mut app);

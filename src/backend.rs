@@ -52,7 +52,7 @@ impl<W: Write> Backend for UndercurlBackend<W> {
             }
             // flush ordinary cells, then paint this one ourselves with the
             // full SGR state: colors, 4:3 undercurl, 58 underline color
-            self.0.draw(batch.drain(..).map(|(x, y, c)| (x, y, c)))?;
+            self.0.draw(batch.drain(..))?;
             let fg = style.fg.map(|c| sgr_color(3, c)).unwrap_or_default();
             let bg = style.bg.map(|c| sgr_color(4, c)).unwrap_or_default();
             let curl = style.underline_color.map(|c| sgr_color(5, c)).unwrap_or_default();

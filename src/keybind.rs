@@ -11,27 +11,29 @@ use crate::app::Shell;
 /// actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    NewSession,
-    CloseSession,
-    NextSession,
-    PrevSession,
-    GotoSession(usize),
-    RenameSession,
-    RespawnSession,
+    /// Launch the configured ACP agent in the agents shell.
+    StartAgent,
+    /// Switch to the next / previous running agent.
+    NextAgent,
+    PrevAgent,
+    /// Switch to the Nth running agent (0-based).
+    GotoAgent(usize),
+    /// Close the active agent (kills its subprocess).
+    CloseAgent,
     GotoShell(Shell),
     FocusEditor,
-    FocusChats,
+    /// Switch to the agents shell.
+    FocusAgent,
     DiffAll,
     Refresh,
     ScrollUp,
     ScrollDown,
     TogglePalette,
-    LeaderLiteral,
     Help,
     Quit,
     // editor-targeted actions: no default app-level triggers (the editor
     // handles its own chords when focused; binding e.g. ctrl+c globally
-    // would steal it from agent terminals) — bindable and used by the
+    // would steal it from the editor) — bindable and used by the
     // right-click context menu
     Copy,
     Cut,
@@ -48,24 +50,21 @@ pub enum Action {
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Action::NewSession => write!(f, "new_session"),
-            Action::CloseSession => write!(f, "close_session"),
-            Action::NextSession => write!(f, "next_session"),
-            Action::PrevSession => write!(f, "prev_session"),
-            Action::GotoSession(n) => write!(f, "goto_session:{}", n + 1),
-            Action::RenameSession => write!(f, "rename_session"),
-            Action::RespawnSession => write!(f, "respawn_session"),
+            Action::StartAgent => write!(f, "start_agent"),
+            Action::NextAgent => write!(f, "next_agent"),
+            Action::PrevAgent => write!(f, "prev_agent"),
+            Action::GotoAgent(n) => write!(f, "goto_agent:{}", n + 1),
+            Action::CloseAgent => write!(f, "close_agent"),
             Action::GotoShell(Shell::Agents) => write!(f, "goto_shell:agents"),
             Action::GotoShell(Shell::Git) => write!(f, "goto_shell:git"),
             Action::GotoShell(Shell::Code) => write!(f, "goto_shell:code"),
             Action::FocusEditor => write!(f, "focus_editor"),
-            Action::FocusChats => write!(f, "focus_chats"),
+            Action::FocusAgent => write!(f, "focus_agent"),
             Action::DiffAll => write!(f, "diff_all"),
             Action::Refresh => write!(f, "refresh"),
             Action::ScrollUp => write!(f, "scroll_up"),
             Action::ScrollDown => write!(f, "scroll_down"),
             Action::TogglePalette => write!(f, "toggle_palette"),
-            Action::LeaderLiteral => write!(f, "leader_literal"),
             Action::Help => write!(f, "help"),
             Action::Quit => write!(f, "quit"),
             Action::Copy => write!(f, "copy"),
@@ -90,27 +89,24 @@ impl std::str::FromStr for Action {
             None => (s, None),
         };
         Ok(match (name, arg) {
-            ("new_session", None) => Action::NewSession,
-            ("close_session", None) => Action::CloseSession,
-            ("next_session", None) => Action::NextSession,
-            ("prev_session", None) => Action::PrevSession,
-            ("goto_session", Some(n)) => {
+            ("start_agent", None) => Action::StartAgent,
+            ("next_agent", None) => Action::NextAgent,
+            ("prev_agent", None) => Action::PrevAgent,
+            ("goto_agent", Some(n)) => {
                 let n: usize = n.parse().map_err(|_| ())?;
-                Action::GotoSession(n.checked_sub(1).ok_or(())?)
+                Action::GotoAgent(n.checked_sub(1).ok_or(())?)
             }
-            ("rename_session", None) => Action::RenameSession,
-            ("respawn_session", None) => Action::RespawnSession,
+            ("close_agent", None) => Action::CloseAgent,
             ("goto_shell", Some("agents")) => Action::GotoShell(Shell::Agents),
             ("goto_shell", Some("git")) => Action::GotoShell(Shell::Git),
             ("goto_shell", Some("code")) => Action::GotoShell(Shell::Code),
             ("focus_editor", None) => Action::FocusEditor,
-            ("focus_chats", None) => Action::FocusChats,
+            ("focus_agent", None) => Action::FocusAgent,
             ("diff_all", None) => Action::DiffAll,
             ("refresh", None) => Action::Refresh,
             ("scroll_up", None) => Action::ScrollUp,
             ("scroll_down", None) => Action::ScrollDown,
             ("toggle_palette", None) => Action::TogglePalette,
-            ("leader_literal", None) => Action::LeaderLiteral,
             ("help", None) => Action::Help,
             ("quit", None) => Action::Quit,
             ("copy", None) => Action::Copy,
@@ -131,22 +127,19 @@ impl Action {
     /// Every action, for `+list-actions`.
     pub fn all_names() -> Vec<&'static str> {
         vec![
-            "new_session",
-            "close_session",
-            "next_session",
-            "prev_session",
-            "goto_session:N",
-            "rename_session",
-            "respawn_session",
+            "start_agent",
+            "next_agent",
+            "prev_agent",
+            "goto_agent:N",
+            "close_agent",
             "goto_shell:agents|git|code",
             "focus_editor",
-            "focus_chats",
+            "focus_agent",
             "diff_all",
             "refresh",
             "scroll_up",
             "scroll_down",
             "toggle_palette",
-            "leader_literal",
             "help",
             "quit",
             "copy",
@@ -309,18 +302,15 @@ impl Keybinds {
         let mut bind = |spec: &str, action: Action| {
             binds.push((spec.parse::<Trigger>().expect(spec), action));
         };
-        bind("ctrl+a>ctrl+a", Action::LeaderLiteral);
-        bind("ctrl+a>c", Action::NewSession);
-        bind("ctrl+a>x", Action::CloseSession);
-        bind("ctrl+a>n", Action::NextSession);
-        bind("ctrl+a>tab", Action::NextSession);
-        bind("ctrl+a>p", Action::PrevSession);
+        bind("ctrl+a>c", Action::StartAgent);
+        bind("ctrl+a>n", Action::NextAgent);
+        bind("ctrl+a>tab", Action::NextAgent);
+        bind("ctrl+a>p", Action::PrevAgent);
+        bind("ctrl+a>x", Action::CloseAgent);
         for n in 1..=9 {
-            bind(&format!("ctrl+a>{n}"), Action::GotoSession(n - 1));
+            bind(&format!("ctrl+a>{n}"), Action::GotoAgent(n - 1));
         }
-        bind("ctrl+a>r", Action::RenameSession);
-        bind("ctrl+a>shift+r", Action::RespawnSession);
-        bind("ctrl+a>h", Action::FocusChats);
+        bind("ctrl+a>h", Action::FocusAgent);
         bind("ctrl+a>g", Action::GotoShell(Shell::Git));
         bind("ctrl+a>f", Action::GotoShell(Shell::Code));
         bind("ctrl+a>e", Action::FocusEditor);
@@ -442,11 +432,10 @@ mod tests {
 
     #[test]
     fn actions_parse_and_roundtrip() {
-        for name in ["new_session", "goto_session:3", "goto_shell:git", "toggle_palette", "quit"] {
+        for name in ["start_agent", "goto_shell:git", "toggle_palette", "quit"] {
             let a: Action = name.parse().expect(name);
             assert_eq!(a.to_string(), name);
         }
-        assert!("goto_session:0".parse::<Action>().is_err(), "sessions are 1-based");
         assert!("nonsense".parse::<Action>().is_err());
     }
 
@@ -454,12 +443,8 @@ mod tests {
     fn defaults_cover_the_traditional_chords() {
         let kb = Keybinds::defaults();
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        assert_eq!(kb.lookup(true, &key('c')), Some(Action::NewSession));
+        assert_eq!(kb.lookup(true, &key('c')), Some(Action::StartAgent));
         assert_eq!(kb.lookup(true, &key('q')), Some(Action::Quit));
-        assert_eq!(
-            kb.lookup(true, &KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
-            Some(Action::RespawnSession)
-        );
         assert_eq!(
             kb.lookup(false, &KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             Some(Action::GotoShell(Shell::Git))
@@ -476,7 +461,7 @@ mod tests {
         let (kb, errors) = Keybinds::from_config(&[
             "f4=diff_all".into(),
             "ctrl+a>d=unbind".into(),
-            "ctrl+a>w=goto_session:2".into(),
+            "ctrl+a>w=focus_agent".into(),
             "broken".into(),
             "f5=made_up_action".into(),
         ]);
@@ -488,6 +473,6 @@ mod tests {
         let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(kb.lookup(true, &d), None, "unbound");
         let w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
-        assert_eq!(kb.lookup(true, &w), Some(Action::GotoSession(1)));
+        assert_eq!(kb.lookup(true, &w), Some(Action::FocusAgent));
     }
 }

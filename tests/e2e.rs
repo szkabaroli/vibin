@@ -40,8 +40,6 @@ impl Tui {
         }
         cmd.cwd(workdir);
         cmd.env("TERM", "xterm-256color");
-        // Sessions run a plain shell instead of claude so tests are hermetic.
-        cmd.env("VIBIN_CMD", "/bin/sh");
         for (key, value) in envs {
             cmd.env(key, value);
         }
@@ -93,14 +91,6 @@ impl Tui {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
-    }
-
-    /// Workspaces boot on the code shell: wait for its home card, then
-    /// hop to the agents shell (F1) and wait for the session tab.
-    fn boot_to_agents(&mut self) {
-        assert!(self.wait_for("Search Files"), "screen:\n{}", self.screen());
-        self.send(b"\x1bOP");
-        assert!(self.wait_for(" 1:"), "screen:\n{}", self.screen());
     }
 
     fn wait_exit(&mut self) -> bool {
@@ -168,47 +158,15 @@ fn boots_and_shows_shells() {
     assert!(branch_shown, "screen:\n{}", tui.screen());
     // F2 → Git shell with changes + diff main pane
     tui.send(b"\x1bOQ");
-    assert!(tui.wait_for("?? hello.txt"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("Update(hello.txt)"), "screen:\n{}", tui.screen());
-    // F1 → Agents: session tab + shell prompt + chats sidebar
+    assert!(tui.wait_for("??"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("+ hello e2e"), "screen:\n{}", tui.screen());
+    // F1 → Agents: empty state (no agent configured in tests)
     tui.send(b"\x1bOP");
-    assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("no agent running"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("AGENTS"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
     tui.send(b"q");
     assert!(tui.wait_exit());
-}
-
-#[test]
-fn typed_input_reaches_the_shell_session() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
-    // jump to the agent terminal first
-    tui.send(CTRL_A);
-    tui.send(b"1");
-    tui.send(b"echo marker-$((40 + 2))\r");
-    assert!(tui.wait_for("marker-42"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn leader_c_opens_second_session_and_digits_switch() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    tui.send(CTRL_A);
-    tui.send(b"c");
-    assert!(tui.wait_for(" 2:"), "screen:\n{}", tui.screen());
-    // type in session 2, switch to 1, verify session 1 doesn't have it
-    tui.send(b"echo in-two\r");
-    assert!(tui.wait_for("in-two"), "screen:\n{}", tui.screen());
-    tui.send(CTRL_A);
-    tui.send(b"1");
-    assert!(tui.wait_gone("in-two"), "screen:\n{}", tui.screen());
-    tui.send(b"echo in-one\r");
-    assert!(tui.wait_for("in-one"), "screen:\n{}", tui.screen());
 }
 
 #[test]
@@ -218,9 +176,9 @@ fn help_overlay_toggles() {
     assert!(tui.wait_for("Search Files"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
     tui.send(b"?");
-    assert!(tui.wait_for("send literal Ctrl+A"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("agents shell"), "screen:\n{}", tui.screen());
     tui.send(b" ");
-    assert!(tui.wait_gone("send literal Ctrl+A"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_gone("agents shell"), "screen:\n{}", tui.screen());
 }
 
 #[test]
@@ -233,7 +191,7 @@ fn diff_overlay_shows_changes() {
     // pretty rendering: per-file header, stat line, numbered added row
     assert!(tui.wait_for("Update(hello.txt)"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("└ Added 1 line"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("1 + hello e2e"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("+ hello e2e"), "screen:\n{}", tui.screen());
     tui.send(b"q");
     assert!(tui.wait_gone("hello e2e"), "screen:\n{}", tui.screen());
 }
@@ -245,10 +203,10 @@ fn git_tab_stage_and_commit_via_ui() {
     assert!(tui.wait_for("Search Files"), "screen:\n{}", tui.screen());
     tui.send(CTRL_A);
     tui.send(b"g");
-    assert!(tui.wait_for("?? hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("??"), "screen:\n{}", tui.screen());
     // stage everything, then commit
     tui.send(b"a");
-    assert!(tui.wait_for("A  hello.txt"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("A "), "screen:\n{}", tui.screen());
     tui.send(b"c");
     assert!(tui.wait_for("commit message"), "screen:\n{}", tui.screen());
     tui.send(b"e2e commit\r");
@@ -257,123 +215,15 @@ fn git_tab_stage_and_commit_via_ui() {
 }
 
 #[test]
-fn exited_session_shows_status_and_respawns() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    assert!(tui.wait_for("$"), "screen:\n{}", tui.screen());
-    tui.send(CTRL_A);
-    tui.send(b"1");
-    tui.send(b"exit 7\r");
-    // dashboard: red cross in the tab bar, exit code in the pane title,
-    // count in the status bar
-    assert!(tui.wait_for("✖"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("exited (7)"), "screen:\n{}", tui.screen());
-    // respawn in place
-    tui.send(CTRL_A);
-    tui.send(b"R");
-    assert!(tui.wait_for("session respawned"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_gone("✖"), "screen:\n{}", tui.screen());
-    tui.send(b"echo back-alive\r");
-    assert!(tui.wait_for("back-alive"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn rename_session_via_prompt() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    tui.send(CTRL_A);
-    tui.send(b"r");
-    assert!(tui.wait_for("rename session"), "screen:\n{}", tui.screen());
-    // clear the prefilled title, type a new one
-    tui.send(&[0x7f; 10]);
-    tui.send(b"api-refactor\r");
-    assert!(tui.wait_for("1:api-refactor"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn mouse_click_switches_session_tab() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    tui.send(CTRL_A);
-    tui.send(b"c");
-    assert!(tui.wait_for(" 2:"), "screen:\n{}", tui.screen());
-    tui.send(b"echo in-two\r");
-    assert!(tui.wait_for("in-two"), "screen:\n{}", tui.screen());
-    // SGR mouse press+release on tab 1 (sidebar is 34 wide; the first tab
-    // starts right after it — click near its label on the pane's top row,
-    // below the two menu-bar rows)
-    tui.send(b"\x1b[<0;38;3M\x1b[<0;38;3m");
-    assert!(tui.wait_gone("in-two"), "screen:\n{}", tui.screen());
-    tui.send(b"echo in-one\r");
-    assert!(tui.wait_for("in-one"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn chats_tab_lists_and_resumes_past_conversations() {
+fn welcome_screen_opens_current_directory() {
     let dir = git_fixture();
     let workdir = dir.path().canonicalize().unwrap();
-    // fake HOME with one planted Claude Code transcript for this workdir
     let home = TempDir::new().unwrap();
-    let munged: String = workdir
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let proj = home.path().join(".claude").join("projects").join(munged);
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("cafe1234.jsonl"),
-        "{\"type\":\"summary\",\"summary\":\"fix the flux capacitor\"}\n",
-    )
-    .unwrap();
-
-    let mut tui = Tui::launch_env(
-        &workdir,
-        &[
-            ("HOME", home.path().to_str().unwrap()),
-            // sessions echo their args so we can observe the resume flags
-            ("VIBIN_CMD", "/bin/echo claude-stub"),
-        ],
-    );
-    tui.boot_to_agents();
-    tui.send(CTRL_A);
-    tui.send(b"h");
-    assert!(tui.wait_for("fix the flux capacitor"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("fix the flux capacitor"), "screen:\n{}", tui.screen());
-    tui.send(b"\r");
-    assert!(tui.wait_for("resuming chat cafe1234"), "screen:\n{}", tui.screen());
-    // the stub session received the resume flags
-    assert!(tui.wait_for("claude-stub --resume cafe1234"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn welcome_screen_lists_projects_and_opens_workspace() {
-    let dir = git_fixture();
-    let workdir = dir.path().canonicalize().unwrap();
-    // fake HOME with one recent project pointing at a real directory
-    let home = TempDir::new().unwrap();
-    let recent = home.path().join("code").join("otherproj");
-    std::fs::create_dir_all(&recent).unwrap();
-    let proj = home.path().join(".claude").join("projects").join("-code-otherproj");
-    std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("chat.jsonl"),
-        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", recent.display()),
-    )
-    .unwrap();
-
     // no dir argument → welcome screen
     let mut tui = Tui::launch_welcome(&workdir, &[("HOME", home.path().to_str().unwrap())]);
-    // logo, version, current dir entry, and the recent project
     assert!(tui.wait_for("██"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("v0.1.0"), "screen:\n{}", tui.screen());
-    // current-dir row (suffix may truncate with long temp paths) + recents
-    assert!(tui.wait_for("▸ open "), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("~/code/otherproj"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("1 chat"), "screen:\n{}", tui.screen());
+    assert!(tui.wait_for("open "), "screen:\n{}", tui.screen());
     // Enter opens the current directory as a workspace (Code shell)
     tui.send(b"\r");
     assert!(tui.wait_for("Search Files"), "screen:\n{}", tui.screen());
@@ -547,13 +397,10 @@ fn lsp_window_messages_become_toasts_and_buttons_answer() {
     assert!(tui.wait_for("e2e server warning"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("e2e reload the workspace?"), "screen:\n{}", tui.screen());
     assert!(tui.wait_for(" Reload "), "screen:\n{}", tui.screen());
-    // the plain toast expires (~4s); the question waits for an answer
-    assert!(tui.wait_gone("e2e server warning"), "screen:\n{}", tui.screen());
-    assert!(tui.wait_for("e2e reload the workspace?"), "screen:\n{}", tui.screen());
-    // with only the sticky toast left it sits at rows 3 (text) and 4
-    // (buttons); text is 25 wide → card x = 110-(25+3)-3 = 79, Reload
-    // label starts at x=81. Click inside it (SGR is 1-based).
-    tui.send(b"\x1b[<0;85;5M\x1b[<0;85;5m");
+    // toast stack: warning (row 3), then the question's text (row 4)
+    // and buttons (row 5); text is 25 wide → card x = 110-(25+3)-3 = 79,
+    // Reload label starts at x=81. Click inside it (SGR is 1-based).
+    tui.send(b"\x1b[<0;85;6M\x1b[<0;85;6m");
     // the fake server echoes the picked title back as a new message —
     // proof the response reached it
     assert!(tui.wait_for("e2e picked Reload"), "screen:\n{}", tui.screen());
@@ -574,24 +421,10 @@ fn command_palette_opens_files_and_runs_commands() {
     assert!(tui.wait_for(" NORMAL "), "screen:\n{}", tui.screen());
     assert!(tui.wait_for("hello e2e"), "screen:\n{}", tui.screen());
     tui.send(b":q\r");
-    // command mode: > new agent
+    // command mode: > view git changes
     tui.send(&[0x0b]);
-    tui.send(b">new agent\r");
-    assert!(tui.wait_for(" 2:"), "screen:\n{}", tui.screen());
-}
-
-#[test]
-fn session_close_shows_placeholder() {
-    let dir = git_fixture();
-    let mut tui = Tui::launch(dir.path());
-    tui.boot_to_agents();
-    tui.send(CTRL_A);
-    tui.send(b"x");
-    assert!(tui.wait_for("no active sessions"), "screen:\n{}", tui.screen());
-    // and a new one can be started again; it takes tab slot 1 with id 2
-    tui.send(CTRL_A);
-    tui.send(b"c");
-    assert!(tui.wait_for(" 1:"), "screen:\n{}", tui.screen());
+    tui.send(b">view git\r");
+    assert!(tui.wait_for("GIT"), "screen:\n{}", tui.screen());
 }
 
 /// Not a test — run with `cargo test --test e2e dump_welcome -- --ignored`

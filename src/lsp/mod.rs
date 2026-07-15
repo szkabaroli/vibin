@@ -62,6 +62,12 @@ struct Shared {
     hover_result: Option<String>,
     definition_pending: Option<u64>,
     definition_result: Option<Vec<Location>>,
+    /// In-flight `textDocument/completion` request.
+    completion_pending: Option<u64>,
+    /// Last completion reply (the full item list; the app filters it).
+    completion_result: Option<Vec<CompletionItem>>,
+    /// Characters the server said should trigger completion (`.`, `::`, …).
+    completion_triggers: Vec<String>,
     /// In-flight `textDocument/documentLink` request and the file it's for.
     links_pending: Option<(u64, PathBuf)>,
     /// Last documentLink reply per file.
@@ -207,6 +213,21 @@ pub struct DocumentLink {
     pub tooltip: String,
 }
 
+/// A `textDocument/completion` candidate, flattened for the popup: the
+/// label shown, its kind ("Method"/"Function"/…), an optional signature
+/// `detail` and `documentation`, and the text to insert (snippet syntax
+/// already stripped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub label: String,
+    pub kind: &'static str,
+    pub detail: Option<String>,
+    pub documentation: Option<String>,
+    pub insert_text: String,
+    /// Server's ordering hint (sortText), for a stable sort before filtering.
+    pub sort_text: String,
+}
+
 pub struct LspClient {
     pub language: String,
     /// Taken by Drop, which hands it to the detached shutdown thread.
@@ -263,6 +284,15 @@ impl LspClient {
                         "publishDiagnostics": {},
                         "diagnostic": { "dynamicRegistration": false },
                         "documentLink": { "tooltipSupport": true },
+                        // completion: we render label + kind + detail/docs and
+                        // filter client-side, so claim snippet + docs support
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": true,
+                                "documentationFormat": ["markdown", "plaintext"]
+                            },
+                            "contextSupport": true
+                        },
                         // no dynamicRegistration/resolve: servers should
                         // send lenses with commands filled in
                         "codeLens": {}
@@ -318,8 +348,7 @@ impl LspClient {
                 shared.generation += 1;
             }
             // and let the next workspace pull re-report it fresh
-            shared.workspace_result_ids.remove(path).is_some()
-                && shared.supports_workspace_diag
+            shared.workspace_result_ids.remove(path).is_some() && shared.supports_workspace_diag
         } else {
             false
         };
@@ -445,6 +474,33 @@ impl LspClient {
     /// The last definition reply (empty = server found nothing).
     pub fn take_definition(&self) -> Option<Vec<Location>> {
         self.shared.lock().ok()?.definition_result.take()
+    }
+
+    /// Request completions at a (line, UTF-16 column). The reply lands in
+    /// shared state; poll with [`take_completion`](Self::take_completion).
+    pub fn request_completion(&self, path: &Path, line: usize, character: usize) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.completion_pending = Some(id);
+            shared.completion_result = None;
+        }
+        self.notify(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/completion",
+            "params": {
+                "textDocument": { "uri": path_to_uri(path) },
+                "position": { "line": line, "character": character },
+            }
+        }));
+    }
+
+    /// The last completion reply, taken (None until one arrives).
+    pub fn take_completion(&self) -> Option<Vec<CompletionItem>> {
+        self.shared.lock().ok()?.completion_result.take()
+    }
+
+    /// The server's completion trigger characters (`.`, `::`, …), if any.
+    pub fn completion_triggers(&self) -> Vec<String> {
+        self.shared.lock().map(|s| s.completion_triggers.clone()).unwrap_or_default()
     }
 
     /// Ask for the clickable ranges of a document. Fire-and-forget like
@@ -715,10 +771,16 @@ fn reader_loop(
                         &writer,
                         &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
                     );
+                    let triggers = message
+                        .pointer("/result/capabilities/completionProvider/triggerCharacters")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
                     let queued = {
                         let Ok(mut shared) = shared.lock() else { break };
                         shared.initialized = true;
                         shared.supports_workspace_diag = supports_ws;
+                        shared.completion_triggers = triggers;
                         shared.sync_kind = parse_sync_kind(message.get("result"));
                         shared.generation += 1;
                         std::mem::take(&mut shared.queued)
@@ -737,6 +799,10 @@ fn reader_loop(
                         s.hover_pending = None;
                         s.hover_result =
                             Some(extract_hover_text(message.get("result")).unwrap_or_default());
+                        s.generation += 1;
+                    } else if s.completion_pending == Some(id) {
+                        s.completion_pending = None;
+                        s.completion_result = Some(parse_completion(message.get("result")));
                         s.generation += 1;
                     } else if s.definition_pending == Some(id) {
                         s.definition_pending = None;
@@ -1084,6 +1150,146 @@ fn parse_code_lenses(result: Option<&Value>) -> Vec<CodeLens> {
         .collect()
 }
 
+/// Parse a completion reply: `CompletionItem[]` or `CompletionList { items }`.
+fn parse_completion(result: Option<&Value>) -> Vec<CompletionItem> {
+    let items = match result {
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(v) => match v.get("items").and_then(Value::as_array) {
+            Some(items) => items.as_slice(),
+            None => return Vec::new(),
+        },
+        None => return Vec::new(),
+    };
+    let mut out: Vec<CompletionItem> = items
+        .iter()
+        .filter_map(|item| {
+            let label = item.get("label").and_then(Value::as_str)?.trim().to_string();
+            if label.is_empty() {
+                return None;
+            }
+            let is_snippet = item.get("insertTextFormat").and_then(Value::as_u64) == Some(2);
+            // insert text, in the server's order of preference
+            let raw_insert = item
+                .pointer("/textEdit/newText")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("insertText").and_then(Value::as_str))
+                .unwrap_or(&label);
+            let insert_text =
+                if is_snippet { strip_snippet(raw_insert) } else { raw_insert.to_string() };
+            Some(CompletionItem {
+                kind: completion_kind(item.get("kind").and_then(Value::as_u64)),
+                detail: item.get("detail").and_then(Value::as_str).map(str::to_string),
+                documentation: extract_markup(item.get("documentation")),
+                sort_text: item
+                    .get("sortText")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&label)
+                    .to_string(),
+                insert_text,
+                label,
+            })
+        })
+        .collect();
+    // stable server order (sortText) before the app filters by prefix
+    out.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+    out
+}
+
+/// LSP `CompletionItemKind` → a short display name.
+fn completion_kind(kind: Option<u64>) -> &'static str {
+    match kind.unwrap_or(0) {
+        2 => "Method",
+        3 => "Function",
+        4 => "Constructor",
+        5 => "Field",
+        6 => "Variable",
+        7 => "Class",
+        8 => "Interface",
+        9 => "Module",
+        10 => "Property",
+        11 => "Unit",
+        12 => "Value",
+        13 => "Enum",
+        14 => "Keyword",
+        15 => "Snippet",
+        16 => "Color",
+        17 => "File",
+        18 => "Reference",
+        19 => "Folder",
+        20 => "EnumMember",
+        21 => "Constant",
+        22 => "Struct",
+        23 => "Event",
+        24 => "Operator",
+        25 => "TypeParam",
+        _ => "Text",
+    }
+}
+
+/// A `MarkupContent { value }` or plain string → its text.
+fn extract_markup(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(v) => v
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string),
+        None => None,
+    }
+}
+
+/// Reduce LSP snippet syntax to plain text: `${1:name}` / `${name}` → the
+/// name, bare `$0`/`$1` tabstops dropped, `\$` / `\}` unescaped. Good
+/// enough to insert something sensible without a snippet engine.
+fn strip_snippet(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    out.push(next);
+                    chars.next();
+                }
+            }
+            '$' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next(); // {
+                    // ${n:placeholder} → placeholder; ${name} → name
+                    let mut inner = String::new();
+                    let mut depth = 1;
+                    for ic in chars.by_ref() {
+                        match ic {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                                inner.push(ic);
+                            }
+                            _ => inner.push(ic),
+                        }
+                    }
+                    let name = inner.split_once(':').map(|(_, p)| p).unwrap_or("");
+                    // numeric-only placeholders are tabstops; drop them
+                    if !name.chars().all(|c| c.is_ascii_digit()) {
+                        out.push_str(name);
+                    }
+                } else {
+                    // bare $0 / $1 tabstop — skip the digits
+                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Parse a definition reply: Location | Location[] | LocationLink[].
 fn parse_definitions(result: Option<&Value>) -> Vec<Location> {
     let Some(result) = result else { return Vec::new() };
@@ -1248,7 +1454,8 @@ mod tests {
     fn parses_text_document_sync_kind() {
         let num = json!({ "capabilities": { "textDocumentSync": 2 } });
         assert_eq!(parse_sync_kind(Some(&num)), 2);
-        let obj = json!({ "capabilities": { "textDocumentSync": { "openClose": true, "change": 1 } } });
+        let obj =
+            json!({ "capabilities": { "textDocumentSync": { "openClose": true, "change": 1 } } });
         assert_eq!(parse_sync_kind(Some(&obj)), 1);
         let absent = json!({ "capabilities": {} });
         assert_eq!(parse_sync_kind(Some(&absent)), 0, "no sync declared = none");
@@ -1509,18 +1716,13 @@ mod tests {
         let line = text.lines().position(|l| l.contains("fn main")).unwrap();
         let col = text.lines().nth(line).unwrap().find("main").unwrap() + 1;
         let deadline = Instant::now() + Duration::from_secs(120);
-        let mut attempt = 0;
         while Instant::now() < deadline {
-            attempt += 1;
             client.request_hover(&file, line, col);
             std::thread::sleep(Duration::from_millis(1500));
-            if let Some(hover) = client.take_hover() {
-                eprintln!("attempt {attempt}: hover = {:?}", &hover[..hover.len().min(120)]);
-                if !hover.is_empty() {
-                    return;
-                }
-            } else {
-                eprintln!("attempt {attempt}: no reply yet");
+            if let Some(hover) = client.take_hover()
+                && !hover.is_empty()
+            {
+                return;
             }
         }
         panic!("no hover after 120s");
@@ -1565,6 +1767,45 @@ mod tests {
         assert_eq!(parsed[0].character, 2);
         assert!(parse_definitions(Some(&Value::Null)).is_empty());
         assert!(parse_definitions(None).is_empty());
+    }
+
+    #[test]
+    fn parse_completion_variants_and_kinds() {
+        // a CompletionList with items, out of sortText order
+        let list = json!({
+            "isIncomplete": false,
+            "items": [
+                { "label": "zed", "kind": 6, "sortText": "b", "detail": "int" },
+                { "label": "apply", "kind": 3, "sortText": "a",
+                  "documentation": { "kind": "markdown", "value": "does a thing" } },
+            ]
+        });
+        let items = parse_completion(Some(&list));
+        assert_eq!(items.len(), 2);
+        // sorted by sortText: apply (a) before zed (b)
+        assert_eq!(items[0].label, "apply");
+        assert_eq!(items[0].kind, "Function");
+        assert_eq!(items[0].documentation.as_deref(), Some("does a thing"));
+        assert_eq!(items[1].kind, "Variable");
+        assert_eq!(items[1].detail.as_deref(), Some("int"));
+        // a bare CompletionItem[] also parses; insertText/textEdit preferred
+        let arr = json!([
+            { "label": "foo", "insertText": "foo()" },
+            { "label": "bar", "textEdit": { "newText": "bar!" } },
+        ]);
+        let items = parse_completion(Some(&arr));
+        assert_eq!(items[0].insert_text, "bar!"); // "bar" < "foo" by sortText=label
+        assert_eq!(items[1].insert_text, "foo()");
+        assert!(parse_completion(Some(&Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn snippets_reduce_to_plain_text() {
+        assert_eq!(strip_snippet("println!(\"$0\")"), "println!(\"\")");
+        assert_eq!(strip_snippet("match ${1:expr} {\n\t$0\n}"), "match expr {\n\t\n}");
+        assert_eq!(strip_snippet("with_${2:name}_end"), "with_name_end");
+        assert_eq!(strip_snippet("plain"), "plain");
+        assert_eq!(strip_snippet("\\$literal"), "$literal");
     }
 
     #[test]

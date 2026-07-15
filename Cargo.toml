@@ -3,6 +3,18 @@ name = "vibin"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "a terminal code editor with Claude Code sessions living next to your code"
+homepage = "https://github.com/szkabaroli/vibin"
+repository = "https://github.com/szkabaroli/vibin"
+
+# `cargo binstall vibin --git https://github.com/szkabaroli/vibin` pulls the
+# prebuilt tarballs the release workflow publishes, matching this layout.
+# (crates.io publishing stays blocked by the vendored-crossterm [patch], so
+# binstall reads the git manifest rather than the registry.)
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 [dependencies]
 anyhow = "1.0.103"
 # default-features off drops image support (text-only); wayland-data-control
@@ -14,11 +26,13 @@ crossterm = "0.29.0"
 figment = { version = "0.10.19", features = ["toml"] }
 flate2 = "1"
 gif = "0.14.2"
-git2 = "0.21.0"
+# vibin only touches local repos (status/diff/stage/commit) — no fetch/push,
+# so we drop the default ssh/https transports. that means no openssl/libssh2
+# to statically link, which makes the musl release builds painless.
+git2 = { version = "0.21.0", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 imara-diff = "0.1"
 nucleo-matcher = "0.3.1"
-portable-pty = "0.9.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 ropey = "1"
@@ -57,9 +71,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-xml = "0.7.0"
 tree-sitter-yaml = "0.7.2"
 tree-sitter-zig = "1.1.2"
-tui-term = "0.3.4"
 unicode-width = "0.2"
-vt100 = "0.16.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -67,6 +79,10 @@ libc = "0.2"
 [dev-dependencies]
 divan = "0.1"
 tempfile = "3.27.0"
+# the e2e harness drives the real `vibin` binary in a pseudo-terminal and
+# reads its rendered screen — vibin itself no longer needs a PTY.
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
 
 [[bench]]
 name = "editor"

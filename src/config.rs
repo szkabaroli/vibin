@@ -19,6 +19,19 @@ pub struct Config {
     pub spell_check: bool,
     /// Underline confusable / highlight invisible Unicode characters.
     pub mark_unicode: bool,
+    /// Nerd Font filetype icons in the file tree. Needs a Nerd Font (or a
+    /// terminal with a built-in symbols fallback, like Ghostty) — set
+    /// false for plain `[▶]` glyphs on fonts without the icons.
+    pub icons: bool,
+    /// Check GitHub once a day (in the background) for a newer release and
+    /// print a one-line notice on exit. Off by default — it's a network
+    /// call. Only meaningful for non-package-manager installs; `vibin
+    /// +update` self-updates those. `brew`/`nix` installs are told to use
+    /// their manager instead.
+    pub check_for_updates: bool,
+    /// Ring the terminal bell when an agent finishes a turn or asks for a
+    /// permission — an audible nudge for a background agent. On by default.
+    pub bell: bool,
     /// Lines scrolled per mouse-wheel event. Unset -> auto: 1 under Ghostty
     /// (its own `mouse-scroll-multiplier` already scales the event stream,
     /// so multiplying again would compound), the classic 3 elsewhere.
@@ -29,6 +42,16 @@ pub struct Config {
     /// `vibin +list-actions` names every action.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub keybinds: Vec<String>,
+    /// The ACP agent to launch when a workspace opens: a command and its
+    /// arguments, e.g. `agent = ["npx", "@zed-industries/claude-code-acp"]`.
+    /// Empty = no agent starts automatically (the agents shell shows a
+    /// "start an agent" state). `VIBIN_ACP_CMD` overrides it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agent: Vec<String>,
+    /// OpenRouter model used to generate a conversation title when the
+    /// agent didn't (needs `OPENROUTER_API_KEY`). Defaults to a free model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_model: Option<String>,
     /// Language servers, in the shape of Neovim's `vim.lsp.config`: each
     /// `[lsp.<name>]` table declares the command, the languages it serves,
     /// and the workspace marker files that start it eagerly at workspace
@@ -105,14 +128,31 @@ impl Default for Config {
             show_hidden: false,
             spell_check: true,
             mark_unicode: true,
+            icons: true,
+            check_for_updates: false,
+            bell: true,
             mouse_scroll_multiplier: None,
             keybinds: Vec::new(),
+            agent: Vec::new(),
+            title_model: None,
             lsp: default_lsp(),
         }
     }
 }
 
 impl Config {
+    /// The ACP agent command to auto-launch: `VIBIN_ACP_CMD` (whitespace
+    /// split) if set, else the `agent` config key. None = no agent.
+    pub fn agent_command(&self) -> Option<Vec<String>> {
+        if let Ok(cmd) = std::env::var("VIBIN_ACP_CMD") {
+            let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+            if !parts.is_empty() {
+                return Some(parts);
+            }
+        }
+        (!self.agent.is_empty()).then(|| self.agent.clone())
+    }
+
     /// The server command for a language: the first `[lsp.*]` entry (in
     /// name order) whose filetypes include it. `VIBIN_LSP_CMD` overrides
     /// every language (tests; also handy for one-off custom servers).

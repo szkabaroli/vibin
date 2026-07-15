@@ -104,6 +104,10 @@ pub struct Editor {
     /// Set while an insert-mode burst has already pushed its undo point.
     insert_undo_open: bool,
     highlighter: Option<highlight::FileHighlighter>,
+    /// The highlighter being built (config + first whole-file parse) on a
+    /// background thread; until it lands the file renders as a skeleton —
+    /// real text, dimmed. `None` means resolved (grammar or plain text).
+    highlighter_rx: Option<std::sync::mpsc::Receiver<Option<highlight::FileHighlighter>>>,
     highlights: Vec<HighlightSpan>,
     highlights_dirty: bool,
     /// Quantized scroll position the cached spans were extracted around.
@@ -154,10 +158,35 @@ impl Editor {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let crlf = text.contains("\r\n");
         let indent_label = detect_indent(&text);
+        // the highlighter arrives asynchronously: the first whole-file
+        // parse costs ~20 ms on a large file (and the very first open of a
+        // language another ~14 ms of query compilation), so it runs off
+        // the UI thread and the file paints immediately as a skeleton
+        let highlighter_rx = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (path, text) = (path.clone(), text.clone());
+            // observation aid: VIBIN_GHOST_DELAY=<ms> holds the parse back
+            // so the ghost skeleton stays visible that long
+            let delay = std::env::var("VIBIN_GHOST_DELAY").ok().and_then(|v| v.parse().ok());
+            std::thread::spawn(move || {
+                if let Some(ms) = delay {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                let highlighter = highlight::cached_config_for(&path)
+                    .and_then(highlight::FileHighlighter::new)
+                    .map(|mut h| {
+                        h.prime(text);
+                        h
+                    });
+                let _ = tx.send(highlighter);
+            });
+            Some(rx)
+        };
         Ok(Self {
             crlf,
             indent_label,
-            highlighter: highlight::config_for(&path).and_then(highlight::FileHighlighter::new),
+            highlighter: None,
+            highlighter_rx,
             path,
             text: Rope::from_str(&text),
             mode: Mode::Normal,
@@ -197,6 +226,39 @@ impl Editor {
         self.dirty = false;
         self.status = Some(format!("wrote {} ({} lines)", self.file_name(), self.text.len_lines()));
         Ok(())
+    }
+
+    /// Whether the background highlighter is still being built — the
+    /// renderer shows the skeleton (dimmed plain text) while this is true.
+    pub fn highlight_pending(&self) -> bool {
+        self.highlighter_rx.is_some()
+    }
+
+    /// Receive the background-built highlighter if it has landed. True
+    /// when it did (the skeleton must be redrawn with real colors).
+    pub fn poll_highlighter(&mut self) -> bool {
+        let Some(rx) = &self.highlighter_rx else { return false };
+        match rx.try_recv() {
+            Ok(highlighter) => {
+                self.highlighter_rx = None;
+                self.highlighter = highlighter;
+                self.highlights_dirty = true;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.highlighter_rx = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+        }
+    }
+
+    /// Block until the background highlighter resolves — tests and benches
+    /// that assert on colored output, never the interactive path.
+    pub fn wait_for_highlighter(&mut self) {
+        while self.highlight_pending() && !self.poll_highlighter() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Styled spans around the visible source, recomputed lazily after
@@ -909,6 +971,33 @@ impl Editor {
         self.begin_insert_edit();
         self.text.insert(self.head, s);
         self.head += s.chars().count();
+        self.anchor = self.head;
+        self.goal_col = None;
+        self.mark_edited();
+    }
+
+    /// The identifier being typed at the cursor: its start char index and
+    /// text. Scans back over `[A-Za-z0-9_]` from the cursor.
+    pub fn word_prefix(&self) -> (usize, String) {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut start = self.head;
+        while start > 0 && self.text.get_char(start - 1).is_some_and(is_word) {
+            start -= 1;
+        }
+        (start, self.text.slice(start..self.head).to_string())
+    }
+
+    /// Replace the char range `start..self.head` with `text` and land the
+    /// cursor after it — one undo step. Used to accept a completion.
+    pub fn apply_completion(&mut self, start: usize, text: &str) {
+        let start = start.min(self.head);
+        self.push_undo();
+        self.insert_undo_open = false;
+        if start < self.head {
+            self.text.remove(start..self.head);
+        }
+        self.text.insert(start, text);
+        self.head = start + text.chars().count();
         self.anchor = self.head;
         self.goal_col = None;
         self.mark_edited();
